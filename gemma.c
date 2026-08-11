@@ -186,7 +186,7 @@ typedef struct {
 
 
 #define FP16_MAX      (((union {_Float16 f; uint16_t b;}){.b = 0x7BFF}).f)
-#define EOT_SENTINAL  (-1)  // Sentinal for end of token array
+#define EOT_SENTINEL  (-1)  // Sentinel for end of token array
 #define SAMPLE_ABORT  ((int *)(intptr_t)-1)
 
 // Global state for interruption handling
@@ -846,7 +846,7 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
     rmsnorm(buf->x, buf->x, model->final_norm, conf->embed_dim, conf->eps);
 
     // Logit softcapping
-    for (int d = 0; d <= pos; d++) {
+    for (int d = 0; d <= conf->vocab_size; d++) {
         float val = (float)buf->logits[d] / conf->logit_softcapping;
         buf->logits[d] = (_Float16)(tanhf(val) * conf->logit_softcapping);
     }
@@ -976,7 +976,7 @@ void sample(
 
     // Prefill all the prompt tokens except the last one
     pos = 0;
-    for (int *t = tokens; *t != EOT_SENTINAL && *(t+1) != EOT_SENTINAL; t++) {
+    for (int *t = tokens; *t != EOT_SENTINEL && *(t+1) != EOT_SENTINEL; t++) {
         if (g_interrupted) {
             if (use_rpen) free(visited);
             return;
@@ -1040,10 +1040,10 @@ void sample(
 
         if (ret == SAMPLE_ABORT) break;
         else if (ret != NULL) {
-            // Injected a token array (ends with EOT_SENTINAL)
+            // Injected a token array (ends with EOT_SENTINEL)
             // Prefill all the tokens except the last one
             int i;
-            for (i = 0; (token = ret[i]) != EOT_SENTINAL && ret[i+1] != EOT_SENTINAL; i++) {
+            for (i = 0; (token = ret[i]) != EOT_SENTINEL && ret[i+1] != EOT_SENTINEL; i++) {
                 if (g_interrupted) break;
                 if (use_rpen) visited[token] = true;
                 forward(model, buf, token, pos++);
@@ -1182,7 +1182,7 @@ void generate(
     int tokens[size + 1];
     tokens[0] = tok->bos;
     encode(tok, prompt, tokens + 1, &n_tokens);
-    tokens[n_tokens] = EOT_SENTINAL;
+    tokens[n_tokens] = EOT_SENTINEL;
 
     sample(model, buf, tokens, seqlen, temperature, topk, topp, rpen, generate_callback);
 }
@@ -1221,7 +1221,7 @@ int *new_turn(GemmaTokenizer *tok, bool bos) {
     tokens[n_tokens++] = get_token_idx(tok, "\n");
     tokens[n_tokens++] = tok->sot;
     encode(tok, "model\n", tokens + n_tokens, &n_tokens);
-    tokens[n_tokens++] = EOT_SENTINAL;
+    tokens[n_tokens++] = EOT_SENTINEL;
 
     printf("Model: ");
     return tokens;
