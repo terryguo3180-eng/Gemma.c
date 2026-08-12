@@ -846,7 +846,7 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
     rmsnorm(buf->x, buf->x, model->final_norm, conf->embed_dim, conf->eps);
 
     // Logit softcapping
-    for (int d = 0; d <= conf->vocab_size; d++) {
+    for (int d = 0; d < conf->vocab_size; d++) {
         float val = (float)buf->logits[d] / conf->logit_softcapping;
         buf->logits[d] = (_Float16)(tanhf(val) * conf->logit_softcapping);
     }

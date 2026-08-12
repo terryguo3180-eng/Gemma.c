@@ -59,6 +59,7 @@ class Embedding(nn.Module):
                 torch.empty((vocab_size, embed_dim), dtype=torch.int8),
                 requires_grad=False,
             )
+            # Per-tensor quantization
             self.weight_scaler = nn.Parameter(
                 torch.empty(vocab_size, dtype=dtype), requires_grad=False
             )
@@ -102,6 +103,7 @@ class Linear(nn.Module):
                 torch.empty((fan_in, fan_out), dtype=torch.int8),
                 requires_grad=False,
             )
+            # Per-channel quantiation
             self.weight_scaler = nn.Parameter(
                 torch.empty(fan_out, dtype=dtype), requires_grad=False
             )
