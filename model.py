@@ -128,8 +128,6 @@ class Linear(nn.Module):
             out = torch._int_mm(x_q, self.weight)  # type: ignore  # int32
             
             out = out.float() * x_scale * self.weight_scaler.float()
-            max_val = torch.finfo(self.dtype).max
-            out = out.clamp(-max_val, max_val)
             
             return out.reshape(*orig_shape[:-1], -1).to(self.dtype)
         else:

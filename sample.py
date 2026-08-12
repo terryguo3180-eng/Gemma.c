@@ -170,4 +170,4 @@ def generate(
 
 
 if __name__ == "__main__":
-    chat("./gemma-3-270m-it.bin", device="cpu")
+    generate("./gemma-3-270m-pt.bin", prompt="Once upon a time", device="cpu")

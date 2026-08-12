@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <stdbool.h>
@@ -58,6 +59,60 @@ static char** get_utf8_argv(int *argc_out) { (void)argc_out; return NULL; }
 static void free_utf8_argv(char **argv, int argc) { (void)argv; (void)argc; }
 #endif
 
+#define FP16_MAX      (((union {_Float16 f; uint16_t b;}){.b = 0x7BFF}).f)
+#define EOT_SENTINEL  (-1)  // Sentinel for end of token array
+#define SAMPLE_ABORT  ((int *)(intptr_t)-1)
+
+// Global state for interruption handling
+static volatile bool g_interrupted = false;
+
+void signal_handler(int signum) {
+    (void)signum;
+    g_interrupted = true;
+}
+
+void setup_signal_handler(void) {
+    signal(SIGINT, signal_handler);
+#ifdef SIGTERM
+    signal(SIGTERM, signal_handler);
+#endif
+}
+
+// Safe memory operation wrappers
+void *safe_malloc(size_t size, const char *context) {
+    void *ptr = malloc(size);
+    if (ptr == NULL) {
+        fprintf(
+            stderr, "Memory allocation failed: %s (size: %zu bytes)\n",
+            context, size
+        );
+        exit(1);
+    }
+    return ptr;
+}
+
+void *safe_calloc(size_t count, size_t size, const char *context) {
+    void *ptr = calloc(count, size);
+    if (ptr == NULL) {
+        fprintf(
+            stderr, "Memory allocation failed: %s (count: %zu, size: %zu)\n",
+            context, count, size
+        );
+        exit(1);
+    }
+    return ptr;
+}
+
+void safe_fread(void *ptr, size_t size, size_t count, FILE *fp, const char *context) {
+    size_t read = fread(ptr, size, count, fp);
+    if (read != count) {
+        fprintf(
+            stderr, "File read failed: %s (expected %zu, got %zu)\n",
+            context, count, read
+        );
+        exit(1);
+    }
+}
 
 typedef struct {
     int n_layers;         // Number of transformer layers
@@ -83,6 +138,7 @@ typedef struct {
     bool use_qk_norm;     // Whether query & key normalization is applied
     bool pre_ffwd_norm;   // Whether pre-feedforward normalization is applied
     bool post_ffwd_norm;  // Whether post-feedforward normalization is applied
+    bool quant;           // Whether int8 quantization is enabled
 } GemmaConfig;
 
 typedef struct { char *val; int idx; } Token;
@@ -136,17 +192,37 @@ Merge *get_merge_rec(GemmaTokenizer *tok, char *str1, char *str2) {
     return val;  // NULL if not found
 }
 
+typedef enum { DTYPE_FP16, DTYPE_INT8 } WeightDType;
+
+// Linear weights
+typedef struct {
+    WeightDType dtype;
+    union {
+        _Float16 *fp16;
+        struct { int8_t *q; _Float16 *scales; } i8;
+    };
+} Linear;
+
+void free_linear(Linear l) {
+    if (l.dtype == DTYPE_FP16)
+        free(l.fp16);
+    else {
+        free(l.i8.q);
+        free(l.i8.scales);
+    }
+}
+
 typedef struct {
     // Attention weights
     // 2D weights are transposed for higher CPU cache hits in GEMV
-    _Float16 *wq;  // (embed_dim, n_heads * head_dim).T
-    _Float16 *wk;  // (embed_dim, n_kv_heads * head_dim).T
-    _Float16 *wv;  // (embed_dim, n_kv_heads * head_dim).T
-    _Float16 *wo;  // (n_heads * head_dim, embed_dim).T
+    Linear wq;  // (embed_dim, n_heads * head_dim).T
+    Linear wk;  // (embed_dim, n_kv_heads * head_dim).T
+    Linear wv;  // (embed_dim, n_kv_heads * head_dim).T
+    Linear wo;  // (n_heads * head_dim, embed_dim).T
     // Feedforward weights
-    _Float16 *w1;  // (embed_dim, mlp_hidden_size).T
-    _Float16 *w2;  // (embed_dim, mlp_hidden_size).T
-    _Float16 *w3;  // (mlp_hidden_size, embed_dim).T
+    Linear w1;  // (embed_dim, mlp_hidden_size).T
+    Linear w2;  // (embed_dim, mlp_hidden_size).T
+    Linear w3;  // (mlp_hidden_size, embed_dim).T
     // RMSNorm weights
     _Float16 *nq;  // (head_dim,)
     _Float16 *nk;  // (head_dim,)
@@ -159,13 +235,57 @@ typedef struct {
 typedef struct {
     GemmaConfig *config;
     GemmaTokenizer *tokenizer;
-    _Float16 *embedding;   // (vocab_size, embed_dim)
+    Linear embedding;   // (vocab_size, embed_dim)
     GemmaDecoderLayer **layers;
     _Float16 *final_norm;  // (embed_dim,)
 } GemmaModel;
 
+void free_model(GemmaModel *model) {
+    GemmaConfig *conf = model->config;
+    GemmaTokenizer *tok = model->tokenizer;
+
+    free(conf->attn_local_layers);
+    free(tok->vocab_data);
+    free(tok->vocab);
+    free(tok->merge_data);
+    free(tok->ranks);
+    free_linear(model->embedding);
+
+    for (int i = 0; i < conf->n_layers; i++) {
+        GemmaDecoderLayer *layer = model->layers[i];
+        free_linear(layer->wq);
+        free_linear(layer->wk);
+        free_linear(layer->wv);
+        free_linear(layer->wo);
+        if (conf->use_qk_norm) {
+            free(layer->nq);
+            free(layer->nk);
+        }
+        free_linear(layer->w1);
+        free_linear(layer->w2);
+        free_linear(layer->w3);
+        free(layer->n1);
+        free(layer->n2);
+        if (conf->pre_ffwd_norm)
+            free(layer->n3);
+        if (conf->post_ffwd_norm)
+            free(layer->n4);
+        free(layer);
+    }
+    free(model->final_norm);
+
+    free(tok);
+    free(conf);
+    free(model->layers);
+    free(model);
+}
+
 typedef struct {
     int cache_len;
+
+    int8_t *x_i8;            // (embed_dim,)
+    int8_t *xo_i8;           // (n_heads, head_dim)
+    int8_t *xg_i8;           // (mlp_hidden_size,)
 
     _Float16 *x;             // (embed_dim,)
     _Float16 *resid;         // (embed_dim,)
@@ -184,63 +304,64 @@ typedef struct {
     _Float16 *logits;        // (vocab_size,)
 } ModelBuffer;
 
+ModelBuffer *malloc_buffer(GemmaConfig *conf, int cache_len) {
+    ModelBuffer *buf = safe_malloc(sizeof(*buf), "ModelBuffer");
+    buf->cache_len = cache_len;
 
-#define FP16_MAX      (((union {_Float16 f; uint16_t b;}){.b = 0x7BFF}).f)
-#define EOT_SENTINEL  (-1)  // Sentinel for end of token array
-#define SAMPLE_ABORT  ((int *)(intptr_t)-1)
-
-// Global state for interruption handling
-static volatile bool g_interrupted = false;
-
-void signal_handler(int signum) {
-    (void)signum;
-    g_interrupted = true;
-}
-
-void setup_signal_handler(void) {
-    signal(SIGINT, signal_handler);
-#ifdef SIGTERM
-    signal(SIGTERM, signal_handler);
-#endif
-}
-
-// Forward declarations
-char *decode(GemmaTokenizer *tok, int id);
-
-// Safe memory operation wrappers
-void *safe_malloc(size_t size, const char *context) {
-    void *ptr = malloc(size);
-    if (ptr == NULL) {
-        fprintf(
-            stderr, "Memory allocation failed: %s (size: %zu bytes)\n",
-            context, size
-        );
-        exit(1);
+    int q_size = conf->n_heads * conf->head_dim;
+    int kv_size = conf->n_kv_heads * conf->head_dim;
+    
+    if (conf->quant) {
+        buf->x_i8 = safe_malloc(conf->embed_dim * sizeof(int8_t), "buffer x_i8");
+        buf->xo_i8 = safe_malloc(q_size * sizeof(int8_t), "buffer xo_i8");
+        buf->xg_i8 = safe_malloc(conf->mlp_hidden_size * sizeof(int8_t), "buffer xg_i8");
     }
-    return ptr;
+
+    buf->x = safe_malloc(conf->embed_dim * sizeof(_Float16), "buffer x");
+    buf->resid = safe_malloc(conf->embed_dim * sizeof(_Float16), "buffer resid");
+
+    buf->xq = safe_malloc(q_size * sizeof(_Float16), "buffer xq");
+    buf->xk = safe_malloc(kv_size * sizeof(_Float16), "buffer xk");
+    buf->xq_buf = safe_malloc(q_size * sizeof(_Float16), "buffer xq_buf");
+    buf->xk_buf = safe_malloc(kv_size * sizeof(_Float16), "buffer xk_buf");
+    buf->csfreqs_slid = safe_malloc(conf->head_dim * sizeof(_Float16), "buffer csfreqs_slid");
+    buf->csfreqs_full = safe_malloc(conf->head_dim * sizeof(_Float16), "buffer csfreqs_full");
+    buf->xv = safe_malloc(kv_size * sizeof(_Float16), "buffer xv");
+    buf->xo = safe_malloc(q_size * sizeof(_Float16), "buffer xo");
+    buf->att = safe_malloc(conf->n_heads * cache_len * sizeof(_Float16), "buffer att");
+    buf->kv_cache = safe_malloc(
+        conf->n_layers * 2 * cache_len * kv_size * sizeof(_Float16),
+        "buffer kv_cache"
+    );
+    buf->xg = safe_malloc(conf->mlp_hidden_size * sizeof(_Float16), "buffer xg");
+    buf->xu = safe_malloc(conf->mlp_hidden_size * sizeof(_Float16), "buffer xu");
+    buf->logits = safe_malloc(conf->vocab_size * sizeof(_Float16), "buffer logits");
+
+    return buf;
 }
 
-void *safe_calloc(size_t count, size_t size, const char *context) {
-    void *ptr = calloc(count, size);
-    if (ptr == NULL) {
-        fprintf(
-            stderr, "Memory allocation failed: %s (count: %zu, size: %zu)\n",
-            context, count, size
-        );
-        exit(1);
+void free_buffer(ModelBuffer *buf, bool quant) {
+    if (quant) {
+        free(buf->x_i8);
+        free(buf->xo_i8);
+        free(buf->xg_i8);
     }
-    return ptr;
-}
-
-void safe_fread(void *ptr, size_t size, size_t count, FILE *fp, const char *context) {
-    size_t read = fread(ptr, size, count, fp);
-    if (read != count) {
-        fprintf(
-            stderr, "File read failed: %s (expected %zu, got %zu)\n",
-            context, count, read
-        );
-        exit(1);
-    }
+    free(buf->x);
+    free(buf->resid);
+    free(buf->xq);
+    free(buf->xk);
+    free(buf->xq_buf);
+    free(buf->xk_buf);
+    free(buf->csfreqs_slid);
+    free(buf->csfreqs_full);
+    free(buf->xv);
+    free(buf->xo);
+    free(buf->att);
+    free(buf->kv_cache);
+    free(buf->xg);
+    free(buf->xu);
+    free(buf->logits);
+    free(buf);
 }
 
 int read_uint16(FILE *fp) {
@@ -310,10 +431,31 @@ int get_strarr_bytes(FILE *fp, int count) {
     return offset;
 }
 
-_Float16 *read_tensor(FILE *fp, int size) {
-    _Float16 *tensor = safe_malloc(size * sizeof(_Float16), "tensor");
-    safe_fread(tensor, sizeof(_Float16), size, fp, "tensor data");
+_Float16 *read_tensor_fp16(FILE *fp, int size) {
+    _Float16 *tensor = safe_malloc(size * sizeof(_Float16), "fp16 tensor");
+    safe_fread(tensor, sizeof(_Float16), size, fp, "fp16 tensor");
     return tensor;
+}
+
+int8_t *read_tensor_int8(FILE *fp, int size) {
+    int8_t *tensor = safe_malloc(size * sizeof(int8_t), "int8 tensor");
+    safe_fread(tensor, sizeof(int8_t), size, fp, "int8 tensor");
+    return tensor;
+}
+
+Linear read_linear(FILE *fp, int m, int n, bool quant) {
+    Linear w;
+    if (!quant) {
+        // fp16 precision
+        w.dtype = DTYPE_FP16;
+        w.fp16 = read_tensor_fp16(fp, m * n);
+    } else {
+        // int8 quantization
+        w.dtype = DTYPE_INT8;
+        w.i8.q = read_tensor_int8(fp, m * n);
+        w.i8.scales = read_tensor_fp16(fp, n);
+    }
+    return w;
 }
 
 // Python-like repr() for error printing
@@ -410,10 +552,7 @@ GemmaModel *read_model(const char *filename) {
     conf->use_qk_norm = (extra_flags & 8) == 8;
     conf->pre_ffwd_norm = (extra_flags & 4) == 4;
     conf->post_ffwd_norm = (extra_flags & 2) == 2;
-    if (extra_flags & 1) {
-        printf("int8 quantization not supported\n");
-        exit(1);
-    }
+    conf->quant = (extra_flags & 1) == 1;
 
     // dtype (only supports float16)
     int offset = 0;
@@ -458,13 +597,16 @@ GemmaModel *read_model(const char *filename) {
     }
     qsort(tok->ranks, tok->n_merges, sizeof(tok->ranks[0]), cmp_merge);
 
-    // Build the model
+    // Build the model & Read the weights
     GemmaModel *model = safe_malloc(sizeof(*model), "GemmaModel");
     model->config = conf;
     model->tokenizer = tok;
 
-    // Read the weights
-    model->embedding = read_tensor(fp, conf->vocab_size * conf->embed_dim);
+    // The shape is actually (vocab_size, embed_dim), but it uses per-tensor quantization
+    // rather than per-channel like other weights. Gemma uses tied weights, which means
+    // the final lm_head shares the same weights with the embedding table, but transposed.
+    // So it becomes per-channel quantization in the final lm_head
+    model->embedding = read_linear(fp, conf->embed_dim, conf->vocab_size, conf->quant);
     model->layers = safe_malloc(conf->n_layers * sizeof(*model->layers), "model layers");
 
     int q_size = conf->n_heads * conf->head_dim;
@@ -475,124 +617,36 @@ GemmaModel *read_model(const char *filename) {
         GemmaDecoderLayer *layer = safe_malloc(sizeof(*layer), "GemmaDecoderLayer");
 
         // Attention weights
-        layer->wq = read_tensor(fp, conf->embed_dim * q_size);
-        layer->wk = read_tensor(fp, conf->embed_dim * kv_size);
-        layer->wv = read_tensor(fp, conf->embed_dim * kv_size);
-        layer->wo = read_tensor(fp, q_size * conf->embed_dim);
+        layer->wq = read_linear(fp, conf->embed_dim, q_size, conf->quant);
+        layer->wk = read_linear(fp, conf->embed_dim, kv_size, conf->quant);
+        layer->wv = read_linear(fp, conf->embed_dim, kv_size, conf->quant);
+        layer->wo = read_linear(fp, q_size, conf->embed_dim, conf->quant);
 
         if (conf->use_qk_norm) {
-            layer->nq = read_tensor(fp, conf->head_dim);
-            layer->nk = read_tensor(fp, conf->head_dim);
+            layer->nq = read_tensor_fp16(fp, conf->head_dim);
+            layer->nk = read_tensor_fp16(fp, conf->head_dim);
         }
 
         // Feedforward weights
-        layer->w1 = read_tensor(fp, conf->embed_dim * conf->mlp_hidden_size);
-        layer->w2 = read_tensor(fp, conf->embed_dim * conf->mlp_hidden_size);
-        layer->w3 = read_tensor(fp, conf->mlp_hidden_size * conf->embed_dim);
+        layer->w1 = read_linear(fp, conf->embed_dim, conf->mlp_hidden_size, conf->quant);
+        layer->w2 = read_linear(fp, conf->embed_dim, conf->mlp_hidden_size, conf->quant);
+        layer->w3 = read_linear(fp, conf->mlp_hidden_size, conf->embed_dim, conf->quant);
 
         // RMSNorm weights
-        layer->n1 = read_tensor(fp, conf->embed_dim);
-        layer->n2 = read_tensor(fp, conf->embed_dim);
+        layer->n1 = read_tensor_fp16(fp, conf->embed_dim);
+        layer->n2 = read_tensor_fp16(fp, conf->embed_dim);
 
         if (conf->pre_ffwd_norm)
-            layer->n3 = read_tensor(fp, conf->embed_dim);
+            layer->n3 = read_tensor_fp16(fp, conf->embed_dim);
         if (conf->post_ffwd_norm)
-            layer->n4 = read_tensor(fp, conf->embed_dim);
+            layer->n4 = read_tensor_fp16(fp, conf->embed_dim);
 
         model->layers[l] = layer;
     }
-    model->final_norm = read_tensor(fp, conf->embed_dim);
+    model->final_norm = read_tensor_fp16(fp, conf->embed_dim);
 
     fclose(fp);
     return model;
-}
-
-void free_model(GemmaModel *model) {
-    GemmaConfig *conf = model->config;
-    GemmaTokenizer *tok = model->tokenizer;
-
-    free(conf->attn_local_layers);
-    free(tok->vocab_data);
-    free(tok->vocab);
-    free(tok->merge_data);
-    free(tok->ranks);
-    free(model->embedding);
-
-    for (int i = 0; i < conf->n_layers; i++) {
-        GemmaDecoderLayer *layer = model->layers[i];
-        free(layer->wq);
-        free(layer->wk);
-        free(layer->wv);
-        free(layer->wo);
-        if (conf->use_qk_norm) {
-            free(layer->nq);
-            free(layer->nk);
-        }
-        free(layer->w1);
-        free(layer->w2);
-        free(layer->w3);
-        free(layer->n1);
-        free(layer->n2);
-        if (conf->pre_ffwd_norm)
-            free(layer->n3);
-        if (conf->post_ffwd_norm)
-            free(layer->n4);
-        free(layer);
-    }
-    free(model->final_norm);
-
-    free(tok);
-    free(conf);
-    free(model->layers);
-    free(model);
-}
-
-ModelBuffer *malloc_buffer(GemmaConfig *conf, int cache_len) {
-    ModelBuffer *buf = safe_malloc(sizeof(*buf), "ModelBuffer");
-    buf->cache_len = cache_len;
-    buf->x = safe_malloc(conf->embed_dim * sizeof(_Float16), "buffer x");
-    buf->resid = safe_malloc(conf->embed_dim * sizeof(_Float16), "buffer resid");
-
-    int q_size = conf->n_heads * conf->head_dim;
-    int kv_size = conf->n_kv_heads * conf->head_dim;
-
-    buf->xq = safe_malloc(q_size * sizeof(_Float16), "buffer xq");
-    buf->xk = safe_malloc(kv_size * sizeof(_Float16), "buffer xk");
-    buf->xq_buf = safe_malloc(q_size * sizeof(_Float16), "buffer xq_buf");
-    buf->xk_buf = safe_malloc(kv_size * sizeof(_Float16), "buffer xk_buf");
-    buf->csfreqs_slid = safe_malloc(conf->head_dim * sizeof(_Float16), "buffer csfreqs_slid");
-    buf->csfreqs_full = safe_malloc(conf->head_dim * sizeof(_Float16), "buffer csfreqs_full");
-    buf->xv = safe_malloc(kv_size * sizeof(_Float16), "buffer xv");
-    buf->xo = safe_malloc(q_size * sizeof(_Float16), "buffer xo");
-    buf->att = safe_malloc(conf->n_heads * cache_len * sizeof(_Float16), "buffer att");
-    buf->kv_cache = safe_malloc(
-        conf->n_layers * 2 * cache_len * kv_size * sizeof(_Float16),
-        "buffer kv_cache"
-    );
-    buf->xg = safe_malloc(conf->mlp_hidden_size * sizeof(_Float16), "buffer xg");
-    buf->xu = safe_malloc(conf->mlp_hidden_size * sizeof(_Float16), "buffer xu");
-    buf->logits = safe_malloc(conf->vocab_size * sizeof(_Float16), "buffer logits");
-
-    return buf;
-}
-
-void free_buffer(ModelBuffer *buf) {
-    free(buf->x);
-    free(buf->resid);
-    free(buf->xq);
-    free(buf->xk);
-    free(buf->xq_buf);
-    free(buf->xk_buf);
-    free(buf->csfreqs_slid);
-    free(buf->csfreqs_full);
-    free(buf->xv);
-    free(buf->xo);
-    free(buf->att);
-    free(buf->kv_cache);
-    free(buf->xg);
-    free(buf->xu);
-    free(buf->logits);
-    free(buf);
 }
 
 void rmsnorm(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps) {
@@ -609,19 +663,59 @@ void rmsnorm(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps)
     }
 }
 
-void gemv(
+_Float16 quantize_act(int8_t *dst, _Float16 *vec, int dim) {
+    // Quantize the activation vector, and returns quantization scale
+    _Float16 amax = 0.0f;  // Find the abs max in vec
+    for (int d = 0; d < dim; d++) {
+        _Float16 av = vec[d] >= 0 ? vec[d] : -vec[d];
+        if (av > amax) amax = av;
+    }
+
+    // 1.0f just to make sure we are not dividing by zero
+    _Float16 qscale = amax > 0.0f ? amax / 127.0f : 1.0f;
+
+    // Quantize vec into qbuf
+    #pragma omp parallel for
+    for (int d = 0; d < dim; d++) {
+        int q = (int)roundf((float)vec[d] / (float)qscale);
+        if (q > 127) q = 127;
+        else if (q < -127) q = -127;
+        dst[d] = (int8_t)q;
+    }
+
+    return qscale;
+}
+
+void gemv_fp16(
     _Float16 *restrict dst,
-    _Float16 *restrict mat,
+    const Linear *restrict mat,
     _Float16 *restrict vec,
     int m, int n
 ) {
-    // mat (m, n) @ vec (n,) = dst (m,)
     #pragma omp parallel for
     for (int i = 0; i < m; i++) {
         float sum = 0;
         for (int j = 0; j < n; j++)
-            sum += (float)mat[i * n + j] * (float)vec[j];
+            sum += (float)mat->fp16[i*n + j] * (float)vec[j];
         dst[i] = (_Float16)sum;
+    }
+}
+
+void gemv_int8(
+    _Float16 *restrict dst,
+    const Linear *restrict mat,
+    int8_t *restrict vec,
+    int m, int n,
+    _Float16 qscale
+) {
+    float fqscale = (float)qscale;
+
+    #pragma omp parallel for
+    for (int i = 0; i < m; i++) {
+        int32_t sum = 0;
+        for (int j = 0; j < n; j++)
+            sum += (int32_t)mat->i8.q[i*n + j] * (int32_t)vec[j];
+        dst[i] = (_Float16)((float)sum * fqscale * (float)mat->i8.scales[i]);
     }
 }
 
@@ -649,9 +743,18 @@ void softmax(_Float16 *dst, _Float16 *src, int dim) {
         dst[i] = (_Float16)((float)dst[i] / expsum);
 }
 
-__attribute__((optimize("no-fast-math")))  // Not sure if this works for other compilers
-static inline float clamp_fp16(float v) {
+// Make sure the clamping is not optimized by compilers
+#ifdef __GNUC__
+__attribute__((optimize("no-fast-math")))
+#endif
+static inline _Float16 clamp_fp16(_Float16 v) {
+#ifdef __clang__
+#pragma float_control(precise, on, push)
+#endif
     return fminf(FP16_MAX, fmaxf(-FP16_MAX, v));
+#ifdef __clang__
+#pragma float_control(pop)
+#endif
 }
 
 void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
@@ -659,8 +762,16 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
 
     // x = embedding[tok] * embed_dim**0.5
     _Float16 embed_scale = (_Float16)sqrtf((float)conf->embed_dim);
-    for (int i = 0; i < conf->embed_dim; i++)
-        buf->x[i] = model->embedding[tok*conf->embed_dim + i] * embed_scale;
+    if (conf->quant)
+        // Dequantize
+        embed_scale *= model->embedding.i8.scales[tok];
+
+    for (int i = 0; i < conf->embed_dim; i++) {
+        if (!conf->quant)
+            buf->x[i] = model->embedding.fp16[tok*conf->embed_dim + i] * embed_scale;
+        else
+            buf->x[i] = model->embedding.i8.q[tok*conf->embed_dim + i] * embed_scale;
+    }
     
     int q_size = conf->n_heads * conf->head_dim;
     int kv_size = conf->n_kv_heads * conf->head_dim;
@@ -691,9 +802,16 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
         rmsnorm(buf->x, buf->x, layer->n1, conf->embed_dim, conf->eps);
 
         // The attention block
-        gemv(buf->xq, layer->wq, buf->x, q_size, conf->embed_dim);  // (n_heads, head_dim)
-        gemv(buf->xk, layer->wk, buf->x, kv_size, conf->embed_dim);  // (n_kv_heads, head_dim)
-        gemv(buf->xv, layer->wv, buf->x, kv_size, conf->embed_dim);  // (n_kv_heads, head_dim)
+        if (!conf->quant) {
+            gemv_fp16(buf->xq, &layer->wq, buf->x, q_size, conf->embed_dim);  // (n_heads, head_dim)
+            gemv_fp16(buf->xk, &layer->wk, buf->x, kv_size, conf->embed_dim);  // (n_kv_heads, head_dim)
+            gemv_fp16(buf->xv, &layer->wv, buf->x, kv_size, conf->embed_dim);  // (n_kv_heads, head_dim)
+        } else {
+            float xscale = quantize_act(buf->x_i8, buf->x, conf->embed_dim);
+            gemv_int8(buf->xq, &layer->wq, buf->x_i8, q_size, conf->embed_dim, xscale);
+            gemv_int8(buf->xk, &layer->wk, buf->x_i8, kv_size, conf->embed_dim, xscale);
+            gemv_int8(buf->xv, &layer->wv, buf->x_i8, kv_size, conf->embed_dim, xscale);
+        }
 
         if (conf->use_qk_norm) {
             // Query RMSNorm
@@ -743,7 +861,7 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
 
         if (pos >= buf->cache_len) {
             printf("\nKV Cache is full, exiting...");
-            free_buffer(buf);
+            free_buffer(buf, conf->quant);
             free_model(model);
             exit(1);
         }
@@ -796,7 +914,14 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
             }
         }
 
-        gemv(buf->x, layer->wo, buf->xo, conf->embed_dim, q_size);
+        // Map xo back to x
+        if (!conf->quant) {
+            gemv_fp16(buf->x, &layer->wo, buf->xo, conf->embed_dim, q_size);
+        } else {
+            float xoscale = quantize_act(buf->xo_i8, buf->xo, q_size);
+            gemv_int8(buf->x, &layer->wo, buf->xo_i8, conf->embed_dim, q_size, xoscale);
+        }
+
         rmsnorm(buf->x, buf->x, layer->n2, conf->embed_dim, conf->eps);
 
         // Combine the residual stream
@@ -815,8 +940,14 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
             rmsnorm(buf->x, buf->x, layer->n3, conf->embed_dim, conf->eps);
 
         // MLP feedforward layer
-        gemv(buf->xg, layer->w2, buf->x, conf->mlp_hidden_size, conf->embed_dim);
-        gemv(buf->xu, layer->w1, buf->x, conf->mlp_hidden_size, conf->embed_dim);
+        if (!conf->quant) {
+            gemv_fp16(buf->xg, &layer->w2, buf->x, conf->mlp_hidden_size, conf->embed_dim);
+            gemv_fp16(buf->xu, &layer->w1, buf->x, conf->mlp_hidden_size, conf->embed_dim);
+        } else {
+            float xscale = quantize_act(buf->x_i8, buf->x, conf->embed_dim);
+            gemv_int8(buf->xg, &layer->w2, buf->x_i8, conf->mlp_hidden_size, conf->embed_dim, xscale);
+            gemv_int8(buf->xu, &layer->w1, buf->x_i8, conf->mlp_hidden_size, conf->embed_dim, xscale);
+        }
 
         // GELU layer using tanh approximation
         #pragma omp parallel for
@@ -830,7 +961,12 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
         for (int d = 0; d < conf->mlp_hidden_size; d++)
             buf->xg[d] *= buf->xu[d];
 
-        gemv(buf->x, layer->w3, buf->xg, conf->embed_dim, conf->mlp_hidden_size);
+        if (!conf->quant) {
+            gemv_fp16(buf->x, &layer->w3, buf->xg, conf->embed_dim, conf->mlp_hidden_size);
+        } else {
+            float xscale = quantize_act(buf->xg_i8, buf->xg, conf->mlp_hidden_size);
+            gemv_int8(buf->x, &layer->w3, buf->xg_i8, conf->embed_dim, conf->mlp_hidden_size, xscale);
+        }
 
         if (conf->post_ffwd_norm)
             rmsnorm(buf->x, buf->x, layer->n4, conf->embed_dim, conf->eps);
@@ -846,10 +982,11 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
     rmsnorm(buf->x, buf->x, model->final_norm, conf->embed_dim, conf->eps);
 
     // Logit softcapping
-    for (int d = 0; d < conf->vocab_size; d++) {
-        float val = (float)buf->logits[d] / conf->logit_softcapping;
-        buf->logits[d] = (_Float16)(tanhf(val) * conf->logit_softcapping);
-    }
+    if (conf->logit_softcapping != 0.0f)
+        for (int d = 0; d < conf->vocab_size; d++) {
+            float val = (float)buf->logits[d] / conf->logit_softcapping;
+            buf->logits[d] = (_Float16)(tanhf(val) * conf->logit_softcapping);
+        }
 }
 
 int argmax(_Float16 *logits, int vocab_size) {
@@ -1008,7 +1145,12 @@ void sample(
         forward(model, buf, token, pos);
 
         // Compute logits
-        gemv(buf->logits, model->embedding, buf->x, conf->vocab_size, conf->embed_dim);
+        if (!conf->quant) {
+            gemv_fp16(buf->logits, &model->embedding, buf->x, conf->vocab_size, conf->embed_dim);
+        } else {
+            float xscale = quantize_act(buf->x_i8, buf->x, conf->embed_dim);
+            gemv_int8(buf->logits, &model->embedding, buf->x_i8, conf->vocab_size, conf->embed_dim, xscale);
+        }
 
         if (temperature == 0.0f) {
             // Argmax sampling
@@ -1172,7 +1314,6 @@ int *encode(GemmaTokenizer *tok, char *sstr, int *tokens, int *n_tokens) {
 }
 
 char *decode(GemmaTokenizer *tok, int id) { return tok->vocab[id]; }
-
 
 int *generate_callback(int token, GemmaTokenizer *tok) {
     if (token == tok->eos || token == tok->eot)
@@ -1436,7 +1577,7 @@ int main(int argc, char **argv) {
     if (g_interrupted)
         printf("\n\nInterrupted by user\n");
 
-    free_buffer(buf);
+    free_buffer(buf, model->config->quant);
     free_model(model);
     return 0;
 }

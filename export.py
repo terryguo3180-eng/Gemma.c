@@ -119,9 +119,10 @@ def export_hf(
             emb = Embedding(emb_weight.size(0), emb_weight.size(1), True, dtype)
             emb.weight.data = emb_weight
             emb.quantize()
-            write_tensor(emb.weight_scaler.data)
             emb_weight = emb.weight.data
         write_tensor(emb_weight)
+        if quant:
+            write_tensor(emb.weight_scaler.data)  # type: ignore
 
         for i in range(config.num_hidden_layers):
             layer: (
@@ -134,29 +135,32 @@ def export_hf(
             v_proj = hf_attn.v_proj.weight.data.to(dtype)
             o_proj = hf_attn.o_proj.weight.data.to(dtype)
 
+            weight_scalars: list = [None, None, None, None]
             if quant:
                 q_linear = Linear(q_proj.size(1), emb_weight.size(0), True, dtype)
                 k_linear = Linear(k_proj.size(1), emb_weight.size(0), True, dtype)
                 v_linear = Linear(v_proj.size(1), emb_weight.size(0), True, dtype)
                 o_linear = Linear(o_proj.size(1), emb_weight.size(0), True, dtype)
 
-                for mod, wei in (
+                for i, (mod, wei) in enumerate((
                     (q_linear, q_proj),
                     (k_linear, k_proj),
                     (v_linear, v_proj),
                     (o_linear, o_proj),
-                ):
+                )):
                     mod.weight.data = wei.T
                     mod.quantize()
-                    write_tensor(mod.weight_scaler.data)
+                    weight_scalars[i] = mod.weight_scaler.data
 
                 q_proj = q_linear.weight.data.T
                 k_proj = k_linear.weight.data.T
                 v_proj = v_linear.weight.data.T
                 o_proj = o_linear.weight.data.T
 
-            for wei in (q_proj, k_proj, v_proj, o_proj):
+            for wei, sca in zip((q_proj, k_proj, v_proj, o_proj), weight_scalars):
                 write_tensor(wei)
+                if sca is not None:
+                    write_tensor(sca)
 
             if isinstance(hf_attn, Gemma3Attention):  # use_qk_norm
                 q_norm = hf_attn.q_norm.weight.data.to(dtype)
@@ -169,26 +173,29 @@ def export_hf(
             gate_proj = hf_ffwd.gate_proj.weight.data.to(dtype)
             down_proj = hf_ffwd.down_proj.weight.data.to(dtype)
 
+            weight_scalars: list = [None, None, None, None]
             if quant:
                 up_linear = Linear(up_proj.size(1), up_proj.size(0), True, dtype)
                 gate_linear = Linear(gate_proj.size(1), gate_proj.size(0), True, dtype)
                 down_linear = Linear(down_proj.size(1), down_proj.size(0), True, dtype)
 
-                for mod, wei in (
+                for i, (mod, wei) in enumerate((
                     (up_linear, up_proj),
                     (gate_linear, gate_proj),
                     (down_linear, down_proj),
-                ):
+                )):
                     mod.weight.data = wei.T
                     mod.quantize()
-                    write_tensor(mod.weight_scaler.data)
+                    weight_scalars[i] = mod.weight_scaler.data
 
                 up_proj = up_linear.weight.data.T
                 gate_proj = gate_linear.weight.data.T
                 down_proj = down_linear.weight.data.T
 
-            for wei in (up_proj, gate_proj, down_proj):
+            for wei, sca in zip((up_proj, gate_proj, down_proj), weight_scalars):
                 write_tensor(wei)
+                if sca is not None:
+                    write_tensor(sca)
 
             norm1 = layer.input_layernorm.weight.data.to(dtype)
             norm2 = layer.post_attention_layernorm.weight.data.to(dtype)
@@ -286,36 +293,39 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
 
         dtype_q = np.int8 if quant else dtype_np
 
+        model.embedding.weight.data = read_tensor((vocab_size, embed_dim), dtype_q)
         if quant:
             model.embedding.weight_scaler.data = read_tensor((vocab_size,))
-        model.embedding.weight.data = read_tensor((vocab_size, embed_dim), dtype_q)
 
         for i in range(n_layers):
             layer: GemmaDecoderBlock = model.layers[i]  # type: ignore
 
+            layer.attn.q_proj.weight.data = read_tensor((head_dim * n_heads, embed_dim), dtype_q).T
             if quant:
                 layer.attn.q_proj.weight_scaler.data = read_tensor((head_dim * n_heads,))
-                layer.attn.k_proj.weight_scaler.data = read_tensor((head_dim * n_kv_heads,))
-                layer.attn.v_proj.weight_scaler.data = read_tensor((head_dim * n_kv_heads,))
-                layer.attn.o_proj.weight_scaler.data = read_tensor((embed_dim,))
-
-            layer.attn.q_proj.weight.data = read_tensor((head_dim * n_heads, embed_dim), dtype_q).T
             layer.attn.k_proj.weight.data = read_tensor((head_dim * n_kv_heads, embed_dim), dtype_q).T
+            if quant:
+                layer.attn.k_proj.weight_scaler.data = read_tensor((head_dim * n_kv_heads,))
             layer.attn.v_proj.weight.data = read_tensor((head_dim * n_kv_heads, embed_dim), dtype_q).T
+            if quant:
+                layer.attn.v_proj.weight_scaler.data = read_tensor((head_dim * n_kv_heads,))
             layer.attn.o_proj.weight.data = read_tensor((embed_dim, head_dim * n_heads), dtype_q).T
+            if quant:
+                layer.attn.o_proj.weight_scaler.data = read_tensor((embed_dim,))
 
             if use_qk_norm:
                 layer.attn.q_norm.weight.data = read_tensor((head_dim,))
                 layer.attn.k_norm.weight.data = read_tensor((head_dim,))
 
+            layer.ffwd.up_proj.weight.data = read_tensor((mlp_hidden_size, embed_dim), dtype_q).T
             if quant:
                 layer.ffwd.up_proj.weight_scaler.data = read_tensor((mlp_hidden_size,))
-                layer.ffwd.gate_proj.weight_scaler.data = read_tensor((mlp_hidden_size,))
-                layer.ffwd.down_proj.weight_scaler.data = read_tensor((embed_dim,))
-
-            layer.ffwd.up_proj.weight.data = read_tensor((mlp_hidden_size, embed_dim), dtype_q).T
             layer.ffwd.gate_proj.weight.data = read_tensor((mlp_hidden_size, embed_dim), dtype_q).T
+            if quant:
+                layer.ffwd.gate_proj.weight_scaler.data = read_tensor((mlp_hidden_size,))
             layer.ffwd.down_proj.weight.data = read_tensor((embed_dim, mlp_hidden_size), dtype_q).T
+            if quant:
+                layer.ffwd.down_proj.weight_scaler.data = read_tensor((embed_dim,))
 
             layer.norm1.weight.data = read_tensor((embed_dim,))
             layer.norm2.weight.data = read_tensor((embed_dim,))
