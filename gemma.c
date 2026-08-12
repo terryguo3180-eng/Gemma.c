@@ -1247,7 +1247,6 @@ void chat(
 }
 
 bool safe_atoui(const char *str, unsigned int *result) {
- 
     if (str == NULL) return false;
 
     char *endptr;
