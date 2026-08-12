@@ -997,6 +997,10 @@ void sample(
     if (use_topk || use_topp)
         fis = safe_malloc(conf->vocab_size * sizeof(*fis), "FloatIdx array");
 
+    // Record tok/s
+    clock_t start_time = clock();
+    int gen_tokens = 0;
+
     for (; pos < seqlen; pos++) {
         if (g_interrupted) break;
 
@@ -1036,6 +1040,7 @@ void sample(
             }
         }
 
+        gen_tokens++;
         int *ret = token_callback(token, model->tokenizer);
 
         if (ret == SAMPLE_ABORT) break;
@@ -1053,6 +1058,17 @@ void sample(
         }
         // ret == NULL: do nothing
     }
+
+    clock_t end_time = clock();
+    double elapsed = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+
+    if (elapsed > 0.0)
+        printf(
+            "\n\nGenerated %d tokens in %.2f seconds (%.2f tok/s)\n",
+            gen_tokens, elapsed, gen_tokens / elapsed
+        );
+    else
+        printf("\n\nGenerated %d tokens\n", gen_tokens);
 
     free(probs);
     if (use_rpen) free(visited);
@@ -1159,7 +1175,7 @@ char *decode(GemmaTokenizer *tok, int id) { return tok->vocab[id]; }
 
 
 int *generate_callback(int token, GemmaTokenizer *tok) {
-    if (token == tok->eos)
+    if (token == tok->eos || token == tok->eot)
         return SAMPLE_ABORT;
 
     printf("%s", decode(tok, token));
@@ -1228,7 +1244,7 @@ int *new_turn(GemmaTokenizer *tok, bool bos) {
 }
 
 int *chat_callback(int token, GemmaTokenizer *tok) {
-    if (token == tok->eot)
+    if (token == tok->eos || token == tok->eot)
         return new_turn(tok, false);
 
     printf("%s", decode(tok, token));
