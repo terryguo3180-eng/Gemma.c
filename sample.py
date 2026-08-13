@@ -170,4 +170,4 @@ def generate(
 
 
 if __name__ == "__main__":
-    generate("./gemma-3-270m-pt.bin", prompt="Once upon a time", device="cpu")
+    generate("./exported/gemma-3-4b-it_q.bin", prompt="Once upon a time", device="cpu")

@@ -1,4 +1,7 @@
-# Gemma.fsh
+# Gemma.c
+
+A single‑file C implementation for inference of Gemma models (versions 1, 2, and 3).
+This lightweight, self‑contained program loads a model in a custom binary format and runs text generation efficiently on CPU using OpenMP and aggressive compiler optimisations.
 
 Gemma model inference in a single C file, supports arbitary model in Gemma 1/2/3 architecture.
 
@@ -8,22 +11,22 @@ I plan to implement this in GLSL fragment shader, so we will be able to run LLMs
 To build it, simply type `make`, or compile it manually using:
 
 ```bash
-gcc -Ofast -march=native -flto -fopenmp gemma.c -o gemma -lm
+gcc -Ofast -march=native -mtune=native -flto -fopenmp gemma.c -o gemma -lm
 ```
 
-You also need to obtain a model file. I implemented a custom binary format specifically for Gemma models, you can convert huggingface models into this format using the `export.py` script. For example to convert the Gemma-3-1B-Instruct model into float16 (which is the only dtype supported for now), run:
+You also need to obtain a model file. I implemented a custom binary format specifically for Gemma models, you can convert huggingface models into this format using the `export.py` script. E.g. To convert the Gemma-3-1B-Instruct model, run:
 
 ```bash
-python export.py -m google/gemma-3-1b-it -o gemma-3-1b-it.bin -d float16
+python export.py -m google/gemma-3-1b-it -o gemma-3-1b-it.bin
 ```
 
-This will generate a ~1.9GB file. You can prompt it using:
+This will generate a ~1.9GB file called `gemma-3-1b-it.bin`. You can run it using:
 
 ```bash
 ./gemma gemma-3-1b-it.bin -i "Hello I'm a language model,"
 ```
 
-Here's the what the model generates when I runned this:
+Here's the what the model generated when I runned this:
 ```text
 Hello I'm a language model, and I just finished training on a massive dataset of text and code. I can respond to a wide range of prompts and questions.
 
@@ -49,7 +52,7 @@ I also wrote a chat interface, to chat with the model:
 ./gemma gemma-3-1b-it.bin -c
 ```
 
-This will automatically apply the Gemma chat template, and it works just fine. Here's an example conversation with the same 1B Instruct model:
+This will automatically apply the Gemma chat template. Here's an example conversation with the same 1B Instruct model:
 
 > ---
 > 

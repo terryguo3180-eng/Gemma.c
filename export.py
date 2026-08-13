@@ -6,14 +6,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers import GemmaForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM
-from transformers.models.gemma3.modeling_gemma3 import Gemma3DecoderLayer, Gemma3Attention
-
-if TYPE_CHECKING:
-    from transformers.models.gemma.modeling_gemma import GemmaDecoderLayer as Gemma1DecoderLayer
-    from transformers.models.gemma2.modeling_gemma2 import Gemma2DecoderLayer
-
 from model import Embedding, GemmaConfig, GemmaDecoderBlock, GemmaModel, Linear, Tensor
 from tokenizer import GemmaTokenizer
 
@@ -23,40 +15,132 @@ def export_hf(
     export_path: str,
     dtype: torch.dtype = torch.float16,
     quant: bool = False,
+    cache_dir: str | None = None,
 ):
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_path, low_cpu_mem_usage=True,
-    )
-    hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
-    assert isinstance(hf_model, (
-        GemmaForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM
-    ))
+    import gc
+    import os
+    import json
 
-    config = hf_model.config
+    from accelerate import init_empty_weights
+    from huggingface_hub import snapshot_download
+    from safetensors import safe_open
+
+    from transformers import AutoConfig
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import GemmaForCausalLM, \
+        Gemma2ForCausalLM, Gemma3ForCausalLM, \
+        Gemma3ForConditionalGeneration
+    from transformers.models.gemma3.modeling_gemma3 import \
+        Gemma3DecoderLayer, Gemma3Attention
+
+    if TYPE_CHECKING:
+        from transformers.models.gemma.modeling_gemma import \
+            GemmaDecoderLayer as Gemma1DecoderLayer
+        from transformers.models.gemma2.modeling_gemma2 import \
+            Gemma2DecoderLayer
+
+    from tqdm import tqdm
+
+    GemmaLLMs = (GemmaForCausalLM, Gemma2ForCausalLM, Gemma3ForCausalLM)
+    GemmaVLMs = (Gemma3ForConditionalGeneration,)
+    Gemma3Models = (Gemma3ForCausalLM, Gemma3ForConditionalGeneration)
+
+
+    class LazyStateDict:
+        """Reads individual tensors from a (possibly sharded) safetensors checkpoint
+        on demand, without ever materializing the full model in memory."""
+
+        def __init__(self, model_dir: str):
+            index_path = os.path.join(model_dir, "model.safetensors.index.json")
+            if os.path.exists(index_path):
+                with open(index_path) as fp:
+                    weight_map = json.load(fp)["weight_map"]
+            else:
+                single_file = os.path.join(model_dir, "model.safetensors")
+                if not os.path.exists(single_file):
+                    raise FileNotFoundError(
+                        f"No safetensors checkpoint found in {model_dir}. "
+                        "This export path only supports safetensors checkpoints."
+                    )
+                with safe_open(single_file, framework="pt") as fp:
+                    weight_map = {k: "model.safetensors" for k in fp.keys()}
+
+            self.model_dir = model_dir
+            self.weight_map = weight_map
+            self._handles: dict[str, safe_open] = {}
+
+        def _handle(self, filename: str):
+            if filename not in self._handles:
+                self._handles[filename] = safe_open(
+                    os.path.join(self.model_dir, filename), framework="pt", device="cpu"
+                )
+            return self._handles[filename]
+
+        def get(self, name: str) -> Tensor:
+            filename = self.weight_map.get(name)
+            if filename is None:
+                raise KeyError(f"Tensor '{name}' not found in checkpoint")
+            return self._handle(filename).get_tensor(name)
+
+    # Resolve model_path (local dir or hub repo id) to a local directory containing
+    # the config/tokenizer/safetensors files, without loading any weights yet.
+    if os.path.isdir(model_path):
+        local_dir = model_path
+    else:
+        local_dir = snapshot_download(
+            model_path,
+            cache_dir=cache_dir,
+            allow_patterns=["*.json", "*.safetensors", "*.model", "*.txt", "tokenizer*"],
+        )
+
+    hf_config = AutoConfig.from_pretrained(local_dir)
+    hf_tokenizer = AutoTokenizer.from_pretrained(local_dir)
+
+    # Build only the architecture (meta device -> ~0 memory, no weights allocated)
+    with init_empty_weights():
+        hf_model = AutoModelForCausalLM.from_config(hf_config)
+    assert isinstance(hf_model, GemmaLLMs + GemmaVLMs)
+
+    if isinstance(hf_model, GemmaLLMs):
+        config = hf_model.config
+    elif isinstance(hf_model, GemmaVLMs):
+        config = hf_model.config.text_config
+        assert not isinstance(config, dict)
+        assert config is not None
+    else:
+        assert False
+
+    weights = LazyStateDict(local_dir)
+    # Map module identity -> fully-qualified name, so we can pull the matching
+    # tensor straight out of the checkpoint for any module in the meta model
+    module_names = {id(m): n for n, m in hf_model.named_modules()}
+
+    def w(module: torch.nn.Module) -> Tensor:
+        name = module_names[id(module)] + ".weight"
+        return weights.get(name).to(dtype)
+
+    # Can't use config.vocab_size here, sometimes they are different
+    vocab_size = len(hf_tokenizer._vocab)
 
     with open(export_path, "wb") as f:
         # Dump the model config
         f.write(struct.pack("> ccc HHHHH II fffff", *(
-            # char (1 byte)
             bytes([config.num_hidden_layers]),
             bytes([config.num_attention_heads]),
             bytes([config.num_key_value_heads]),
-            # unsigned short (2 bytes)
             config.head_dim,
-            config.hidden_size,  # embed_dim
+            config.hidden_size,
             config.intermediate_size,
             config.query_pre_attn_scalar,
             config.sliding_window or 0,
-            # unsigned int (4 bytes)
             config.max_position_embeddings,
-            config.vocab_size,
-            # float (4 bytes)
+            vocab_size,
             config.rope_parameters.get("sliding_attention", {}).get("rope_theta", 10000.0)
-                if isinstance(hf_model, Gemma3ForCausalLM) and config.rope_parameters is not None
-                else 10000.0,  # local_theta
+                if isinstance(hf_model, Gemma3Models) and config.rope_parameters is not None
+                else 10000.0,
             config.rope_parameters.get("full_attention", {}).get("rope_theta", 10000.0)
-                if isinstance(hf_model, Gemma3ForCausalLM) and config.rope_parameters is not None
-                else 10000.0,  # global_theta
+                if isinstance(hf_model, Gemma3Models) and config.rope_parameters is not None
+                else 10000.0,
             config.rms_norm_eps,
             config.attn_logit_softcapping or 0.0,
             config.final_logit_softcapping or 0.0,
@@ -65,26 +149,24 @@ def export_hf(
         # attn_local_layers
         attn_local_layers = (
             [lt == "sliding_attention" for lt in config.layer_types]
-            if isinstance(hf_model, (Gemma2ForCausalLM, Gemma3ForCausalLM))
+            if isinstance(hf_model, (Gemma2ForCausalLM, *Gemma3Models))
                 and config.layer_types is not None
             else [False]
         )
         n_layer_bytes = (len(attn_local_layers) + 7) // 8
         layer_bytes = bytearray((len(attn_local_layers) + 7) // 8)
-
         for i, bit in enumerate(attn_local_layers):
             if bit:
                 layer_bytes[i // 8] |= (1 << (7 - i % 8))
-
         f.write(n_layer_bytes.to_bytes())
         f.write(layer_bytes)
 
         # Additional flags
         extra_flags = 0
         for bit in [
-            isinstance(hf_model, Gemma3ForCausalLM),  # use_qk_norm
-            isinstance(hf_model, (Gemma2ForCausalLM, Gemma3ForCausalLM)),  # pre_ffwd_norm
-            isinstance(hf_model, (Gemma2ForCausalLM, Gemma3ForCausalLM)),  # post_ffwd_norm
+            isinstance(hf_model, Gemma3Models),
+            isinstance(hf_model, (Gemma2ForCausalLM, *Gemma3Models)),
+            isinstance(hf_model, (Gemma2ForCausalLM, *Gemma3Models)),
             quant,
         ]:
             extra_flags = (extra_flags << 1) | bit
@@ -95,7 +177,6 @@ def export_hf(
             f.write(len(str_bytes).to_bytes())
             f.write(str_bytes)
 
-        # dtype
         write_str(str(dtype).removeprefix("torch."))
 
         # Dump the tokenizer (vocab & merges)
@@ -110,11 +191,29 @@ def export_hf(
             write_str(lhs.replace("▁", " "))
             write_str(rhs.replace("▁", " "))
 
-        # Dump the weights
         def write_tensor(tensor: Tensor):
-            f.write(tensor.contiguous().numpy().tobytes())
+            arr = tensor.contiguous().numpy()
+            arr.tofile(f)
 
-        emb_weight = hf_model.model.embed_tokens.weight.data.to(dtype)
+        if isinstance(hf_model, GemmaLLMs):
+            text_model = hf_model.model
+        elif isinstance(hf_model, GemmaVLMs):
+            text_model = hf_model.model.language_model
+        else:
+            assert False
+
+        total = config.num_hidden_layers * 7
+        if quant:
+            total *= 2
+        total += config.num_hidden_layers * 2
+        if isinstance(hf_model, Gemma3Models):
+            total += config.num_hidden_layers * 4
+        total += 2
+        pbar = tqdm(total=total, desc="Writing weights")
+        pbar.refresh()
+
+        # Embedding weight
+        emb_weight = w(text_model.embed_tokens)[:vocab_size, :]
         if quant:
             emb = Embedding(emb_weight.size(0), emb_weight.size(1), True, dtype)
             emb.weight.data = emb_weight
@@ -123,26 +222,30 @@ def export_hf(
         write_tensor(emb_weight)
         if quant:
             write_tensor(emb.weight_scaler.data)  # type: ignore
+        pbar.update()
+        del emb_weight
+        if quant:
+            del emb  # type: ignore
 
         for i in range(config.num_hidden_layers):
             layer: (
                 Gemma1DecoderLayer | Gemma2DecoderLayer | Gemma3DecoderLayer
-            ) = hf_model.model.layers[i]  # type: ignore
+            ) = text_model.layers[i]  # type: ignore
 
             hf_attn = layer.self_attn
-            q_proj = hf_attn.q_proj.weight.data.to(dtype)
-            k_proj = hf_attn.k_proj.weight.data.to(dtype)
-            v_proj = hf_attn.v_proj.weight.data.to(dtype)
-            o_proj = hf_attn.o_proj.weight.data.to(dtype)
+            q_proj = w(hf_attn.q_proj)
+            k_proj = w(hf_attn.k_proj)
+            v_proj = w(hf_attn.v_proj)
+            o_proj = w(hf_attn.o_proj)
 
             weight_scalars: list = [None, None, None, None]
             if quant:
-                q_linear = Linear(q_proj.size(1), emb_weight.size(0), True, dtype)
-                k_linear = Linear(k_proj.size(1), emb_weight.size(0), True, dtype)
-                v_linear = Linear(v_proj.size(1), emb_weight.size(0), True, dtype)
-                o_linear = Linear(o_proj.size(1), emb_weight.size(0), True, dtype)
+                q_linear = Linear(q_proj.size(1), q_proj.size(0), True, dtype)
+                k_linear = Linear(k_proj.size(1), k_proj.size(0), True, dtype)
+                v_linear = Linear(v_proj.size(1), v_proj.size(0), True, dtype)
+                o_linear = Linear(o_proj.size(1), o_proj.size(0), True, dtype)
 
-                for i, (mod, wei) in enumerate((
+                for j, (mod, wei) in enumerate((
                     (q_linear, q_proj),
                     (k_linear, k_proj),
                     (v_linear, v_proj),
@@ -150,66 +253,87 @@ def export_hf(
                 )):
                     mod.weight.data = wei.T
                     mod.quantize()
-                    weight_scalars[i] = mod.weight_scaler.data
+                    pbar.update()
+                    weight_scalars[j] = mod.weight_scaler.data
 
                 q_proj = q_linear.weight.data.T
                 k_proj = k_linear.weight.data.T
                 v_proj = v_linear.weight.data.T
                 o_proj = o_linear.weight.data.T
+                del q_linear, k_linear, v_linear, o_linear
 
             for wei, sca in zip((q_proj, k_proj, v_proj, o_proj), weight_scalars):
                 write_tensor(wei)
                 if sca is not None:
                     write_tensor(sca)
+                pbar.update()
+            del weight_scalars, q_proj, k_proj, v_proj, o_proj
 
-            if isinstance(hf_attn, Gemma3Attention):  # use_qk_norm
-                q_norm = hf_attn.q_norm.weight.data.to(dtype)
-                k_norm = hf_attn.k_norm.weight.data.to(dtype)
+            if isinstance(hf_attn, Gemma3Attention):
+                q_norm = w(hf_attn.q_norm)
+                k_norm = w(hf_attn.k_norm)
                 write_tensor(q_norm)
+                pbar.update()
                 write_tensor(k_norm)
+                pbar.update()
+                del q_norm, k_norm
+            del hf_attn
 
             hf_ffwd = layer.mlp
-            up_proj = hf_ffwd.up_proj.weight.data.to(dtype)
-            gate_proj = hf_ffwd.gate_proj.weight.data.to(dtype)
-            down_proj = hf_ffwd.down_proj.weight.data.to(dtype)
+            up_proj = w(hf_ffwd.up_proj)
+            gate_proj = w(hf_ffwd.gate_proj)
+            down_proj = w(hf_ffwd.down_proj)
 
-            weight_scalars: list = [None, None, None, None]
+            weight_scalars = [None, None, None]
             if quant:
                 up_linear = Linear(up_proj.size(1), up_proj.size(0), True, dtype)
                 gate_linear = Linear(gate_proj.size(1), gate_proj.size(0), True, dtype)
                 down_linear = Linear(down_proj.size(1), down_proj.size(0), True, dtype)
 
-                for i, (mod, wei) in enumerate((
+                for j, (mod, wei) in enumerate((
                     (up_linear, up_proj),
                     (gate_linear, gate_proj),
                     (down_linear, down_proj),
                 )):
                     mod.weight.data = wei.T
                     mod.quantize()
-                    weight_scalars[i] = mod.weight_scaler.data
+                    pbar.update()
+                    weight_scalars[j] = mod.weight_scaler.data
 
                 up_proj = up_linear.weight.data.T
                 gate_proj = gate_linear.weight.data.T
                 down_proj = down_linear.weight.data.T
+                del up_linear, gate_linear, down_linear
 
             for wei, sca in zip((up_proj, gate_proj, down_proj), weight_scalars):
                 write_tensor(wei)
                 if sca is not None:
                     write_tensor(sca)
+                pbar.update()
+            del weight_scalars, up_proj, gate_proj, down_proj, hf_ffwd
 
-            norm1 = layer.input_layernorm.weight.data.to(dtype)
-            norm2 = layer.post_attention_layernorm.weight.data.to(dtype)
+            norm1 = w(layer.input_layernorm)
+            norm2 = w(layer.post_attention_layernorm)
             write_tensor(norm1)
+            pbar.update()
             write_tensor(norm2)
+            pbar.update()
+            del norm1, norm2
 
             if isinstance(layer, Gemma3DecoderLayer):
-                norm3 = layer.pre_feedforward_layernorm.weight.data.to(dtype)
-                norm4 = layer.post_feedforward_layernorm.weight.data.to(dtype)
+                norm3 = w(layer.pre_feedforward_layernorm)
+                norm4 = w(layer.post_feedforward_layernorm)
                 write_tensor(norm3)
+                pbar.update()
                 write_tensor(norm4)
+                pbar.update()
+                del norm3, norm4
 
-        final_norm = hf_model.model.norm.weight.data.to(dtype)
+            gc.collect()
+
+        final_norm = w(text_model.norm)
         write_tensor(final_norm)
+        pbar.update()
 
 
 def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
@@ -232,7 +356,7 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
         def read_str():
             str_len = f.read(1)[0]
             return f.read(str_len).decode("utf-8")
-            
+        
         # attn_local_layers
         bits = 0
         local_layers_bytes = f.read(1)[0]
@@ -359,24 +483,26 @@ Examples:
         required=True,
         help="Path to the Hugging Face model id / local directory"
     )
-    
     parser.add_argument(
         "-o", "--output",
         required=True,
         help="Output binary file path"
     )
-    
     parser.add_argument(
         "-d", "--dtype",
         choices=["float16", "float32", "bfloat16"],
         default="float16",
         help="Data type for model weights (default: float16)"
     )
-    
     parser.add_argument(
         "-q", "--quantize",
         action="store_true",
         help="Enable 8-bit quantization"
+    )
+    parser.add_argument(
+        "-c", "--cache-path",
+        type=str,
+        help="Hugging Face cache directory"
     )
     
     args = parser.parse_args()
@@ -388,5 +514,5 @@ Examples:
     }
     dtype = dtype_map[args.dtype]
     
-    export_hf(args.model_path, args.output, dtype, args.quantize)
+    export_hf(args.model_path, args.output, dtype, args.quantize, args.cache_path)
     print(f"Successfully exported to {args.output}")
