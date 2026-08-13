@@ -83,7 +83,7 @@ void *safe_malloc(size_t size, const char *context) {
     void *ptr = malloc(size);
     if (ptr == NULL) {
         fprintf(
-            stderr, "Memory allocation failed: %s (size: %zu bytes)\n",
+            stderr, "Memory allocation failed: %s (size: %zu)\n",
             context, size
         ); exit(1);
     }
@@ -532,7 +532,10 @@ GemmaModel *read_model(const char *filename) {
     char dtype[10];
     read_str(fp, dtype, &offset);
     if (strcmp(dtype, "float16") != 0) {
-        printf("dtype %s not supported\n", repr(dtype)); exit(1);
+        char *repr_dtype = repr(dtype);
+        printf("dtype %s not supported\n", repr_dtype);
+        free(repr_dtype);
+        exit(1);
     }
 
     // Build vocabulary
@@ -625,10 +628,12 @@ GemmaModel *read_model(const char *filename) {
 
 void rmsnorm(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps) {
     float sqsum = 0.0f;
+    #pragma omp simd reduction(+:sqsum)
     for (int i = 0; i < dim; i++) {
         sqsum += (float)src[i] * (float)src[i];
     }
     float rms = 1.0f / sqrtf(sqsum / dim + eps);
+    #pragma omp simd
     for (int i = 0; i < dim; i++) {
         // Gemma uses (weight + 1) instead of (weight)
         dst[i] = (_Float16)((float)src[i] * rms * (weight[i] + 1));
@@ -648,7 +653,7 @@ _Float16 quantize_act(int8_t *dst, _Float16 *vec, int dim) {
     _Float16 qscale = amax > 0.0f ? amax / 127.0f : 1.0f;
 
     // Quantize vec into qbuf
-    #pragma omp parallel for
+    #pragma omp simd
     for (int d = 0; d < dim; d++) {
         int q = (int)roundf((float)vec[d] / (float)qscale);
         if (q > 127) { q = 127; }
@@ -715,6 +720,7 @@ void softmax(_Float16 *dst, _Float16 *src, int dim) {
         expsum += val;
     }
 
+    #pragma omp simd
     for (int i = 0; i < dim; i++) {
         dst[i] = (_Float16)((float)dst[i] / expsum);
     }
