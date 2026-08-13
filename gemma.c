@@ -85,8 +85,7 @@ void *safe_malloc(size_t size, const char *context) {
         fprintf(
             stderr, "Memory allocation failed: %s (size: %zu bytes)\n",
             context, size
-        );
-        exit(1);
+        ); exit(1);
     }
     return ptr;
 }
@@ -97,8 +96,7 @@ void *safe_calloc(size_t count, size_t size, const char *context) {
         fprintf(
             stderr, "Memory allocation failed: %s (count: %zu, size: %zu)\n",
             context, count, size
-        );
-        exit(1);
+        ); exit(1);
     }
     return ptr;
 }
@@ -109,8 +107,7 @@ void safe_fread(void *ptr, size_t size, size_t count, FILE *fp, const char *cont
         fprintf(
             stderr, "File read failed: %s (expected %zu, got %zu)\n",
             context, count, read
-        );
-        exit(1);
+        ); exit(1);
     }
 }
 
@@ -152,8 +149,7 @@ int cmp_token(const void *a, const void *b) {
 
 int cmp_merge(const void *a, const void *b) {
     int ret = strcmp(((Merge *)a)->str1, ((Merge *)b)->str1);
-    if (ret != 0)
-        return ret;
+    if (ret != 0) { return ret; }
     return strcmp(((Merge *)a)->str2, ((Merge *)b)->str2);
 }
 
@@ -257,19 +253,14 @@ void free_model(GemmaModel *model) {
         free_linear(layer->wk);
         free_linear(layer->wv);
         free_linear(layer->wo);
-        if (conf->use_qk_norm) {
-            free(layer->nq);
-            free(layer->nk);
-        }
         free_linear(layer->w1);
         free_linear(layer->w2);
         free_linear(layer->w3);
         free(layer->n1);
         free(layer->n2);
-        if (conf->pre_ffwd_norm)
-            free(layer->n3);
-        if (conf->post_ffwd_norm)
-            free(layer->n4);
+        if (conf->use_qk_norm) { free(layer->nq); free(layer->nk); }
+        if (conf->pre_ffwd_norm) free(layer->n3);
+        if (conf->post_ffwd_norm) free(layer->n4);
         free(layer);
     }
     free(model->final_norm);
@@ -341,11 +332,6 @@ ModelBuffer *malloc_buffer(GemmaConfig *conf, int cache_len) {
 }
 
 void free_buffer(ModelBuffer *buf, bool quant) {
-    if (quant) {
-        free(buf->x_i8);
-        free(buf->xo_i8);
-        free(buf->xg_i8);
-    }
     free(buf->x);
     free(buf->resid);
     free(buf->xq);
@@ -361,6 +347,7 @@ void free_buffer(ModelBuffer *buf, bool quant) {
     free(buf->xg);
     free(buf->xu);
     free(buf->logits);
+    if (quant) { free(buf->x_i8); free(buf->xo_i8); free(buf->xg_i8); }
     free(buf);
 }
 
@@ -392,8 +379,7 @@ char *read_str(FILE *fp, char *data, int *offset) {
     // Read a pascal-style string, the first byte indicates the length
     int len = fgetc(fp);
     if (len == EOF) {
-        fprintf(stderr, "File read failed: reading string length\n");
-        exit(1);
+        fprintf(stderr, "File read failed: reading string length\n"); exit(1);
     }
     char *str = data + *offset;
     safe_fread(str, sizeof(char), len, fp, "string data");
@@ -407,26 +393,22 @@ int get_strarr_bytes(FILE *fp, int count) {
     int offset = 0;
     long pos = ftell(fp);
     if (pos == -1L) {
-        perror("ftell failed");
-        exit(1);
+        perror("ftell failed"); exit(1);
     }
     // Get the total number of bytes
     for (int i = 0; i < count; i++) {
         int len = fgetc(fp);
         if (len == EOF) {
-            fprintf(stderr, "File read failed: reading string length in array\n");
-            exit(1);
+            fprintf(stderr, "File read failed: reading string length\n"); exit(1);
         }
         if (fseek(fp, len, SEEK_CUR) != 0) {
-            perror("fseek failed");
-            exit(1);
+            perror("fseek failed"); exit(1);
         }
         offset += len + 1;
     }
     // Resume position
     if (fseek(fp, pos, SEEK_SET) != 0) {
-        perror("fseek failed");
-        exit(1);
+        perror("fseek failed"); exit(1);
     }
     return offset;
 }
@@ -487,14 +469,7 @@ char *repr(const char *str) {
             result[offset++] = '"';
             break;
         default:
-            if (str[i] >= 32 && str[i] < 127) {
-                result[offset++] = str[i];
-            } else {
-                result[offset++] = '\\';
-                result[offset++] = 'x';
-                result[offset++] = "0123456789abcdef"[(unsigned char)str[i] >> 4];
-                result[offset++] = "0123456789abcdef"[(unsigned char)str[i] & 15];
-            }
+            result[offset++] = str[i];
         }
     }
     result[offset++] = '"';
@@ -529,8 +504,7 @@ GemmaModel *read_model(const char *filename) {
     // attn_local_layers
     int n_bytes = fgetc(fp);
     if (n_bytes == EOF) {
-        fprintf(stderr, "File read failed: reading attn_local_layers size\n");
-        exit(1);
+        fprintf(stderr, "File read failed: reading attn_local_layers size\n"); exit(1);
     }
     char *buf = safe_malloc(n_bytes, "attn_local_layers buffer");
     conf->attn_local_layers = safe_malloc(conf->n_layers * sizeof(bool), "attn_local_layers");
@@ -546,21 +520,19 @@ GemmaModel *read_model(const char *filename) {
     // Additional flags
     int extra_flags = fgetc(fp);
     if (extra_flags == EOF) {
-        fprintf(stderr, "File read failed: reading extra flags\n");
-        exit(1);
+        fprintf(stderr, "File read failed: reading extra flags\n"); exit(1);
     }
     conf->use_qk_norm = (extra_flags & 8) == 8;
     conf->pre_ffwd_norm = (extra_flags & 4) == 4;
     conf->post_ffwd_norm = (extra_flags & 2) == 2;
-    conf->quant = (extra_flags & 1) == 1;
+    conf->quant = extra_flags & 1;
 
     // dtype (only supports float16)
     int offset = 0;
     char dtype[10];
     read_str(fp, dtype, &offset);
     if (strcmp(dtype, "float16") != 0) {
-        printf("dtype %s not supported\n", repr(dtype));
-        exit(1);
+        printf("dtype %s not supported\n", repr(dtype)); exit(1);
     }
 
     // Build vocabulary
@@ -636,10 +608,12 @@ GemmaModel *read_model(const char *filename) {
         layer->n1 = read_tensor_fp16(fp, conf->embed_dim);
         layer->n2 = read_tensor_fp16(fp, conf->embed_dim);
 
-        if (conf->pre_ffwd_norm)
+        if (conf->pre_ffwd_norm) {
             layer->n3 = read_tensor_fp16(fp, conf->embed_dim);
-        if (conf->post_ffwd_norm)
+        }
+        if (conf->post_ffwd_norm) {
             layer->n4 = read_tensor_fp16(fp, conf->embed_dim);
+        }
 
         model->layers[l] = layer;
     }
@@ -651,12 +625,10 @@ GemmaModel *read_model(const char *filename) {
 
 void rmsnorm(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps) {
     float sqsum = 0.0f;
-    #pragma omp parallel for reduction(+:sqsum)
     for (int i = 0; i < dim; i++) {
         sqsum += (float)src[i] * (float)src[i];
     }
     float rms = 1.0f / sqrtf(sqsum / dim + eps);
-    #pragma omp parallel for
     for (int i = 0; i < dim; i++) {
         // Gemma uses (weight + 1) instead of (weight)
         dst[i] = (_Float16)((float)src[i] * rms * (weight[i] + 1));
@@ -666,9 +638,10 @@ void rmsnorm(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps)
 _Float16 quantize_act(int8_t *dst, _Float16 *vec, int dim) {
     // Quantize the activation vector, and returns quantization scale
     _Float16 amax = 0.0f;  // Find the abs max in vec
+    #pragma omp parallel reduction(max:amax)
     for (int d = 0; d < dim; d++) {
         _Float16 av = vec[d] >= 0 ? vec[d] : -vec[d];
-        if (av > amax) amax = av;
+        if (av > amax) { amax = av; }
     }
 
     // 1.0f just to make sure we are not dividing by zero
@@ -678,8 +651,8 @@ _Float16 quantize_act(int8_t *dst, _Float16 *vec, int dim) {
     #pragma omp parallel for
     for (int d = 0; d < dim; d++) {
         int q = (int)roundf((float)vec[d] / (float)qscale);
-        if (q > 127) q = 127;
-        else if (q < -127) q = -127;
+        if (q > 127) { q = 127; }
+        else if (q < -127) { q = -127; }
         dst[d] = (int8_t)q;
     }
 
@@ -692,11 +665,13 @@ void gemv_fp16(
     _Float16 *restrict vec,
     int m, int n
 ) {
+    // fp16 mat (m, n) @ fp16 vec (n,) = fp16 dst (m,)
     #pragma omp parallel for
     for (int i = 0; i < m; i++) {
         float sum = 0;
-        for (int j = 0; j < n; j++)
+        for (int j = 0; j < n; j++) {
             sum += (float)mat->fp16[i*n + j] * (float)vec[j];
+        }
         dst[i] = (_Float16)sum;
     }
 }
@@ -710,37 +685,61 @@ void gemv_int8(
 ) {
     float fqscale = (float)qscale;
 
+    // int8 mat (m, n) @ int8 vec (n,) = fp16 dst (m,)
     #pragma omp parallel for
     for (int i = 0; i < m; i++) {
         int32_t sum = 0;
-        for (int j = 0; j < n; j++)
+        for (int j = 0; j < n; j++) {
             sum += (int32_t)mat->i8.q[i*n + j] * (int32_t)vec[j];
+        }
         dst[i] = (_Float16)((float)sum * fqscale * (float)mat->i8.scales[i]);
     }
 }
 
 _Float16 dot(_Float16 *v1, _Float16 *v2, int dim) {
     _Float16 sum = 0.0f;
-    #pragma omp parallel for reduction(+:sum)
-    for (int i = 0; i < dim; i++)
-        sum += v1[i] * v2[i];
+    for (int i = 0; i < dim; i++) { sum += v1[i] * v2[i]; }
     return sum;
 }
 
 void softmax(_Float16 *dst, _Float16 *src, int dim) {
     _Float16 max = -1e10f;
-    for (int i = 0; i < dim; i++)
-        if (src[i] > max) max = src[i];
+    for (int i = 0; i < dim; i++) {
+        if (src[i] > max) { max = src[i]; }
+    }
 
     float expsum = 0.0f;
     for (int i = 0; i < dim; i++) {
         float val = expf((float)(src[i] - max));
-        expsum += val;
         dst[i] = (_Float16)val;
+        expsum += val;
     }
 
-    for (int i = 0; i < dim; i++)
+    for (int i = 0; i < dim; i++) {
         dst[i] = (_Float16)((float)dst[i] / expsum);
+    }
+}
+
+void softmax_omp(_Float16 *dst, _Float16 *src, int dim) {
+    // OpenMP parallelized version of softmax
+    _Float16 max = -(_Float16)INFINITY;
+    #pragma omp parallel for reduction(max:max)
+    for (int i = 0; i < dim; i++) {
+        if (src[i] > max) { max = src[i]; }
+    }
+
+    float expsum = 0.0f;
+    #pragma omp parallel for reduction(+:expsum)
+    for (int i = 0; i < dim; i++) {
+        float val = expf((float)(src[i] - max));
+        dst[i] = (_Float16)val;
+        expsum += val;
+    }
+
+    #pragma omp parallel for
+    for (int i = 0; i < dim; i++) {
+        dst[i] = (_Float16)((float)dst[i] / expsum);
+    }
 }
 
 // Make sure the clamping is not optimized by compilers
@@ -759,6 +758,13 @@ static inline _Float16 clamp_fp16(_Float16 v) {
 
 void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
     GemmaConfig *conf = model->config;
+    
+    if (pos >= buf->cache_len) {
+        printf("\nKV Cache is full, exiting...");
+        free_buffer(buf, conf->quant);
+        free_model(model);
+        exit(1);
+    }
 
     // x = embedding[tok] * embed_dim**0.5
     _Float16 embed_scale = (_Float16)sqrtf((float)conf->embed_dim);
@@ -767,10 +773,11 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
         embed_scale *= model->embedding.i8.scales[tok];
 
     for (int i = 0; i < conf->embed_dim; i++) {
-        if (!conf->quant)
+        if (!conf->quant) {
             buf->x[i] = model->embedding.fp16[tok*conf->embed_dim + i] * embed_scale;
-        else
+        } else {
             buf->x[i] = model->embedding.i8.q[tok*conf->embed_dim + i] * embed_scale;
+        }
     }
     
     int q_size = conf->n_heads * conf->head_dim;
@@ -832,8 +839,8 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
         // Apply RoPE to queries & keys
         #pragma omp parallel for
         for (int d = 0; d < conf->n_heads * conf->head_dim; d++) {
-            int a = d % hd_half;  // Index in the current half vector
-            int b = a + hd_half;  // Index in the current half vector
+            int a = d % hd_half;  // Index in the first half vector
+            int b = a + hd_half;  // Index in the second half vector
             int i = d % conf->head_dim;  // Index in the current vector
             int h = d / conf->head_dim;  // Current head
             int o = h * conf->head_dim;  // Offset for current head
@@ -842,74 +849,75 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
             float sfr = freqs_cs[a*2 + 1];
             
             // Apply to queries
-            if (i < hd_half)
+            if (i < hd_half) {
                 buf->xq_buf[o+i] = (_Float16)(buf->xq[o+a]*cfr - buf->xq[o+b]*sfr);
-            else
+            } else {
                 buf->xq_buf[o+i] = (_Float16)(buf->xq[o+a]*sfr + buf->xq[o+b]*cfr);
+            }
 
             if (h >= conf->n_kv_heads) continue;
             
             // Apply to keys
-            if (i < hd_half)
+            if (i < hd_half) {
                 buf->xk_buf[o+i] = (_Float16)(buf->xk[o+a]*cfr - buf->xk[o+b]*sfr);
-            else
+            } else {
                 buf->xk_buf[o+i] = (_Float16)(buf->xk[o+a]*sfr + buf->xk[o+b]*cfr);
+            }
         }
 
         memcpy(buf->xq, buf->xq_buf, conf->n_heads * conf->head_dim * sizeof(_Float16));
         memcpy(buf->xk, buf->xk_buf, conf->n_kv_heads * conf->head_dim * sizeof(_Float16));
 
-        if (pos >= buf->cache_len) {
-            printf("\nKV Cache is full, exiting...");
-            free_buffer(buf, conf->quant);
-            free_model(model);
-            exit(1);
-        }
-        int entry_size = conf->n_kv_heads * conf->head_dim;
-        int layer_size = 2*buf->cache_len * entry_size;
+        int entry_sz = conf->n_kv_heads * conf->head_dim;
+        int layer_sz = 2*buf->cache_len * entry_sz;
 
         // (cache_len, n_kv_heads, head_dim)
-        _Float16 *k_cache = buf->kv_cache + l*layer_size;
-        _Float16 *v_cache = k_cache + buf->cache_len * entry_size;
+        _Float16 *k_cache = buf->kv_cache + l*layer_sz;
+        _Float16 *v_cache = k_cache + buf->cache_len * entry_sz;
 
         // Write to key & value cache
-        memcpy(k_cache + pos*entry_size, buf->xk, entry_size*sizeof(_Float16));
-        memcpy(v_cache + pos*entry_size, buf->xv, entry_size*sizeof(_Float16));
+        memcpy(k_cache + pos*entry_sz, buf->xk, entry_sz*sizeof(_Float16));
+        memcpy(v_cache + pos*entry_sz, buf->xv, entry_sz*sizeof(_Float16));
+
+        // Whether the current layer uses sliding window attention
+        bool local_att = is_local && pos >= conf->sliding_window;
+        // Starting position of attention
+        int spos = local_att ? (pos + 1 - conf->sliding_window) : 0;
+        int attlen = pos + 1 - spos;  // Include the current pos
 
         // Iterate over all the attention heads
         #pragma omp parallel for
         for (int h = 0; h < conf->n_heads; h++) {
             int h_kv = h * conf->n_kv_heads / conf->n_heads;
             _Float16 *xq_head = buf->xq + h*conf->head_dim;  // xq[h, :]
-            _Float16 *xk_head = k_cache + h_kv*conf->head_dim;  // k_cache[:, h_kv, :]
-            _Float16 *att_head = buf->att + h*buf->cache_len;  // att[h, :]
+            _Float16 *xk_head = k_cache + spos*entry_sz + h_kv*conf->head_dim;  // k_cache[spos:, h_kv, :]
+            _Float16 *att_head = buf->att + h*buf->cache_len + spos;  // att[h, spos:]
 
             // Compute dot product of the current query across all the keys
-            for (int t = 0; t <= pos; t++)
-                att_head[t] = dot(xq_head, xk_head + t*entry_size, conf->head_dim) * att_scale;
+            for (int t = 0; t < attlen; t++) {
+                att_head[t] = dot(xq_head, xk_head + t*entry_sz, conf->head_dim) * att_scale;
+            }
     
             // Attention score softcapping
-            if (conf->attn_softcapping != 0.0f)
-                for (int t = 0; t <= pos; t++) {
+            if (conf->attn_softcapping != 0.0f) {
+                for (int t = 0; t < attlen; t++) {
                     float val = (float)att_head[t] / conf->attn_softcapping;
                     att_head[t] = (_Float16)(tanhf(val) * conf->attn_softcapping);
                 }
+            }
 
-            // Sliding window attention, discard attention scores at the beginning
-            if (is_local && pos >= conf->sliding_window)
-                for (int i = 0; i <= pos - conf->sliding_window; i++)
-                    att_head[i] = -(_Float16)INFINITY;
-            
             // Softmax
-            softmax(att_head, att_head, pos + 1);
+            softmax(att_head, att_head, attlen);
 
             // Compute output
-            _Float16 *xv_head = v_cache + h_kv*conf->head_dim;  // v_cache[:, h_kv, :]
+            _Float16 *xv_head = v_cache + spos*entry_sz + h_kv*conf->head_dim;  // v_cache[spos:, h_kv, :]
             _Float16 *xo_head = buf->xo + h*conf->head_dim;
+            // xo_head (head_dim,) = att_head (attlen,) @ xv_head (attlen, head_dim)
             for (int d = 0; d < conf->head_dim; d++) {
                 float sum = 0.0f;
-                for (int t = 0; t <= pos; t++)
-                    sum += (xv_head + t*entry_size)[d] * att_head[t];
+                for (int t = 0; t < attlen; t++) {
+                    sum += (xv_head + t*entry_sz)[d] * att_head[t];
+                }
                 xo_head[d] = sum;
             }
         }
@@ -936,8 +944,9 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
 
         memcpy(buf->resid, buf->x, conf->embed_dim * sizeof(_Float16));
 
-        if (conf->pre_ffwd_norm)
+        if (conf->pre_ffwd_norm) {
             rmsnorm(buf->x, buf->x, layer->n3, conf->embed_dim, conf->eps);
+        }
 
         // MLP feedforward layer
         if (!conf->quant) {
@@ -949,18 +958,18 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
             gemv_int8(buf->xu, &layer->w1, buf->x_i8, conf->mlp_hidden_size, conf->embed_dim, xscale);
         }
 
-        // GELU layer using tanh approximation
+        // GELU layer
         #pragma omp parallel for
         for (int d = 0; d < conf->mlp_hidden_size; d++) {
+            // Tanh approximation of GELU
             float x = (float)buf->xg[d];
             float c = 0.79788456080287f;  // sqrt(2 / pi)
             x = 0.5*x * (1 + tanhf(c * (x + 0.044715 * x*x*x)));
             buf->xg[d] = (_Float16)x;
-        }
-        // Fuse xg * xu into xg
-        for (int d = 0; d < conf->mlp_hidden_size; d++)
+            // Fuse xg * xu into xg
             buf->xg[d] *= buf->xu[d];
-
+        }
+        
         if (!conf->quant) {
             gemv_fp16(buf->x, &layer->w3, buf->xg, conf->embed_dim, conf->mlp_hidden_size);
         } else {
@@ -968,8 +977,9 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
             gemv_int8(buf->x, &layer->w3, buf->xg_i8, conf->embed_dim, conf->mlp_hidden_size, xscale);
         }
 
-        if (conf->post_ffwd_norm)
+        if (conf->post_ffwd_norm) {
             rmsnorm(buf->x, buf->x, layer->n4, conf->embed_dim, conf->eps);
+        }
 
         // Combine the residual stream
         for (int d = 0; d < conf->embed_dim; d++) {
@@ -982,104 +992,147 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
     rmsnorm(buf->x, buf->x, model->final_norm, conf->embed_dim, conf->eps);
 
     // Logit softcapping
-    if (conf->logit_softcapping != 0.0f)
+    if (conf->logit_softcapping != 0.0f) {
         for (int d = 0; d < conf->vocab_size; d++) {
             float val = (float)buf->logits[d] / conf->logit_softcapping;
             buf->logits[d] = (_Float16)(tanhf(val) * conf->logit_softcapping);
         }
+    }
 }
 
 int argmax(_Float16 *logits, int vocab_size) {
     // Pick the index with the max value
     int max_idx = -1;
     _Float16 max_val = -(_Float16)INFINITY;
-    for (int i = 0; i < vocab_size; i++)
-        if (logits[i] > max_val) {
-            max_val = logits[i];
-            max_idx = i;
-        }
+    for (int i = 0; i < vocab_size; i++) {
+        if (logits[i] > max_val) { max_val = logits[i]; max_idx = i; }
+    }
     return max_idx;
 }
 
 typedef struct { _Float16 val; int idx; } FloatIdx;
 
-int cmp_floatidx(const void *a, const void *b) {
-    FloatIdx *pa = (FloatIdx *)a;
-    FloatIdx *pb = (FloatIdx *)b;
-    if (pb->val > pa->val) return 1;
-    else if (pb->val < pa->val) return -1;
-    return 0;
+static inline void swap_fi(FloatIdx *a, FloatIdx *b) { FloatIdx t = *a; *a = *b; *b = t; }
+
+static uint32_t qs_rand_state = 3418323524;
+static inline uint32_t qs_rand(void) {
+    qs_rand_state ^= qs_rand_state << 13;
+    qs_rand_state ^= qs_rand_state >> 7;
+    qs_rand_state ^= qs_rand_state << 17;
+    return (uint32_t)qs_rand_state;
 }
 
-void apply_topk(_Float16 *logits, FloatIdx *fis, int vocab_size, int k) {
-    if (k <= 0) k = 1;
-    if (k > vocab_size) k = vocab_size;
+int partition_desc(FloatIdx *arr, int lo, int hi) {
+    // Pick the pivot randomly (use a seperate rand sequence)
+    int r = lo + qs_rand() % (hi - lo + 1);
+    swap_fi(&arr[r], &arr[hi]);
+
+    _Float16 pivot = arr[hi].val;
+    int i = lo;
+    for (int j = lo; j < hi; j++) {
+        // Put the greater one on the left
+        if (arr[j].val > pivot) { swap_fi(&arr[i++], &arr[j]); }
+    }
+    swap_fi(&arr[i], &arr[hi]);
+    return i;
+}
+
+void quickselect_topk(FloatIdx *arr, int lo, int hi, int k_idx) {
+    while (lo < hi) {
+        int p = partition_desc(arr, lo, hi);
+        if (p == k_idx) return;
+        else if (p < k_idx) { lo = p + 1; }
+        else { hi = p - 1; }
+    }
+}
+
+void apply_topk(_Float16 *logits, FloatIdx *logit_indices, int vocab_size, int k) {
+    if (k <= 0) { k = 1; }
+    if (k > vocab_size) { k = vocab_size; }
 
     // Record index info
     #pragma omp parallel for
     for (int i = 0; i < vocab_size; i++) {
-        fis[i].val = logits[i];
-        fis[i].idx = i;
+        logit_indices[i].idx = i;
+        logit_indices[i].val = logits[i];
     }
-    qsort(fis, vocab_size, sizeof(FloatIdx), cmp_floatidx);
+    quickselect_topk(logit_indices, 0, vocab_size - 1, k - 1);
 
-    // Keep the top k channels, set the rest to -inf
+    // Keep the top k channels
     #pragma omp parallel for
-    for (int i = 0; i < vocab_size; i++)
-        logits[i] = -(_Float16)INFINITY;
+    for (int i = 0; i < vocab_size; i++) { logits[i] = -(_Float16)INFINITY; }
+    for (int i = 0; i < k; i++) { logits[logit_indices[i].idx] = logit_indices[i].val; }
+}
 
-    for (int i = 0; i < k; i++) {
-        int orig_i = fis[i].idx;
-        logits[orig_i] = fis[i].val;
+void sift_down(FloatIdx *arr, int n, int i) {
+    // Make sure the parent node arr[i] is greater than its children in the heap
+    for (;;) {
+        // l & r are the two children node
+        int l = 2*i + 1, r = 2*i + 2, largest = i;
+        if (l < n && arr[l].val > arr[largest].val) largest = l;
+        if (r < n && arr[r].val > arr[largest].val) largest = r;
+        if (largest == i) break;
+        swap_fi(&arr[i], &arr[largest]);
+        i = largest;
     }
+}
+
+void build_heap(FloatIdx *arr, int n) {
+    for (int i = n/2 - 1; i >= 0; i--) { sift_down(arr, n, i); }
 }
 
 void apply_topp(
-    _Float16 *logits, _Float16 *fpbuf, FloatIdx *fis,
-    int vocab_size, float p
+    _Float16 *logits, _Float16 *fpbuf, FloatIdx *logit_indices,
+    int vocab_size, int k, float p
 ) {
     // Softmax to get the probs, store in fpbuf
-    softmax(fpbuf, logits, vocab_size);
+    softmax_omp(fpbuf, logits, vocab_size);
+    int heap_size = (k == 0) ? vocab_size : k;
 
-    // Record index info
-    #pragma omp parallel for
-    for (int i = 0; i < vocab_size; i++) {
-        fis[i].val = fpbuf[i];
-        fis[i].idx = i;
+    if (k == 0) {
+        #pragma omp parallel for
+        for (int i = 0; i < vocab_size; i++) {
+            logit_indices[i].idx = i;
+            logit_indices[i].val = fpbuf[i];
+        }
+    } else {
+        // topk typically uses values less than 100, no need to use omp here
+        for (int i = 0; i < k; i++) {
+            int idx = logit_indices[i].idx;  // Reuse the candidates from topk
+            logit_indices[i].val = fpbuf[idx];
+        }
     }
-    qsort(fis, vocab_size, sizeof(FloatIdx), cmp_floatidx);
-
-    // Find the threshold where cumulative probability exceeds p
-    float cum = 0.0f;
-    int cutoff = 0;
-    for (; cutoff < vocab_size; cutoff++) {
-        cum += (float)fis[cutoff].val;
-        if (cum >= p) { cutoff++; break; }
-    }
-    if (cutoff <= 0) cutoff = 1;
+    build_heap(logit_indices, heap_size);  // O(k)
 
     // fpbuf is now a copy of the original logits
     memcpy(fpbuf, logits, vocab_size * sizeof(_Float16));
 
+    // Set logits to -inf
     #pragma omp parallel for
-    for (int i = 0; i < vocab_size; i++)
-        logits[i] = -(_Float16)INFINITY;
+    for (int i = 0; i < vocab_size; i++) { logits[i] = -(_Float16)INFINITY; }
 
-    for (int i = 0; i < cutoff; i++) {
-        int orig_i = fis[i].idx;
-        logits[orig_i] = fpbuf[orig_i];
+    float cum = 0.0f;  // Cumulative prob
+
+    while (heap_size > 0) {
+        // Pop the current max prob
+        FloatIdx top = logit_indices[0];
+        logit_indices[0] = logit_indices[--heap_size];  // Put the last element to the top
+        sift_down(logit_indices, heap_size, 0);  // O(log(vocab_size))
+
+        logits[top.idx] = fpbuf[top.idx];
+        cum += (float)top.val;
+        if (cum >= p) break;
     }
 }
 
 void apply_rpen(_Float16* logits, bool *visited, int vocab_size, float rpen) {
+    // rpen short for Repetition Penalty
     #pragma omp parallel for
     for (int i = 0; i < vocab_size; i++) {
         if (!visited[i]) continue;
         _Float16 val = logits[i];
-        if (val > 0.0f)
-            logits[i] = val / rpen;
-        else
-            logits[i] = val * rpen;
+        if (val > 0.0f) { logits[i] = val / rpen; }
+        else { logits[i] = val * rpen; }
     }
 }
 
@@ -1097,28 +1150,30 @@ void sample(
     if (tokens == SAMPLE_ABORT) return;
 
     GemmaConfig *conf = model->config;
+    int vs = conf->vocab_size;
 
     // Boolean flags
-    bool use_topk = topk != 0;
-    bool use_topp = topp < 1.0f;
-    bool use_rpen = rpen > 1.0f;
+    bool dosample = temperature != 0 && topk != 1;
+    bool use_topk = dosample && topk != 0;
+    bool use_topp = dosample && topp < 1.0f;
+    bool use_rpen = dosample && rpen > 1.0f;
 
     // bool array indicating which tokens have already been processed
     // Used in rpen (repetition penalty)
     bool *visited = NULL;
-    if (use_rpen)
-        visited = safe_calloc(conf->vocab_size, sizeof(bool), "visited tokens");
-
+    if (use_rpen) {
+        visited = safe_calloc(vs, sizeof(bool), "visited tokens");
+    }
     int pos, token;
 
     // Prefill all the prompt tokens except the last one
     pos = 0;
     for (int *t = tokens; *t != EOT_SENTINEL && *(t+1) != EOT_SENTINEL; t++) {
         if (g_interrupted) {
-            if (use_rpen) free(visited);
+            if (use_rpen) { free(visited); }
             return;
         }
-        if (use_rpen) visited[*t] = true;
+        if (use_rpen) { visited[*t] = true; }
         forward(model, buf, *t, pos++);
     }
 
@@ -1126,13 +1181,15 @@ void sample(
     _Float16 *probs = NULL;
 
     // Only allocate probs if needed
-    if (temperature != 0.0f)
-        probs = safe_malloc(conf->vocab_size * sizeof(*probs), "probs");
+    if (temperature != 0.0f) {
+        probs = safe_malloc(vs * sizeof(*probs), "probs");
+    }
 
-    // Float buffer for topk & topp
-    FloatIdx *fis = NULL;
-    if (use_topk || use_topp)
-        fis = safe_malloc(conf->vocab_size * sizeof(*fis), "FloatIdx array");
+    // Logit indices for topk & topp
+    FloatIdx *logit_indices = NULL;
+    if (use_topk || use_topp) {
+        logit_indices = safe_malloc(vs * sizeof(*logit_indices), "FloatIdx array");
+    }
 
     // Record tok/s
     clock_t start_time = clock();
@@ -1146,37 +1203,41 @@ void sample(
 
         // Compute logits
         if (!conf->quant) {
-            gemv_fp16(buf->logits, &model->embedding, buf->x, conf->vocab_size, conf->embed_dim);
+            gemv_fp16(buf->logits, &model->embedding, buf->x, vs, conf->embed_dim);
         } else {
             float xscale = quantize_act(buf->x_i8, buf->x, conf->embed_dim);
-            gemv_int8(buf->logits, &model->embedding, buf->x_i8, conf->vocab_size, conf->embed_dim, xscale);
+            gemv_int8(buf->logits, &model->embedding, buf->x_i8, vs, conf->embed_dim, xscale);
         }
 
-        if (temperature == 0.0f) {
+        if (!dosample) {
             // Argmax sampling
-            token = argmax(buf->logits, conf->vocab_size);
+            token = argmax(buf->logits, vs);
         } else {
             // Apply the temperature
             #pragma omp parallel for
-            for (int d = 0; d < conf->vocab_size; d++)
+            for (int d = 0; d < vs; d++) {
                 buf->logits[d] /= (_Float16)temperature;
+            }
 
-            if (use_topk)
-                apply_topk(buf->logits, fis, conf->vocab_size, topk);
-            if (use_topp)
-                apply_topp(buf->logits, probs, fis, conf->vocab_size, topp);
-            if (use_rpen)
-                apply_rpen(buf->logits, visited, conf->vocab_size, rpen);
+            if (use_topk) {
+                apply_topk(buf->logits, logit_indices, vs, topk);
+            }
+            if (use_topp) {
+                apply_topp(buf->logits, probs, logit_indices, vs, topk, topp);
+            }
+            if (use_rpen) {
+                apply_rpen(buf->logits, visited, vs, rpen);
+            }
 
             // Softmax to get the probs
-            softmax(probs, buf->logits, conf->vocab_size);
+            softmax_omp(probs, buf->logits, vs);
 
             // Sample from probs
             float r = (float)rand() / (RAND_MAX + 1.0);
             float sum = 0.0;
 
-            token = conf->vocab_size - 1;
-            for (int d = 0; d < conf->vocab_size; d++) {
+            token = vs - 1;
+            for (int d = 0; d < vs; d++) {
                 sum += (float)probs[d];
                 if (r < sum) { token = d; break; }
             }
@@ -1204,17 +1265,18 @@ void sample(
     clock_t end_time = clock();
     double elapsed = (double)(end_time - start_time) / CLOCKS_PER_SEC;
 
-    if (elapsed > 0.0)
+    if (elapsed > 0.0) {
         printf(
             "\n\nGenerated %d tokens in %.2f seconds (%.2f tok/s)\n",
             gen_tokens, elapsed, gen_tokens / elapsed
         );
-    else
+    } else {
         printf("\n\nGenerated %d tokens\n", gen_tokens);
+    }
 
     free(probs);
     if (use_rpen) free(visited);
-    if (use_topk || use_topp) free(fis);
+    if (use_topk || use_topp) free(logit_indices);
 }
 
 int *encode(GemmaTokenizer *tok, char *sstr, int *tokens, int *n_tokens) {
@@ -1236,25 +1298,26 @@ int *encode(GemmaTokenizer *tok, char *sstr, int *tokens, int *n_tokens) {
         int n_bytes;
         int start = i;
 
-        if (str[i] >> 7 == 0)
+        if (str[i] >> 7 == 0) {
             n_bytes = 1;
-        else if (
+        } else if (
             i + 1 < len && str[i] >> 5 == 6
             && str[i+1] >> 6 == 2
-        )
+        ) {
             n_bytes = 2;
-        else if (
+        } else if (
             i + 2 < len && str[i] >> 4 == 14
             && str[i+1] >> 6 == 2 && str[i+2] >> 6 == 2
-        )
+        ) {
             n_bytes = 3;
-        else if (
+        } else if (
             i + 3 < len && str[i] >> 3 == 30
             && str[i+1] >> 6 == 2 && str[i+2] >> 6 == 2 && str[i+3] >> 6 == 2
-        )
+        ) {
             n_bytes = 4;
-        else
+        } else {
             n_bytes = 1;
+        }
 
         char cstr[5];
         for (int b = 0; b < n_bytes; b++) cstr[b] = str[i++];
@@ -1268,11 +1331,12 @@ int *encode(GemmaTokenizer *tok, char *sstr, int *tokens, int *n_tokens) {
                 snprintf(bstr, 10, "<0x%02X>", (unsigned char)str[b]);
                 tokens[tok_i++] = get_token_idx(tok, bstr);
             }
-        } else
+        } else {
             tokens[tok_i++] = token;
+        }
     }
 
-    while (true) {
+    for (;;) {
         int best_rank = 2147483647;
         Merge *best_pair = NULL;
 
@@ -1316,8 +1380,9 @@ int *encode(GemmaTokenizer *tok, char *sstr, int *tokens, int *n_tokens) {
 char *decode(GemmaTokenizer *tok, int id) { return tok->vocab[id]; }
 
 int *generate_callback(int token, GemmaTokenizer *tok) {
-    if (token == tok->eos || token == tok->eot)
+    if (token == tok->eos || token == tok->eot) {
         return SAMPLE_ABORT;
+    }
 
     printf("%s", decode(tok, token));
     fflush(stdout);
@@ -1345,10 +1410,11 @@ void generate(
 }
 
 int *new_turn(GemmaTokenizer *tok, bool bos) {
-    if (bos)
+    if (bos) {
         printf("User: ");
-    else
+    } else {
         printf("\nUser: ");
+    }
 
     char user_prompt[65536];
     if (fgets(user_prompt, sizeof(user_prompt), stdin) == NULL) {
@@ -1385,8 +1451,9 @@ int *new_turn(GemmaTokenizer *tok, bool bos) {
 }
 
 int *chat_callback(int token, GemmaTokenizer *tok) {
-    if (token == tok->eos || token == tok->eot)
+    if (token == tok->eos || token == tok->eot) {
         return new_turn(tok, false);
+    }
 
     printf("%s", decode(tok, token));
     fflush(stdout);
@@ -1404,19 +1471,19 @@ void chat(
 }
 
 bool safe_atoui(const char *str, unsigned int *result) {
-    if (str == NULL) return false;
+    if (str == NULL) { return false; }
 
     char *endptr;
     long long val = strtoll(str, &endptr, 10);
 
     // Invalid number
-    if (endptr == str) return false;
+    if (endptr == str) { return false; }
     // Extra characters at the end
-    if (*endptr != '\0') return false;
+    if (*endptr != '\0') { return false; }
     // long overflow
-    if (errno == ERANGE) return false;
+    if (errno == ERANGE) { return false; }
     // uint overflow
-    if (val < 0 || val > (long long)UINT_MAX) return false;
+    if (val < 0 || val > (long long)UINT_MAX) { return false; }
     
     // All passed
     *result = (unsigned int)val;
@@ -1424,19 +1491,19 @@ bool safe_atoui(const char *str, unsigned int *result) {
 }
 
 bool safe_atof(const char *str, float *result) {
-    if (str == NULL) return false;
+    if (str == NULL) { return false; }
     
     char *endptr;
     float val = strtof(str, &endptr);
     
     // Invalid number
-    if (endptr == str) return false;
+    if (endptr == str) { return false; }
     // Extra characters at the end
-    if (*endptr != '\0') return false;
+    if (*endptr != '\0') { return false; }
     // Overflow
-    if (errno == ERANGE) return false;
+    if (errno == ERANGE) { return false; }
     // inf / nan
-    if (isinf(val) || isnan(val)) return false;
+    if (isinf(val) || isnan(val)) { return false; }
     
     // All passed
     *result = val;
@@ -1478,8 +1545,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     // On Windows, get UTF-8 encoded command line arguments
     char **utf8_argv = get_utf8_argv(&argc);
-    if (utf8_argv)
-        argv = utf8_argv;
+    if (utf8_argv) { argv = utf8_argv; }
 #endif
 
     if (argc < 2) {
@@ -1569,13 +1635,15 @@ int main(int argc, char **argv) {
     GemmaModel *model = read_model(modelfile);
     ModelBuffer *buf = malloc_buffer(model->config, seqlen);
 
-    if (chatmode)
+    if (chatmode) {
         chat(model, buf, seqlen, temperature, topk, topp, rpen);
-    else
+    } else {
         generate(model, buf, prompt, seqlen, temperature, topk, topp, rpen);
+    }
 
-    if (g_interrupted)
+    if (g_interrupted) {
         printf("\n\nInterrupted by user\n");
+    }
 
     free_buffer(buf, model->config->quant);
     free_model(model);
