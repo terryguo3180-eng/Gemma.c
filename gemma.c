@@ -9,59 +9,13 @@
 #include <time.h>
 #include <signal.h>
 
-#ifdef _WIN32
-#include <windows.h>
-// The default console encoding is kinda weird in Windows
-static void set_utf8_console() {
-    SetConsoleOutputCP(65001);
-    SetConsoleCP(65001);
-}
-
-// Convert Windows command line to UTF-8 argc/argv
-static char** get_utf8_argv(int *argc_out) {
-    wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), argc_out);
-    if (!wargv) return NULL;
-
-    char **argv = malloc((*argc_out + 1) * sizeof(char*));
-    if (!argv) {
-        LocalFree(wargv);
-        return NULL;
-    }
-
-    for (int i = 0; i < *argc_out; i++) {
-        int size = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
-        argv[i] = malloc(size);
-        if (!argv[i]) {
-            for (int j = 0; j < i; j++) free(argv[j]);
-            free(argv);
-            LocalFree(wargv);
-            return NULL;
-        }
-        WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], size, NULL, NULL);
-    }
-    argv[*argc_out] = NULL;
-
-    LocalFree(wargv);
-    return argv;
-}
-
-static void free_utf8_argv(char **argv, int argc) {
-    if (!argv) return;
-    for (int i = 0; i < argc; i++) free(argv[i]);
-    free(argv);
-}
-#else
-#include <termios.h>
-#include <unistd.h>
-// No problem with POSIX though
-static void set_utf8_console() {}
-static char** get_utf8_argv(int *argc_out) { (void)argc_out; return NULL; }
-static void free_utf8_argv(char **argv, int argc) { (void)argv; (void)argc; }
-#endif
-
 #define FP16_MAX      (((union {_Float16 f; uint16_t b;}){.b = 0x7BFF}).f)
 #define EOT_SENTINEL  (-1)  // Sentinel for end of token array
 #define SAMPLE_ABORT  ((int *)(intptr_t)-1)
+
+#ifdef DEBUG
+#pragma message("Debug mode on")
+#endif
 
 // Global state for interruption handling
 static volatile bool g_interrupted = false;
@@ -138,6 +92,11 @@ typedef struct {
     bool quant;           // Whether int8 quantization is enabled
 } GemmaConfig;
 
+void free_config(GemmaConfig *conf) {
+    free(conf->attn_local_layers);
+    free(conf);
+}
+
 typedef struct { char *val; int idx; } Token;
 typedef struct { char *str1; char *str2; int rank; } Merge;
 
@@ -166,6 +125,15 @@ typedef struct {
     Token *vocab_sorted;
     Merge *ranks;
 } GemmaTokenizer;
+
+void free_tokenizer(GemmaTokenizer *tok) {
+    free(tok->vocab_data);
+    free(tok->merge_data);
+    free(tok->vocab);
+    free(tok->vocab_sorted);
+    free(tok->ranks);
+    free(tok);
+}
 
 // These kind of act as dictionaries in python
 
@@ -200,12 +168,8 @@ typedef struct {
 } Linear;
 
 void free_linear(Linear l) {
-    if (l.dtype == DTYPE_FP16)
-        free(l.fp16);
-    else {
-        free(l.i8.q);
-        free(l.i8.scales);
-    }
+    if (l.dtype == DTYPE_FP16) { free(l.fp16); }
+    else { free(l.i8.q); free(l.i8.scales); }
 }
 
 typedef struct {
@@ -240,11 +204,7 @@ void free_model(GemmaModel *model) {
     GemmaConfig *conf = model->config;
     GemmaTokenizer *tok = model->tokenizer;
 
-    free(conf->attn_local_layers);
-    free(tok->vocab_data);
-    free(tok->vocab);
-    free(tok->merge_data);
-    free(tok->ranks);
+    free_tokenizer(tok);
     free_linear(model->embedding);
 
     for (int i = 0; i < conf->n_layers; i++) {
@@ -259,14 +219,12 @@ void free_model(GemmaModel *model) {
         free(layer->n1);
         free(layer->n2);
         if (conf->use_qk_norm) { free(layer->nq); free(layer->nk); }
-        if (conf->pre_ffwd_norm) free(layer->n3);
-        if (conf->post_ffwd_norm) free(layer->n4);
+        if (conf->pre_ffwd_norm) { free(layer->n3); }
+        if (conf->post_ffwd_norm) { free(layer->n4); }
         free(layer);
     }
     free(model->final_norm);
-
-    free(tok);
-    free(conf);
+    free_config(conf);
     free(model->layers);
     free(model);
 }
@@ -282,8 +240,6 @@ typedef struct {
     _Float16 *resid;         // (embed_dim,)
     _Float16 *xq;            // (n_heads, head_dim)
     _Float16 *xk;            // (n_kv_heads, head_dim)
-    _Float16 *xq_buf;        // (n_heads, head_dim)
-    _Float16 *xk_buf;        // (n_kv_heads, head_dim)
     _Float16 *csfreqs_slid;  // (head_dim / 2, 2)
     _Float16 *csfreqs_full;  // (head_dim / 2, 2)
     _Float16 *xv;            // (n_kv_heads, head_dim)
@@ -313,17 +269,12 @@ ModelBuffer *malloc_buffer(GemmaConfig *conf, int cache_len) {
 
     buf->xq = safe_malloc(q_size * sizeof(_Float16), "buffer xq");
     buf->xk = safe_malloc(kv_size * sizeof(_Float16), "buffer xk");
-    buf->xq_buf = safe_malloc(q_size * sizeof(_Float16), "buffer xq_buf");
-    buf->xk_buf = safe_malloc(kv_size * sizeof(_Float16), "buffer xk_buf");
     buf->csfreqs_slid = safe_malloc(conf->head_dim * sizeof(_Float16), "buffer csfreqs_slid");
     buf->csfreqs_full = safe_malloc(conf->head_dim * sizeof(_Float16), "buffer csfreqs_full");
     buf->xv = safe_malloc(kv_size * sizeof(_Float16), "buffer xv");
     buf->xo = safe_malloc(q_size * sizeof(_Float16), "buffer xo");
     buf->att = safe_malloc(conf->n_heads * cache_len * sizeof(_Float16), "buffer att");
-    buf->kv_cache = safe_malloc(
-        conf->n_layers * 2 * cache_len * kv_size * sizeof(_Float16),
-        "buffer kv_cache"
-    );
+    buf->kv_cache = safe_malloc(conf->n_layers * 2 * cache_len * kv_size * sizeof(_Float16), "buffer kv_cache");
     buf->xg = safe_malloc(conf->mlp_hidden_size * sizeof(_Float16), "buffer xg");
     buf->xu = safe_malloc(conf->mlp_hidden_size * sizeof(_Float16), "buffer xu");
     buf->logits = safe_malloc(conf->vocab_size * sizeof(_Float16), "buffer logits");
@@ -336,8 +287,6 @@ void free_buffer(ModelBuffer *buf, bool quant) {
     free(buf->resid);
     free(buf->xq);
     free(buf->xk);
-    free(buf->xq_buf);
-    free(buf->xk_buf);
     free(buf->csfreqs_slid);
     free(buf->csfreqs_full);
     free(buf->xv);
@@ -626,9 +575,38 @@ GemmaModel *read_model(const char *filename) {
     return model;
 }
 
+// Make sure the clamping is not optimized by compilers
+#ifdef __GNUC__
+__attribute__((optimize("no-fast-math")))
+#endif
+static inline _Float16 clamp_fp16(_Float16 v) {
+#ifdef __clang__
+#pragma float_control(precise, on, push)
+#endif
+    return fminf(FP16_MAX, fmaxf(-FP16_MAX, v));
+#ifdef __clang__
+#pragma float_control(pop)
+#endif
+}
+
 void rmsnorm(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps) {
     float sqsum = 0.0f;
-    #pragma omp simd reduction(+:sqsum)
+    #pragma omp simd reduction(+:sqsum)  // Only using SIMD here
+    for (int i = 0; i < dim; i++) {
+        sqsum += (float)src[i] * (float)src[i];
+    }
+    float rms = 1.0f / sqrtf(sqsum / dim + eps);
+    #pragma omp simd
+    for (int i = 0; i < dim; i++) {
+        // Gemma uses (weight + 1) instead of (weight)
+        dst[i] = (_Float16)((float)src[i] * rms * (weight[i] + 1));
+    }
+}
+
+void rmsnorm_omp(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps) {
+    // OpenMP parallelized version of RMSNorm
+    float sqsum = 0.0f;
+    #pragma omp parallel for reduction(+:sqsum)
     for (int i = 0; i < dim; i++) {
         sqsum += (float)src[i] * (float)src[i];
     }
@@ -641,27 +619,27 @@ void rmsnorm(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps)
 }
 
 _Float16 quantize_act(int8_t *dst, _Float16 *vec, int dim) {
-    // Quantize the activation vector, and returns quantization scale
+    // Symmetricly quantize the activations into [-127, 127]
     _Float16 amax = 0.0f;  // Find the abs max in vec
-    #pragma omp parallel reduction(max:amax)
+    #pragma omp parallel for reduction(max:amax)
     for (int d = 0; d < dim; d++) {
         _Float16 av = vec[d] >= 0 ? vec[d] : -vec[d];
         if (av > amax) { amax = av; }
     }
 
     // 1.0f just to make sure we are not dividing by zero
-    _Float16 qscale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    float qscale = amax > 0.0f ? amax / 127.0f : 1.0f;
 
     // Quantize vec into qbuf
     #pragma omp simd
     for (int d = 0; d < dim; d++) {
-        int q = (int)roundf((float)vec[d] / (float)qscale);
+        int q = (int)roundf((float)vec[d] / qscale);
         if (q > 127) { q = 127; }
         else if (q < -127) { q = -127; }
         dst[d] = (int8_t)q;
     }
 
-    return qscale;
+    return (_Float16)qscale;
 }
 
 void gemv_fp16(
@@ -677,7 +655,7 @@ void gemv_fp16(
         for (int j = 0; j < n; j++) {
             sum += (float)mat->fp16[i*n + j] * (float)vec[j];
         }
-        dst[i] = (_Float16)sum;
+        dst[i] = clamp_fp16((_Float16)sum);
     }
 }
 
@@ -697,18 +675,22 @@ void gemv_int8(
         for (int j = 0; j < n; j++) {
             sum += (int32_t)mat->i8.q[i*n + j] * (int32_t)vec[j];
         }
-        dst[i] = (_Float16)((float)sum * fqscale * (float)mat->i8.scales[i]);
+        float val = (float)sum * fqscale * (float)mat->i8.scales[i];
+        dst[i] = clamp_fp16((_Float16)val);
     }
 }
 
 _Float16 dot(_Float16 *v1, _Float16 *v2, int dim) {
-    _Float16 sum = 0.0f;
-    for (int i = 0; i < dim; i++) { sum += v1[i] * v2[i]; }
-    return sum;
+    // Must use float instead of _Float16
+    float sum = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        sum += (float)v1[i] * (float)v2[i];
+    }
+    return (_Float16)sum;
 }
 
 void softmax(_Float16 *dst, _Float16 *src, int dim) {
-    _Float16 max = -1e10f;
+    _Float16 max = -(_Float16)INFINITY;
     for (int i = 0; i < dim; i++) {
         if (src[i] > max) { max = src[i]; }
     }
@@ -748,17 +730,43 @@ void softmax_omp(_Float16 *dst, _Float16 *src, int dim) {
     }
 }
 
-// Make sure the clamping is not optimized by compilers
-#ifdef __GNUC__
-__attribute__((optimize("no-fast-math")))
-#endif
-static inline _Float16 clamp_fp16(_Float16 v) {
-#ifdef __clang__
-#pragma float_control(precise, on, push)
-#endif
-    return fminf(FP16_MAX, fmaxf(-FP16_MAX, v));
-#ifdef __clang__
-#pragma float_control(pop)
+static void warn_stats(const char *name, const _Float16 *data, int len, int layer, int pos, int freq) {
+    // To keep the compiler happy
+    (void)name;
+    (void)data;
+    (void)len;
+    (void)layer;
+    (void)pos;
+    (void)freq;
+
+#ifdef DEBUG
+    if (freq <= 0) return;
+    if (layer % freq != 0) return;
+
+    float min = INFINITY, max = -INFINITY;
+    double sum = 0.0, sumsq = 0.0;
+    int inf_cnt = 0, nan_cnt = 0;
+
+    for (int i = 0; i < len; i++) {
+        float v = (float)data[i];
+        if (isinf(v)) inf_cnt++;
+        if (isnan(v)) nan_cnt++;
+        if (v < min) min = v;
+        if (v > max) max = v;
+        sum += v;
+        sumsq += (double)v * v;
+    }
+
+    if (max >= 0.8 * FP16_MAX || min <= -0.8 * FP16_MAX || inf_cnt >= 1 || nan_cnt >= 1) {        
+        double mean = sum / len;
+        double var = sumsq / len - mean * mean;
+        double std = sqrt(var > 0 ? var : 0);
+
+        printf(
+            "\nWARNING: [L%02d P%04d] %-20s: min=%9.3f max=%9.3f mean=%9.3f std=%9.3f inf=%d nan=%d\n",
+            layer, pos, name, min, max, mean, std, inf_cnt, nan_cnt
+        );
+    }
 #endif
 }
 
@@ -772,12 +780,19 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
         exit(1);
     }
 
-    // x = embedding[tok] * embed_dim**0.5
-    _Float16 embed_scale = (_Float16)sqrtf((float)conf->embed_dim);
-    if (conf->quant)
+    // I can't directly scale the embedding weight beforehand (see export.py),
+    // so I have to scale it here at run time. The activation scaler that I used
+    // in export.py was 1/sqrt(embed_dim), and the original Gemma training uses
+    // sqrt(embed_dim) as embed_scale, they canceled out to 1.0f
+
+    _Float16 embed_scale = 1.0f;  // equivalent to sqrt(embed_dim) * (1/sqrt(embed_dim))
+    if (conf->quant) {
         // Dequantize
         embed_scale *= model->embedding.i8.scales[tok];
+    }
 
+    // x = embedding[tok] * embed_scale
+    #pragma omp parallel for
     for (int i = 0; i < conf->embed_dim; i++) {
         if (!conf->quant) {
             buf->x[i] = model->embedding.fp16[tok*conf->embed_dim + i] * embed_scale;
@@ -785,12 +800,15 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
             buf->x[i] = model->embedding.i8.q[tok*conf->embed_dim + i] * embed_scale;
         }
     }
+
+    warn_stats("embedding", buf->x, conf->embed_dim, 0, pos, 0);
     
     int q_size = conf->n_heads * conf->head_dim;
     int kv_size = conf->n_kv_heads * conf->head_dim;
     int hd_half = conf->head_dim / 2;
 
     // Precompute cos & sin for all frequencies (used in RoPE)
+    #pragma omp simd
     for (int d = 0; d < hd_half; d++) {
         float freq;
         float e = (float)(-2*d) / conf->head_dim;
@@ -812,7 +830,9 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
         GemmaDecoderLayer *layer = model->layers[l];
 
         memcpy(buf->resid, buf->x, conf->embed_dim*sizeof(_Float16));
-        rmsnorm(buf->x, buf->x, layer->n1, conf->embed_dim, conf->eps);
+
+        rmsnorm_omp(buf->x, buf->x, layer->n1, conf->embed_dim, conf->eps);
+        warn_stats("norm1", buf->x, conf->embed_dim, l, pos, 8);
 
         // The attention block
         if (!conf->quant) {
@@ -830,6 +850,7 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
             // Query RMSNorm
             for (int h = 0; h < conf->n_heads; h++) {
                 _Float16 *xq_head = buf->xq + h*conf->head_dim;
+                // Use the non-threading version here since we are running this over every head
                 rmsnorm(xq_head, xq_head, layer->nq, conf->head_dim, conf->eps);
             }
             // Key RMSNorm
@@ -842,37 +863,37 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
         bool is_local = conf->attn_local_layers[l];
         _Float16 *freqs_cs = is_local ? buf->csfreqs_slid : buf->csfreqs_full;
         
-        // Apply RoPE to queries & keys
+        // Apply RoPE to queries
         #pragma omp parallel for
-        for (int d = 0; d < conf->n_heads * conf->head_dim; d++) {
-            int a = d % hd_half;  // Index in the first half vector
-            int b = a + hd_half;  // Index in the second half vector
-            int i = d % conf->head_dim;  // Index in the current vector
-            int h = d / conf->head_dim;  // Current head
+        for (int h = 0; h < conf->n_heads; h++) {
             int o = h * conf->head_dim;  // Offset for current head
-            
-            float cfr = freqs_cs[a*2];
-            float sfr = freqs_cs[a*2 + 1];
-            
-            // Apply to queries
-            if (i < hd_half) {
-                buf->xq_buf[o+i] = (_Float16)(buf->xq[o+a]*cfr - buf->xq[o+b]*sfr);
-            } else {
-                buf->xq_buf[o+i] = (_Float16)(buf->xq[o+a]*sfr + buf->xq[o+b]*cfr);
-            }
-
-            if (h >= conf->n_kv_heads) continue;
-            
-            // Apply to keys
-            if (i < hd_half) {
-                buf->xk_buf[o+i] = (_Float16)(buf->xk[o+a]*cfr - buf->xk[o+b]*sfr);
-            } else {
-                buf->xk_buf[o+i] = (_Float16)(buf->xk[o+a]*sfr + buf->xk[o+b]*cfr);
+            _Float16 *xq = buf->xq + o;
+            #pragma omp simd
+            for (int i = 0; i < hd_half; i++) {
+                float cfr = (float)freqs_cs[2*i];
+                float sfr = (float)freqs_cs[2*i + 1];
+                float a = (float)xq[i];  // Index in the first half vector
+                float b = (float)xq[i + hd_half];  // Index in the second half vector
+                xq[i] = (_Float16)(a * cfr - b * sfr);
+                xq[i + hd_half] = (_Float16)(a * sfr + b * cfr);
             }
         }
 
-        memcpy(buf->xq, buf->xq_buf, conf->n_heads * conf->head_dim * sizeof(_Float16));
-        memcpy(buf->xk, buf->xk_buf, conf->n_kv_heads * conf->head_dim * sizeof(_Float16));
+        // Apply RoPE to keys
+        #pragma omp parallel for
+        for (int h = 0; h < conf->n_kv_heads; h++) {
+            int o = h * conf->head_dim;  // Offset for current head
+            _Float16 *xk = buf->xk + o;
+            #pragma omp simd
+            for (int i = 0; i < hd_half; i++) {
+                float cfr = (float)freqs_cs[2*i];
+                float sfr = (float)freqs_cs[2*i + 1];
+                float a = (float)xk[i];  // Index in the first half vector
+                float b = (float)xk[i + hd_half];  // Index in the second half vector
+                xk[i] = (_Float16)(a * cfr - b * sfr);
+                xk[i + hd_half] = (_Float16)(a * sfr + b * cfr);
+            }
+        }
 
         int entry_sz = conf->n_kv_heads * conf->head_dim;
         int layer_sz = 2*buf->cache_len * entry_sz;
@@ -921,6 +942,7 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
             // xo_head (head_dim,) = att_head (attlen,) @ xv_head (attlen, head_dim)
             for (int d = 0; d < conf->head_dim; d++) {
                 float sum = 0.0f;
+                #pragma omp simd reduction(+:sum)
                 for (int t = 0; t < attlen; t++) {
                     sum += (xv_head + t*entry_sz)[d] * att_head[t];
                 }
@@ -935,23 +957,32 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
             float xoscale = quantize_act(buf->xo_i8, buf->xo, q_size);
             gemv_int8(buf->x, &layer->wo, buf->xo_i8, conf->embed_dim, q_size, xoscale);
         }
+        warn_stats("attn_out", buf->x, conf->embed_dim, l, pos, 8);
 
-        rmsnorm(buf->x, buf->x, layer->n2, conf->embed_dim, conf->eps);
+        rmsnorm_omp(buf->x, buf->x, layer->n2, conf->embed_dim, conf->eps);
+        warn_stats("norm2", buf->x, conf->embed_dim, l, pos, 8);
 
         // Combine the residual stream
+        _Float16 *restrict x = buf->x;
+        _Float16 *restrict resid = buf->resid;
+        #pragma omp simd
         for (int d = 0; d < conf->embed_dim; d++) {
-            buf->x[d] += buf->resid[d];
             // Sometimes the residual stream accumulates huge values on certain channels,
-            // especially in pretrained models (Sun et al. https://arxiv.org/abs/2402.17762)
-            // It works fine in fp32 or bf16, but it can easily overflow fp16
-            // So we need to clamp it
-            buf->x[d] = clamp_fp16(buf->x[d]);
+            // especially in pretrained/bigger models (Sun et al. https://arxiv.org/abs/2402.17762)
+            // It works fine in fp32 or bf16, but it can easily overflow fp16 and become
+            // inf, causing all the activations turning into nan after the next RMSNorm,
+            // so we need to clamp it
+
+            // NOTE: Actually this should almost never trigger now, I added activation scalers
+            // afterwards (see export.py), the clamp here is more of a last-resort safety net
+            buf->x[d] = clamp_fp16(x[d] + resid[d]);
         }
+        warn_stats("resid1", buf->x, conf->embed_dim, l, pos, 8);
 
         memcpy(buf->resid, buf->x, conf->embed_dim * sizeof(_Float16));
 
         if (conf->pre_ffwd_norm) {
-            rmsnorm(buf->x, buf->x, layer->n3, conf->embed_dim, conf->eps);
+            rmsnorm_omp(buf->x, buf->x, layer->n3, conf->embed_dim, conf->eps);
         }
 
         // MLP feedforward layer
@@ -982,43 +1013,53 @@ void forward(GemmaModel *model, ModelBuffer *buf, int tok, int pos) {
             float xscale = quantize_act(buf->xg_i8, buf->xg, conf->mlp_hidden_size);
             gemv_int8(buf->x, &layer->w3, buf->xg_i8, conf->embed_dim, conf->mlp_hidden_size, xscale);
         }
+        warn_stats("down_proj", buf->x, conf->embed_dim, l, pos, 8);
 
         if (conf->post_ffwd_norm) {
-            rmsnorm(buf->x, buf->x, layer->n4, conf->embed_dim, conf->eps);
+            rmsnorm_omp(buf->x, buf->x, layer->n4, conf->embed_dim, conf->eps);
+            warn_stats("norm4", buf->x, conf->embed_dim, l, pos, 8);
         }
 
         // Combine the residual stream
+        x = buf->x;
+        resid = buf->resid;
+        #pragma omp simd
         for (int d = 0; d < conf->embed_dim; d++) {
-            buf->x[d] += buf->resid[d];
-            buf->x[d] = clamp_fp16(buf->x[d]);
+            buf->x[d] = clamp_fp16(x[d] + resid[d]);
         }
+        warn_stats("resid2", buf->x, conf->embed_dim, l, pos, 8);
     }
 
     // Final RMSNorm
-    rmsnorm(buf->x, buf->x, model->final_norm, conf->embed_dim, conf->eps);
-
-    // Logit softcapping
-    if (conf->logit_softcapping != 0.0f) {
-        for (int d = 0; d < conf->vocab_size; d++) {
-            float val = (float)buf->logits[d] / conf->logit_softcapping;
-            buf->logits[d] = (_Float16)(tanhf(val) * conf->logit_softcapping);
-        }
-    }
+    rmsnorm_omp(buf->x, buf->x, model->final_norm, conf->embed_dim, conf->eps);
 }
 
 int argmax(_Float16 *logits, int vocab_size) {
     // Pick the index with the max value
     int max_idx = -1;
     _Float16 max_val = -(_Float16)INFINITY;
-    for (int i = 0; i < vocab_size; i++) {
-        if (logits[i] > max_val) { max_val = logits[i]; max_idx = i; }
+    #pragma omp parallel
+    {
+        int local_idx = -1;
+        _Float16 local_val = -(_Float16)INFINITY;
+        #pragma omp for nowait
+        for (int i = 0; i < vocab_size; i++) {
+            if (logits[i] > local_val) { local_val = logits[i]; local_idx = i; }
+        }
+        #pragma omp critical
+        {
+            // Only one thread is able to run this at a time
+            if (local_val > max_val) { max_val = local_val; max_idx = local_idx; }
+        }
     }
     return max_idx;
 }
 
 typedef struct { _Float16 val; int idx; } FloatIdx;
 
-static inline void swap_fi(FloatIdx *a, FloatIdx *b) { FloatIdx t = *a; *a = *b; *b = t; }
+static inline void swap_fi(FloatIdx *a, FloatIdx *b) {
+    FloatIdx t = *a; *a = *b; *b = t;
+}
 
 static uint32_t qs_rand_state = 3418323524;
 static inline uint32_t qs_rand(void) {
@@ -1180,7 +1221,7 @@ void sample(
             return;
         }
         if (use_rpen) { visited[*t] = true; }
-        forward(model, buf, *t, pos++);
+        forward(model, buf, *t, pos++);  // forward in the current pos
     }
 
     token = tokens[pos];
@@ -1219,6 +1260,14 @@ void sample(
             // Argmax sampling
             token = argmax(buf->logits, vs);
         } else {
+            // Logit softcapping
+            if (conf->logit_softcapping != 0.0f) {
+                for (int d = 0; d < conf->vocab_size; d++) {
+                    float val = (float)buf->logits[d] / conf->logit_softcapping;
+                    buf->logits[d] = (_Float16)(tanhf(val) * conf->logit_softcapping);
+                }
+            }
+
             // Apply the temperature
             #pragma omp parallel for
             for (int d = 0; d < vs; d++) {
@@ -1259,8 +1308,8 @@ void sample(
             int i;
             for (i = 0; (token = ret[i]) != EOT_SENTINEL && ret[i+1] != EOT_SENTINEL; i++) {
                 if (g_interrupted) break;
-                if (use_rpen) visited[token] = true;
-                forward(model, buf, token, pos++);
+                if (use_rpen) { visited[token] = true; }
+                forward(model, buf, token, ++pos);  // forward in the next pos
             }
             if (g_interrupted) break;
             token = ret[i];  // The last element
@@ -1285,7 +1334,7 @@ void sample(
     if (use_topk || use_topp) free(logit_indices);
 }
 
-int *encode(GemmaTokenizer *tok, char *sstr, int *tokens, int *n_tokens) {
+int *encode(GemmaTokenizer *tok, const char *sstr, int *tokens, int *n_tokens) {
     unsigned char *str = (unsigned char *)sstr;
     int len = strlen((char *)str);
 
@@ -1383,22 +1432,34 @@ int *encode(GemmaTokenizer *tok, char *sstr, int *tokens, int *n_tokens) {
     return tokens;
 }
 
-char *decode(GemmaTokenizer *tok, int id) { return tok->vocab[id]; }
+const char *decode(GemmaTokenizer *tok, int id, char *byte_buf) {
+    char *s = tok->vocab[id];
+    // Byte-fallback token, decode back to the raw byte it represents
+    size_t len = strlen(s);
+    if (len == 6 && s[0] == '<' && s[1] == '0' && s[2] == 'x' && s[5] == '>') {
+        unsigned int byte_val;
+        if (sscanf(s + 3, "%2x", &byte_val) == 1) {
+            byte_buf[0] = (char)byte_val;
+            byte_buf[1] = '\0';
+            return byte_buf;
+        }
+    }
+    return s;
+}
 
 int *generate_callback(int token, GemmaTokenizer *tok) {
     if (token == tok->eos || token == tok->eot) {
         return SAMPLE_ABORT;
     }
-
-    printf("%s", decode(tok, token));
+    char byte_buf[2];
+    printf("%s", decode(tok, token, byte_buf));
     fflush(stdout);
-
     return NULL;
 }
 
 void generate(
     GemmaModel *model, ModelBuffer *buf,
-    char *prompt,
+    const char *prompt,
     int seqlen, float temperature, int topk, float topp, float rpen
 ) {
     GemmaTokenizer *tok = model->tokenizer;
@@ -1429,14 +1490,13 @@ int *new_turn(GemmaTokenizer *tok, bool bos) {
     }
     user_prompt[strcspn(user_prompt, "\n")] = '\0';
 
-    /*
-     * Apply the gemma chat template
-     *
-     * [<bos>]<start_of_turn>user\n
-     * Hello! Introduce yourself.<end_of_turn>\n
-     * <start_of_turn>model\n
-     * ...
-    */
+    // Apply the gemma chat template
+    //
+    // [<bos>]<start_of_turn>user\n
+    // Hello! Introduce yourself.<end_of_turn>\n
+    // <start_of_turn>model\n
+    // ...
+
     int n_tokens = 0;
     int size = strlen("user") + strlen(user_prompt) + strlen("model") + 6;
     if (bos) size++;
@@ -1460,8 +1520,8 @@ int *chat_callback(int token, GemmaTokenizer *tok) {
     if (token == tok->eos || token == tok->eot) {
         return new_turn(tok, false);
     }
-
-    printf("%s", decode(tok, token));
+    char byte_buf[2];
+    printf("%s", decode(tok, token, byte_buf));
     fflush(stdout);
     return NULL;
 }
@@ -1480,6 +1540,7 @@ bool safe_atoui(const char *str, unsigned int *result) {
     if (str == NULL) { return false; }
 
     char *endptr;
+    errno = 0;
     long long val = strtoll(str, &endptr, 10);
 
     // Invalid number
@@ -1500,6 +1561,7 @@ bool safe_atof(const char *str, float *result) {
     if (str == NULL) { return false; }
     
     char *endptr;
+    errno = 0;
     float val = strtof(str, &endptr);
     
     // Invalid number
@@ -1544,22 +1606,75 @@ void print_usage(void) {
     );
 }
 
+
+#ifdef _WIN32
+#include <windows.h>
+// The default console encoding is kinda weird in Windows
+static void set_utf8_console() {
+    SetConsoleOutputCP(65001);
+    SetConsoleCP(65001);
+}
+
+// Convert Windows command line to UTF-8 argc/argv
+static char** get_utf8_argv(int *argc_out) {
+    wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), argc_out);
+    if (!wargv) return NULL;
+
+    char **argv = malloc((*argc_out + 1) * sizeof(char*));
+    if (!argv) {
+        LocalFree(wargv);
+        return NULL;
+    }
+
+    for (int i = 0; i < *argc_out; i++) {
+        int size = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+        argv[i] = malloc(size);
+        if (!argv[i]) {
+            for (int j = 0; j < i; j++) free(argv[j]);
+            free(argv);
+            LocalFree(wargv);
+            return NULL;
+        }
+        WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], size, NULL, NULL);
+    }
+    argv[*argc_out] = NULL;
+
+    LocalFree(wargv);
+    return argv;
+}
+
+static void free_utf8_argv(char **argv, int argc) {
+    if (!argv) return;
+    for (int i = 0; i < argc; i++) free(argv[i]);
+    free(argv);
+}
+#else
+// No problem with POSIX though
+static void set_utf8_console() {}
+static char** get_utf8_argv(int *argc_out) { (void)argc_out; return NULL; }
+static void free_utf8_argv(char **argv, int argc) { (void)argv; (void)argc; }
+#endif
+
+static const char* safe_get_arg(int i, int argc, char **argv) {
+    if (i + 1 >= argc) {
+        fprintf(stderr, "Error: Option '%s' requires an argument.\n", argv[i]);
+        return NULL;
+    }
+    return argv[i + 1];
+}
+
 int main(int argc, char **argv) {
     set_utf8_console();
     setup_signal_handler();
 
-#ifdef _WIN32
     // On Windows, get UTF-8 encoded command line arguments
     char **utf8_argv = get_utf8_argv(&argc);
-    if (utf8_argv) { argv = utf8_argv; }
-#endif
+    if (utf8_argv != NULL) { argv = utf8_argv; }
 
     if (argc < 2) {
         print_usage();
         printf("\nError: model filename is not provided\n");
-#ifdef _WIN32
-        if (utf8_argv) free_utf8_argv(utf8_argv, argc);
-#endif
+        if (utf8_argv != NULL) { free_utf8_argv(utf8_argv, argc); }
         return 1;
     }
 
@@ -1575,63 +1690,67 @@ int main(int argc, char **argv) {
     float temperature = 1.0;
     float topp = 1.0;
     float rpen = 1.0;
-    char *prompt = "Once upon a time";
+    const char *prompt = "Once upon a time";
     bool chatmode = false;
 
     // Parse the command line arguments
     for (int i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "-l") || !strcmp(argv[i], "--seqlen")) {
-            char *l = argv[++i];
-            if (!safe_atoui(l, &seqlen)) {
-                print_usage();
-                printf("\nError: Invalid argument for -l / --seqlen: '%s'\n", l);
+        const char *arg = argv[i];
+
+        if (strcmp(arg, "-l") == 0 || strcmp(arg, "--seqlen") == 0) {
+            const char *val = safe_get_arg(i++, argc, argv);
+            if (!val) { return 1; }
+            if (!safe_atoui(val, &seqlen)) {
+                fprintf(stderr, "Invalid number for --seqlen: %s\n", val);
                 return 1;
             }
-        } else if (!strcmp(argv[i], "-k") || !strcmp(argv[i], "--topk")) {
-            char *k = argv[++i];
-            if (!safe_atoui(k, &topk)) {
-                print_usage();
-                printf("\nError: Invalid argument for -k / --topk: '%s'\n", k);
+        } else if (strcmp(arg, "-k") == 0 || strcmp(arg, "--topk") == 0) {
+            const char *val = safe_get_arg(i++, argc, argv);
+            if (!val) { return 1; }
+            if (!safe_atoui(val, &topk)) {
+                fprintf(stderr, "Invalid number for --topk: %s\n", val);
                 return 1;
             }
-        } else if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "--seed")) {
-            char *s = argv[++i];
-            if (!safe_atoui(s, &seed)) {
-                print_usage();
-                printf("\nError: Invalid argument for -s / --seed: '%s'\n", s);
+        } else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--seed") == 0) {
+            const char *val = safe_get_arg(i++, argc, argv);
+            if (!val) { return 1; }
+            if (!safe_atoui(val, &seed)) {
+                fprintf(stderr, "Invalid number for --seed: %s\n", val);
                 return 1;
             }
-        } else if (!strcmp(argv[i], "-t") || !strcmp(argv[i], "--temperature")) {
-            char *t = argv[++i];
-            if (!safe_atof(t, &temperature) || temperature < 0.0) {
-                print_usage();
-                printf("\nError: Invalid argument for -t / --temperature: '%s'\n", t);
+        } else if (strcmp(arg, "-t") == 0 || strcmp(arg, "--temperature") == 0) {
+            const char *val = safe_get_arg(i++, argc, argv);
+            if (!val) { return 1; }
+            if (!safe_atof(val, &temperature) || temperature < 0.0f) {
+                fprintf(stderr, "Invalid temperature: %s (must be >= 0)\n", val);
                 return 1;
             }
-        } else if (!strcmp(argv[i], "-p") || !strcmp(argv[i], "--topp")) {
-            char *p = argv[++i];
-            if (!safe_atof(p, &topp) || topp > 1.0 || topp <= 0.0) {
-                print_usage();
-                printf("\nError: Invalid argument for -p / --topp: '%s'\n", p);
+        } else if (strcmp(arg, "-p") == 0 || strcmp(arg, "--topp") == 0) {
+            const char *val = safe_get_arg(i++, argc, argv);
+            if (!val) { return 1; }
+            if (!safe_atof(val, &topp) || topp <= 0.0f || topp > 1.0f) {
+                fprintf(stderr, "Invalid top-p: %s (must be 0 < p <= 1)\n", val);
                 return 1;
             }
-        } else if (!strcmp(argv[i], "-r") || !strcmp(argv[i], "--rpen")) {
-            char *r = argv[++i];
-            if (!safe_atof(r, &rpen) || rpen < 1.0) {
-                print_usage();
-                printf("\nError: Invalid argument for -r / --rpen: '%s'\n", r);
+        } else if (strcmp(arg, "-r") == 0 || strcmp(arg, "--rpen") == 0) {
+            const char *val = safe_get_arg(i++, argc, argv);
+            if (!val) { return 1; }
+            if (!safe_atof(val, &rpen) || rpen < 1.0f) {
+                fprintf(stderr, "Invalid repetition penalty: %s (must be >= 1)\n", val);
                 return 1;
             }
-        } else if (!strcmp(argv[i], "-i") || !strcmp(argv[i], "--prompt")) {
-            prompt = argv[++i];
-        } else if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "--chat")) {
+        } else if (strcmp(arg, "-i") == 0 || strcmp(arg, "--prompt") == 0) {
+            const char *val = safe_get_arg(i++, argc, argv);
+            if (!val) { return 1; }
+            prompt = val;
+        } else if (strcmp(arg, "-c") == 0 || strcmp(arg, "--chat") == 0) {
             chatmode = true;
-        } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+        } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
             print_usage();
             return 0;
         } else {
+            fprintf(stderr, "Unknown option: %s\n", arg);
             print_usage();
-            printf("\nError: Invalid argument: '%s'\n", argv[i]);
             return 1;
         }
     }
@@ -1651,6 +1770,7 @@ int main(int argc, char **argv) {
         printf("\n\nInterrupted by user\n");
     }
 
+    if (utf8_argv != NULL) { free_utf8_argv(utf8_argv, argc); }
     free_buffer(buf, model->config->quant);
     free_model(model);
     return 0;
