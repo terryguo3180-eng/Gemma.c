@@ -1214,6 +1214,7 @@ void sample(
     int pos, token;
 
     // Prefill all the prompt tokens except the last one
+    clock_t prefill_start = clock();
     pos = 0;
     for (int *t = tokens; *t != EOT_SENTINEL && *(t+1) != EOT_SENTINEL; t++) {
         if (g_interrupted) {
@@ -1223,6 +1224,9 @@ void sample(
         if (use_rpen) { visited[*t] = true; }
         forward(model, buf, *t, pos++);  // forward in the current pos
     }
+    clock_t prefill_end = clock();
+    double prefill_elapsed = (double)(prefill_end - prefill_start) / CLOCKS_PER_SEC;
+    int prefill_tokens = pos;
 
     token = tokens[pos];
     _Float16 *probs = NULL;
@@ -1239,7 +1243,7 @@ void sample(
     }
 
     // Record tok/s
-    clock_t start_time = clock();
+    clock_t gen_start = clock();
     int gen_tokens = 0;
 
     for (; pos < seqlen; pos++) {
@@ -1317,16 +1321,26 @@ void sample(
         // ret == NULL: do nothing
     }
 
-    clock_t end_time = clock();
-    double elapsed = (double)(end_time - start_time) / CLOCKS_PER_SEC;
+    clock_t gen_end = clock();
+    double gen_elapsed = (double)(gen_end - gen_start) / CLOCKS_PER_SEC;
 
-    if (elapsed > 0.0) {
+    // Print prefilling speed
+    if (prefill_elapsed > 0.0) {
         printf(
-            "\n\nGenerated %d tokens in %.2f seconds (%.2f tok/s)\n",
-            gen_tokens, elapsed, gen_tokens / elapsed
+            "\nPrompt processed %d tokens in %.2f seconds (%.2f tok/s)\n",
+            prefill_tokens, prefill_elapsed, prefill_tokens / prefill_elapsed
         );
     } else {
-        printf("\n\nGenerated %d tokens\n", gen_tokens);
+        printf("\nPrompt processed %d tokens instantly\n", prefill_tokens);
+    }
+    // Print generation speed
+    if (gen_elapsed > 0.0) {
+        printf(
+            "Generated %d tokens in %.2f seconds (%.2f tok/s)\n",
+            gen_tokens, gen_elapsed, gen_tokens / gen_elapsed
+        );
+    } else {
+        printf("Generated %d tokens instantly\n", gen_tokens);
     }
 
     free(probs);
@@ -1663,6 +1677,119 @@ static const char* safe_get_arg(int i, int argc, char **argv) {
     return argv[i + 1];
 }
 
+void print_model_config(GemmaModel *model) {
+    (void)model;
+#ifdef DEBUG
+    GemmaConfig *conf = model->config;
+    GemmaTokenizer *tok = model->tokenizer;
+    
+    printf("\n========== Model Configuration ==========\n");
+    printf("Architecture:\n");
+    printf("  n_layers:           %d\n", conf->n_layers);
+    printf("  n_heads:            %d\n", conf->n_heads);
+    printf("  n_kv_heads:         %d\n", conf->n_kv_heads);
+    printf("  head_dim:           %d\n", conf->head_dim);
+    printf("  embed_dim:          %d\n", conf->embed_dim);
+    printf("  mlp_hidden_size:    %d\n", conf->mlp_hidden_size);
+    printf("  vocab_size:         %d\n", conf->vocab_size);
+    printf("  max_seq_len:        %d\n", conf->max_seq_len);
+    printf("  sliding_window:     %d\n", conf->sliding_window);
+    
+    printf("\nAttention:\n");
+    printf("  q_pre_attn_scalar:  %d\n", conf->q_pre_attn_scalar);
+    printf("  attn_softcapping:   %.6f\n", conf->attn_softcapping);
+    printf("  use_qk_norm:        %s\n", conf->use_qk_norm ? "true" : "false");
+    
+    printf("\nRoPE:\n");
+    printf("  local_theta:        %.6f\n", conf->local_theta);
+    printf("  global_theta:       %.6f\n", conf->global_theta);
+    
+    printf("\nNormalization:\n");
+    printf("  eps:                %.6f\n", conf->eps);
+    printf("  pre_ffwd_norm:      %s\n", conf->pre_ffwd_norm ? "true" : "false");
+    printf("  post_ffwd_norm:     %s\n", conf->post_ffwd_norm ? "true" : "false");
+    
+    printf("\nQuantization:\n");
+    printf("  quant:              %s\n", conf->quant ? "true (int8)" : "false (fp16)");
+    
+    printf("\nLogits:\n");
+    printf("  logit_softcapping:  %.6f\n", conf->logit_softcapping);
+    
+    printf("\nAttention Local Layers:\n");
+    printf("  ");
+    for (int i = 0; i < conf->n_layers; i++) {
+        printf("%d", conf->attn_local_layers[i] ? 1 : 0);
+        if ((i + 1) % 32 == 0 && i + 1 < conf->n_layers) { printf("\n  "); }
+    }
+    printf("\n");
+    
+    printf("\nTokenizer:\n");
+    printf("  vocab_size:         %d\n", tok->vocab_size);
+    printf("  n_merges:           %d\n", tok->n_merges);
+    printf("  bos token:          %d\n", tok->bos);
+    printf("  eos token:          %d\n", tok->eos);
+    printf("  sot token:          %d\n", tok->sot);
+    printf("  eot token:          %d\n", tok->eot);
+    
+    printf("\nMemory Footprint (estimated):\n");
+    
+    size_t total_bytes = 0;
+    int q_size = conf->n_heads * conf->head_dim;
+    int kv_size = conf->n_kv_heads * conf->head_dim;
+    
+    // Embedding
+    if (!conf->quant) {
+        total_bytes += conf->embed_dim * conf->vocab_size * sizeof(_Float16);
+    } else {
+        total_bytes += conf->embed_dim * conf->vocab_size * sizeof(int8_t);
+        total_bytes += conf->vocab_size * sizeof(_Float16); // scales
+    }
+    
+    // Each layer
+    for (int l = 0; l < conf->n_layers; l++) {
+        int n_params = (
+            conf->embed_dim * q_size +   // wq
+            conf->embed_dim * kv_size +  // wk
+            conf->embed_dim * kv_size +  // wv
+            q_size * conf->embed_dim +   // wo
+            conf->embed_dim * conf->mlp_hidden_size +  // w1
+            conf->embed_dim * conf->mlp_hidden_size +  // w2
+            conf->mlp_hidden_size * conf->embed_dim    // w3
+        )
+        if (!conf->quant) {
+            total_bytes += n_params * sizeof(_Float16);
+        } else {
+            total_bytes += n_params * sizeof(int8_t);
+            // Add scales
+            total_bytes += (
+                q_size + kv_size + kv_size + conf->embed_dim +
+                conf->mlp_hidden_size + conf->mlp_hidden_size + conf->embed_dim
+            ) * sizeof(_Float16);
+        }
+        // Norm weights
+        total_bytes += (conf->embed_dim + conf->embed_dim) * sizeof(_Float16);  // n1, n2
+        if (conf->use_qk_norm) {
+            total_bytes += 2 * conf->head_dim * sizeof(_Float16);  // nq, nk
+        }
+        if (conf->pre_ffwd_norm) {
+            total_bytes += conf->embed_dim * sizeof(_Float16);  // n3
+        }
+        if (conf->post_ffwd_norm) {
+            total_bytes += conf->embed_dim * sizeof(_Float16);  // n4
+        }
+    }
+    total_bytes += conf->embed_dim * sizeof(_Float16); // final_norm
+    
+    printf("  Weights:            %.2f GB\n", total_bytes / (1024.0 * 1024.0 * 1024.0));
+    
+    // KV Cache (per token)
+    size_t kv_cache_bytes = conf->n_layers * 2 * kv_size * sizeof(_Float16);
+    printf("  KV Cache (tok):     %.2f KB\n", kv_cache_bytes / 1024.0);
+    
+    printf("=========================================\n\n");
+#endif
+}
+
 int main(int argc, char **argv) {
     set_utf8_console();
     setup_signal_handler();
@@ -1759,6 +1886,7 @@ int main(int argc, char **argv) {
 
     GemmaModel *model = read_model(modelfile);
     ModelBuffer *buf = malloc_buffer(model->config, seqlen);
+    print_model_config(model);
 
     if (chatmode) {
         chat(model, buf, seqlen, temperature, topk, topp, rpen);

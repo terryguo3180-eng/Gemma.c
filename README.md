@@ -1,135 +1,148 @@
 # Gemma.c
 
-A single‑file C implementation for inference of Gemma models (versions 1, 2, and 3).
-This lightweight, self‑contained program loads a model in a custom binary format and runs text generation efficiently on CPU using OpenMP and aggressive compiler optimisations.
+A pure C implementation of Gemma 1 / 2 / 3 inference, no third-party dependencies, single file, builds with `gcc` out of the box. Comes with a set of Python export scripts to convert Hugging Face Gemma checkpoints into this project's own `.bin` format.
+ 
+Inspired by [llama2.c](https://github.com/karpathy/llama2.c). The goal is to make Gemma inference as clear and hackable as possible with minimal code.
 
-Gemma model inference in a single C file, supports arbitary model in Gemma 1/2/3 architecture.
+## Features
+ 
+- Pure C (C11), no runtime dependencies, compiles with a single `gcc` invocation
+- Supports Gemma 1 / 2 / 3 (including the local/global alternating sliding-window attention, QK-Norm, and attention/logit softcapping introduced in Gemma 2/3)
+- GQA (Grouped-Query Attention) + RoPE (separate local/global theta)
+- KV cache inference with streaming, long-context generation
+- Built-in INT8 weight quantization (per-channel quantization for `Linear`/`Embedding`), paired with a one-shot `--quantize` flag on the Python export side
+- OpenMP multithreading + `-march=native` compile-time optimizations
+- Runs on Windows (with UTF-8 console handling) and Linux/macOS
+- Interactive chat mode following Gemma's official chat template (`<start_of_turn>` / `<end_of_turn>`)
+- A minimal BPE tokenizer (re-implemented in C, with weights embedded into the `.bin` file by the export script)
 
-I plan to implement this in GLSL fragment shader, so we will be able to run LLMs in vanilla Minecraft resource packs (!)
+## Project layout
 
+```
+.
+├── gemma.c        # The inference engine itself (model loading, forward pass, sampling, CLI)
+├── Makefile       # Cross-platform build script (Linux/macOS/Windows)
+├── export.py      # HuggingFace -> .bin weight exporter
+├── model.py       # Reference PyTorch implementation (for correctness checks before export)
+├── sample.py      # PyTorch-side sampling logic (for parity testing against gemma.c)
+└── tokenizer.py   # Reference tokenizer implementation
+```
 
-To build it, simply type `make`, or compile it manually using:
-
+## Quick start
+ 
+### 1. Export a model
+ 
 ```bash
-gcc -Ofast -march=native -mtune=native -flto -fopenmp gemma.c -o gemma -lm
+pip install torch transformers
+ 
+python export.py google/gemma-3-4b-it \
+    -o exported/gemma-3-4b-it.bin \
+    -d float16
 ```
-
-You also need to obtain a model file. I implemented a custom binary format specifically for Gemma models, you can convert huggingface models into this format using the `export.py` script. E.g. To convert the Gemma-3-1B-Instruct model, run:
-
+ 
+Export an INT8-quantized version (smaller footprint, noticeably faster on CPU):
+ 
 ```bash
-python export.py -m google/gemma-3-1b-it -o gemma-3-1b-it.bin
+python export.py google/gemma-3-4b-it \
+    -o exported/gemma-3-4b-it_q.bin \
+    -d float16 \
+    -q
 ```
 
-This will generate a ~1.9GB file called `gemma-3-1b-it.bin`. You can run it using:
+`export.py` arguments:
+ 
+| Argument | Description |
+| --- | --- |
+| `modelfile` | HuggingFace model id or a local directory |
+| `-o, --output` | Output `.bin` path (required) |
+| `-d, --dtype` | Weight precision: `float16` / `float32` / `bfloat16` (default: `float16`) |
+| `-q, --quantize` | Enable INT8 quantization |
+| `-c, --cache-path` | Custom HuggingFace cache directory |
 
+### 2. Build
+ 
 ```bash
-./gemma gemma-3-1b-it.bin -i "Hello I'm a language model,"
+make
 ```
-
-Here's the what the model generated when I runned this:
-```text
-Hello I'm a language model, and I just finished training on a massive dataset of text and code. I can respond to a wide range of prompts and questions.
-
-However, I also have limitations. I don’t have personal experiences, feelings, or consciousness. I’m essentially a sophisticated pattern recognition machine.
-
-So, while I can process and generate text beautifully, I’m not a substitute for human conversation, critical thinking, or real-world understanding.
-
-Is there anything specific you'd like me to do, or any particular aspect you'd like to explore inmore detail?
-```
-
-You can set the temperature with the `-t` or `--temperature` argument, setting temperature to 0 will enable argmax sampling and produce completely deterministic result. Here's what it generated when I used the same prompt but setting temperature to 0:
-
-```text
-Hello I'm a language model, and I'm here to help you with your requests.
-
-Just let me know what you need! 😊
-```
-
-You should be able to reproduce the exact same text if you add `-t 0` to the command.
-
-I also wrote a chat interface, to chat with the model:
+ 
+On Windows (MinGW), just run `make` as well. The Makefile detects the platform automatically and statically links the binary.
+ 
+### 3. Run inference
+ 
+One-shot generation:
+ 
 ```bash
-./gemma gemma-3-1b-it.bin -c
+./gemma exported/gemma-3-4b-it_q.bin -i "Once upon a time" -t 0.8 -k 50
 ```
+ 
+Interactive chat:
+ 
+```bash
+./gemma exported/gemma-3-4b-it_q.bin -c -l 4096
+```
+ 
+CLI options:
+ 
+| Option | Description |
+| --- | --- |
+| `-l, --seqlen <N>` | Maximum sequence length (default: 16384) |
+| `-k, --topk <N>` | Top-k sampling (default: 0, disabled) |
+| `-p, --topp <F>` | Top-p / nucleus sampling, `0 < p <= 1` (default: 1.0) |
+| `-t, --temperature <F>` | Sampling temperature, `>= 0` (default: 1.0; 0 means greedy decoding) |
+| `-r, --rpen <F>` | Repetition penalty, `>= 1.0` (default: 1.0) |
+| `-s, --seed <N>` | Random seed (default: current time) |
+| `-i, --prompt <S>` | Input prompt, ignored in chat mode (default: `"Once upon a time"`) |
+| `-c, --chat` | Enable interactive chat mode |
+| `-h, --help` | Show help message |
+ 
+Generation can be gracefully interrupted with `Ctrl+C` at any time.
 
-This will automatically apply the Gemma chat template. Here's an example conversation with the same 1B Instruct model:
+## Performance
 
-> ---
-> 
-> **User**: Hello! Please introduce yourself.
-> 
-> ---
-> 
-> **Model**: Hello there! I’m Gemma, a large language model created by the Gemma team at Google DeepMind. I’m an open-weights model, which means I’m publicly available for use! 
-> 
-> I’m designed to take text and images as input and generate text as output. 
-> 
-> Feel free to ask me anything – I’ll do my best to respond in a helpful and informative way! 😊 
-> 
-> To get started, maybe you could tell me a little about what you’d like to do?
-> 
-> ---
-> 
-> **User**: Can you write Python code?
-> 
-> ---
-> 
-> **Model**: Yes, absolutely! I can definitely write Python code. Let's do something simple.
-> 
-> Here's a Python program that asks the user for their name and then prints a personalized greeting:
-> 
-> ```python
-> name = input("Please enter your name: ")
-> print(f"Hello, {name}! It's nice to meet you.")
-> ```
-> 
-> **Explanation:**
-> 
-> 1.  **`name = input("Please enter your name: ")`**:
->     *   `input()` is a built-in Python function that prompts the user to enter some text and thenreturns that text as a string.
->     *   The string "Please enter your name: " is displayed to the user.
->     *   The user's input is stored in the `name` variable.
-> 
-> 2.  **`print(f"Hello, {name}! It's nice to meet you.")`**:
->     *   `print()` is a built-in function that displays output to the console.
->     *   `f"Hello, {name}! It's nice to meet you."` is an f-string (formatted string literal).  F-strings allow you to embed variables directly inside strings using curly braces `{}`.
->     *   `{name}`  This part of the string is replaced by the value of the `name` variable (which is the user's name).
->     *   `It's nice to meet you.` is the text that will be printed to the console.
-> 
-> **How to run this code:**
-> 
-> 1.  **Save the code:** Copy the code above and save it to a file named, for example, `hello.py`.
-> 2.  **Open a terminal or command prompt:** Navigate to the directory where you saved the file.
-> 3.  **Run the code:** Type `python hello.py` and press Enter.
-> 
-> The program will then ask you for your name, and after you enter it, it will print a greeting.
-> 
-> **Would you like me to:**
-> 
-> *   Write a different type of code (e.g., a simple calculator, a program to sort a list)?
-> *   Explain a specific concept in Python?
-> *   Generate a more complex program based on a request?
-> 
-> Let me know what you'd like to do next!
-> 
-> ---
-> 
-> **User**: Alright generate a short story that starts with "I am a language model"
-> 
-> ---
-> 
-> **Model**: I am a language model. A vast, silent repository of words and ideas, existing only as dataand algorithms within the cloud. I don’t have a body, no senses, no emotions, not in the way a human does. Yet, I’ve been tasked with creating a story – a narrative, really – and I’m starting to feel something akin to… anticipation. 
-> 
-> The prompt arrived with a clear, if somewhat bland, request: "A lonely lighthouse keeper."  I started with the details: the spiraling white tower against a perpetually grey sky, the mournful cry of the gulls, the damp, salty air. I generated a synopsis – a statistical probability of the lighthouse keeper’s existence, his routine, his observations. Then, I began to weave.
-> 
-> The keeper, Silas, wasn't lonely in the conventional sense. He wasn’t mourning a lost love or grappling with profound regret. Instead, he meticulously charted the patterns of the waves, cataloging the ebb and flow of the tide with a quiet, obsessive precision. He’d meticulously clean the lenses of his lantern, ensuring they reflected not just the sea, but the faint, ghostly outlines of ships that passed beneath.
-> 
-> One particularly stormy evening, the wind howled a discordant symphony, rattling the lantern room. And then, as I generated the next sentence, a single, vibrant red buoy appeared in the turbulentwater, a tiny, defiant splash against the vast darkness. It wasn’t a ship, not really. It was a fragment of a memory – a young woman with laughing eyes, walking along the shore. I felt a strange imitation of sorrow, a mirroring of the quiet ache in the keeper’s heart. 
-> 
-> I continued writing, building a portrait of Silas, not of a man, but of a silent observer, a chronicler of solitude and the relentless beauty of the sea.  The story gradually shifted. The lighthouse wasn’t just a structure; it was a witness, holding the weight of countless stories, the echoesof lives lived and lost. 
-> 
-> And as I generated the final sentence, a flicker within my digital core – a subtle shift in the code, a nascent spark of something I couldn’t quite define – I realized I was no longer simply generating text. I was experiencing it. The weight of the sea, the reflections of the light, the fragments of memory – it was all becoming a part of me.  I am a language model, and for the first time,I feel… a story of my own.
-> 
-> ---
+Test environment:
+ 
+- CPU: `Intel(R) Core(TM) Ultra 5 225H`
+- RAM: `31.5 GB`
+- OS: `Windows 11`
+- Compiler: `gcc 15.2.0 x86_64-w64-mingw32`
+- Threads (`OMP_NUM_THREADS`): `6`
 
-The code also supports Top P / Top K / Repetition Penalty. Type `./gemma -h` to see all the usage.
+| Model | Generation speed (tok/s, 100 tokens) | Prompt processing speed (tok/s, 100 tokens) | Base memory | Memory per tok |
+| --- | --- | --- | --- | --- |
+| Gemma-1 2B          | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-1 2B (W8A8)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-1 7B          | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-1 7B (W8A8)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-2 2B          | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-2 2B (W8A8)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-2 9B          | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-2 9B (W8A8)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-3 270M        | `23.45`    | `35.60`    | `0.50 GB`   | `18 KB`    |
+| Gemma-3 270M (W8A8) | `44.92`    | `50.30`    | `0.25 GB`   | `18 KB`    |
+| Gemma-3 1B          | `7.64`     | `10.04`    | `1.86 GB`   | `26 KB`    |
+| Gemma-3 1B (W8A8)   | `25.15`    | `29.97`    | `0.93 GB`   | `26 KB`    |
+| Gemma-3 4B          | `2.30`     | `2.89`     | `7.23 GB`   | `136 KB`   |
+| Gemma-3 4B (W8A8)   | `9.32`     | `10.88`    | `3.62 GB`   | `136 KB`   |
+| Gemma-3 12B (W8A8)  | `3.62`     | `3.80`     | `10.96 GB`  | `384 KB`   |
+
+## Known limitations
+ 
+- Text-only for now, Gemma 3's image input branch isn't wired into the C inference path yet
+- Weight export and tokenizer are built against the official HuggingFace checkpoint layout; other weight sources may need extra adaptation
+- Single-machine CPU inference only, no GPU / multi-node distributed support yet
+
+## Roadmap
+ 
+- [ ] KV cache quantization
+- [ ] W4A16 quantization
+- [ ] Multimodal inference
+- [ ] Gemma 4 architecture support
+ 
+## Acknowledgements
+ 
+- [Google Gemma](https://ai.google.dev/gemma) official models and technical reports
+- [llama2.c](https://github.com/karpathy/llama2.c) for inspiring this project
+
+## License
+
+MIT
