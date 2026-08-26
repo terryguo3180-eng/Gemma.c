@@ -52,11 +52,11 @@ python export.py google/gemma-3-4b-it \
 `export.py` arguments:
  
 | Argument | Description |
-| --- | --- |
-| `modelfile` | HuggingFace model id or a local directory |
-| `-o, --output` | Output `.bin` path (required) |
-| `-d, --dtype` | Weight precision: `float16` / `float32` / `bfloat16` (default: `float16`) |
-| `-q, --quantize` | Enable INT8 quantization |
+| -------- | ----------- |
+| `modelfile`        | HuggingFace model id or a local directory |
+| `-o, --output`     | Output `.bin` path (required) |
+| `-d, --dtype`      | Weight precision: `float16` / `float32` / `bfloat16` (default: `float16`) |
+| `-q, --quantize`   | Enable INT8 quantization |
 | `-c, --cache-path` | Custom HuggingFace cache directory |
 
 ### 2. Build
@@ -72,7 +72,7 @@ On Windows (MinGW), just run `make` as well. The Makefile detects the platform a
 One-shot generation:
  
 ```bash
-./gemma exported/gemma-3-4b-it_q.bin -i "Once upon a time" -t 0.8 -k 50
+./gemma exported/gemma-3-4b-it_q.bin -i "Once upon a time" -t 1.2 -k 50 -p 0.8 -r 1.15
 ```
  
 Interactive chat:
@@ -84,16 +84,16 @@ Interactive chat:
 CLI options:
  
 | Option | Description |
-| --- | --- |
-| `-l, --seqlen <N>` | Maximum sequence length (default: 16384) |
-| `-k, --topk <N>` | Top-k sampling (default: 0, disabled) |
-| `-p, --topp <F>` | Top-p / nucleus sampling, `0 < p <= 1` (default: 1.0) |
+| ------ | ----------- |
+| `-l, --seqlen <N>`      | Maximum sequence length (default: 16384) |
+| `-k, --topk <N>`        | Top-k sampling (default: 0, disabled) |
+| `-p, --topp <F>`        | Top-p / nucleus sampling, `0 < p <= 1` (default: 1.0) |
 | `-t, --temperature <F>` | Sampling temperature, `>= 0` (default: 1.0; 0 means greedy decoding) |
-| `-r, --rpen <F>` | Repetition penalty, `>= 1.0` (default: 1.0) |
-| `-s, --seed <N>` | Random seed (default: current time) |
-| `-i, --prompt <S>` | Input prompt, ignored in chat mode (default: `"Once upon a time"`) |
-| `-c, --chat` | Enable interactive chat mode |
-| `-h, --help` | Show help message |
+| `-r, --rpen <F>`        | Repetition penalty, `>= 1.0` (default: 1.0) |
+| `-s, --seed <N>`        | Random seed (default: current time) |
+| `-i, --prompt <S>`      | Input prompt, ignored in chat mode (default: `"Once upon a time"`) |
+| `-c, --chat`            | Enable interactive chat mode |
+| `-h, --help`            | Show help message |
  
 Generation can be gracefully interrupted with `Ctrl+C` at any time.
 
@@ -108,22 +108,25 @@ Test environment:
 - Threads (`OMP_NUM_THREADS`): `6`
 
 | Model | Generation speed (tok/s, 100 tokens) | Prompt processing speed (tok/s, 100 tokens) | Base memory | Memory per tok |
-| --- | --- | --- | --- | --- |
-| Gemma-1 2B          | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| ----- | ------------------------------------ | ------------------------------------------- | ----------- | -------------- |
+| Gemma-1 2B (FP16)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
 | Gemma-1 2B (W8A8)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
-| Gemma-1 7B          | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-1 7B (FP16)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
 | Gemma-1 7B (W8A8)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
-| Gemma-2 2B          | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-2 2B (FP16)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
 | Gemma-2 2B (W8A8)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
-| Gemma-2 9B          | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-2 9B (FP16)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
 | Gemma-2 9B (W8A8)   | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
-| Gemma-3 270M        | `23.45`    | `35.60`    | `0.50 GB`   | `18 KB`    |
+| Gemma-3 270M (FP16) | `23.45`    | `35.60`    | `0.50 GB`   | `18 KB`    |
 | Gemma-3 270M (W8A8) | `44.92`    | `50.30`    | `0.25 GB`   | `18 KB`    |
-| Gemma-3 1B          | `7.64`     | `10.04`    | `1.86 GB`   | `26 KB`    |
+| Gemma-3 1B (FP16)   | `7.64`     | `10.04`    | `1.86 GB`   | `26 KB`    |
 | Gemma-3 1B (W8A8)   | `25.15`    | `29.97`    | `0.93 GB`   | `26 KB`    |
-| Gemma-3 4B          | `2.30`     | `2.89`     | `7.23 GB`   | `136 KB`   |
+| Gemma-3 4B (FP16)   | `2.30`     | `2.89`     | `7.23 GB`   | `136 KB`   |
 | Gemma-3 4B (W8A8)   | `9.32`     | `10.88`    | `3.62 GB`   | `136 KB`   |
+| Gemma-3-12B (FP16)  | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
 | Gemma-3 12B (W8A8)  | `3.62`     | `3.80`     | `10.96 GB`  | `384 KB`   |
+| Gemma-3-27B (FP16)  | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
+| Gemma-3-27B (W8A8)  | `<TODO>`   | `<TODO>`   | `<TODO>`    | `<TODO>`   |
 
 ## Known limitations
  

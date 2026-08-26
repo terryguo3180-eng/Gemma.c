@@ -1,7 +1,24 @@
+from io import BytesIO
+from PIL import Image
+from urllib import request
+
+import torch
+
+from preprocess import preprocess_image
+
+
 class GemmaTokenizer:
-    def __init__(self, vocab: dict[str, int], merges: list[tuple[str, str]]):
+    def __init__(
+        self,
+        vocab: dict[str, int],
+        merges: list[tuple[str, str]],
+        tokens_per_image: int,
+        image_size: int,
+    ):
         self.vocab = vocab
         self.idx_to_str = {i: s for s, i in vocab.items()}
+        self.tokens_per_image = tokens_per_image
+        self.image_size = image_size
 
         self.ranks = {}
         self.merges = {}
@@ -44,19 +61,79 @@ class GemmaTokenizer:
     def decode(self, tokens: list[int]) -> str:
         return "".join(self.idx_to_str[tok] for tok in tokens)
 
-    def apply_chat_template(self, conversation: list[dict[str, str]]):        
+    def apply_chat_template(self, conversation: (
+        list[  # list of all the turns
+            dict[
+                str,  # "role" | "content"
+                str |  # values for "role": "user" | "model" | "assistant"
+                list[  # values for "content": list of all the inputs
+                    dict[
+                        str,  # "type" | "text" | "url" | "image"
+                        str,  # values
+    ]]]])) -> dict[str, torch.Tensor]:
+        
         tokens = [self.vocab["<bos>"]]
+        pixel_values = []
+
         for turn in conversation:
             tokens.append(self.vocab["<start_of_turn>"])
+
             role = "model" if turn["role"] in {"model", "assistant"} else turn["role"]
-            tokens.extend(self.encode(role)[1:])
+            assert isinstance(role, str)
+            tokens.extend(self.encode(role)[1:])  # exclude <bos> at the beginning
             tokens.append(self.vocab["\n"])
-            tokens.extend(self.encode(turn["content"])[1:])
+
+            content = turn["content"]
+            assert not isinstance(content, str)
+            for input in content:
+                if input["type"] == "text":
+                    tokens.extend(self.encode(input["text"])[1:])
+                elif input["type"] == "image":
+                    tokens.append(self.vocab["\n"])
+                    tokens.append(self.vocab["\n"])
+                    tokens.append(self.vocab["<start_of_image>"])
+                    for _ in range(self.tokens_per_image):
+                        # Image placeholders
+                        tokens.append(self.vocab["<image_soft_token>"])
+                    tokens.append(self.vocab["<end_of_image>"])
+                    tokens.append(self.vocab["\n"])
+                    tokens.append(self.vocab["\n"])
+
+                    # Get image path / image object
+                    if "url" in input:
+                        path = input["url"]
+                    elif "image" in input:
+                        path = input["image"]
+                    else:
+                        assert False
+
+                    if isinstance(path, str) and path.startswith("https://"):
+                        with request.urlopen(path) as resp:
+                            img = Image.open(BytesIO(resp.read()))
+                    elif isinstance(path, str):
+                        img = Image.open(path)
+                    elif isinstance(path, Image):
+                        img = path
+                    else:
+                        assert False
+
+                    img = preprocess_image(img, self.image_size)
+                    pixel_values.append(img)
+
             tokens.append(self.vocab["<end_of_turn>"])
             tokens.append(self.vocab["\n"])
 
+        # Model's turn next
         tokens.append(self.vocab["<start_of_turn>"])
         tokens.extend(self.encode("model")[1:])
         tokens.append(self.vocab["\n"])
 
-        return tokens
+        if pixel_values:
+            pixel_values = torch.cat(pixel_values, dim=0)  # (n_images, 3, H, W)
+        else:
+            pixel_values = torch.empty(0)
+
+        return {
+            "tokens": torch.tensor([tokens], dtype=torch.long),
+            "pixel_values": pixel_values,
+        }
