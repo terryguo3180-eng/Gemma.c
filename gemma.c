@@ -32,19 +32,9 @@ void setup_signal_handler(void) {
 #endif
 }
 
-// Temporary macro for string concatenation, need to be freed after use
-#define __CAT(a, b) ({ \
-    char* __CAT_result = malloc(strlen(a) + strlen(b) + 1); \
-    if (__CAT_result) { \
-        strcpy_s(__CAT_result, strlen(a) + strlen(b) + 1, a); \
-        strcat_s(__CAT_result, strlen(a) + strlen(b) + 1, b); \
-    } \
-    __CAT_result; \
-})
-
 // Memory operation wrappers
 // You can pass in basically arbitrary text into macros, including spaces. So inside
-// void functions, simply use `MALLOC(ptr, count, name, )`, and it will be automatically
+// void functions simply use `MALLOC(ptr, count, name, )`, and it will be automatically
 // expanded to `... fprintf(...); return ; ...`
 #define MALLOC(ptr, count, name, fail) do { \
     ptr = malloc((count) * sizeof(*(ptr)));  /* NOLINT */ \
@@ -112,13 +102,14 @@ void setup_signal_handler(void) {
 
 #define READ_STR(fp, data, offset, name, fail) ({ \
     /* Read a pascal-style string, the first byte indicates the length */ \
-    char *__READ_STR_len_name = __CAT((name), ".length"); \
+    char __READ_STR_len_name[128]; \
+    snprintf(__READ_STR_len_name, 128, "%s.length", (name)); \
     int __READ_STR_len = FGETC(fp, __READ_STR_len_name, fail); \
-    free(__READ_STR_len_name); \
     char *__READ_STR_str = (data) + *(offset); \
     FREAD(__READ_STR_str, __READ_STR_len, (fp), (name), fail); \
     (data)[*(offset) + __READ_STR_len] = '\0'; \
-    *(offset) += __READ_STR_len + 1; __READ_STR_str; \
+    *(offset) += __READ_STR_len + 1;\
+    __READ_STR_str; \
 })
 
 #define READ_TENSOR(ptr, count, fp, name, fail) do { \
@@ -130,17 +121,17 @@ void setup_signal_handler(void) {
     MALLOC((w), 1, (name), fail); \
     if (!(quant)) { \
         (w)->dtype = DTYPE_FP16; \
-        char *__READ_LINEAR_fp16_name = __CAT((name), ".fp16"); \
+        char __READ_LINEAR_fp16_name[128]; \
+        snprintf(__READ_LINEAR_fp16_name, 128, "%s.fp16", (name)); \
         READ_TENSOR((w)->fp16, (m) * (n), (fp), __READ_LINEAR_fp16_name, fail); \
-        free(__READ_LINEAR_fp16_name); \
     } else { \
         (w)->dtype = DTYPE_INT8; \
-        char *__READ_LINEAR_i8q_name = __CAT((name), ".i8.q"); \
-        char *__READ_LINEAR_i8scales_name = __CAT((name), ".i8.scales"); \
+        char __READ_LINEAR_i8q_name[128]; \
+        char __READ_LINEAR_i8scales_name[128]; \
+        snprintf(__READ_LINEAR_i8q_name, 128, "%s.i8.q", (name)); \
+        snprintf(__READ_LINEAR_i8scales_name, 128, "%s.i8.scales", (name)); \
         READ_TENSOR((w)->i8.q, (m) * (n), (fp), __READ_LINEAR_i8q_name, fail); \
         READ_TENSOR((w)->i8.scales, (n), (fp), __READ_LINEAR_i8scales_name, fail); \
-        free(__READ_LINEAR_i8q_name); \
-        free(__READ_LINEAR_i8scales_name); \
     } \
 } while(0)
 
