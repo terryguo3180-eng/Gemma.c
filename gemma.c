@@ -648,6 +648,10 @@ GemmaModel *read_model(const char *filename, bool enable_mm) {
         vconf->patch_size = read_uint16(fp);
         vconf->eps = read_float32(fp);
         enc->config = vconf;
+    } else if (conf->support_mm) {
+        for (int j = 0; j < 2; j++) { fgetc(fp); }
+        for (int j = 0; j < 4; j++) { read_uint16(fp); }
+        read_float32(fp);
     }
 
     // dtype (only supports float16)
@@ -664,7 +668,7 @@ GemmaModel *read_model(const char *filename, bool enable_mm) {
     // Build vocabulary
     offset = 0;
     tok->vocab_size = conf->vocab_size;
-    if (use_mm) { tok->vocab_size++; }  // ++ for the <image_soft_token>
+    if (conf->support_mm) { tok->vocab_size++; }  // ++ for the <image_soft_token>
     tok->vocab_data = safe_malloc(get_strarr_bytes(fp, tok->vocab_size), "vocab_data");
     tok->vocab = safe_malloc(tok->vocab_size * sizeof(*tok->vocab), "vocab");
     tok->vocab_sorted = safe_malloc(tok->vocab_size * sizeof(*tok->vocab_sorted), "vocab_sorted");
@@ -1104,7 +1108,7 @@ static void warn_stats(const char *name, const _Float16 *data, int len, int laye
 }
 
 void forward_siglip(
-    SigLIPVisionEncoder *enc, GemmaConfig *conf, SigLIPConfig *vconf, SigLIPBuffer *buf,
+    SigLIPVisionEncoder *enc, GemmaConfig *conf, SigLIPBuffer *buf,
     _Float16 *img, _Float16 *out
 ) {
     SigLIPConfig *vconf = enc->config;
@@ -1229,8 +1233,8 @@ void forward_siglip(
         if (!conf->quant) {
             gemm_fp16(buf->x, &layer->wo, buf->att_out, N, C, C);
         } else {
-            quantize_act_rows(buf->x_i8, buf->x, N, C, buf->x_scales);
-            gemm_int8(buf->x, &layer->wo, buf->att_out, N, C, C, buf->x_scales);
+            quantize_act_rows(buf->x_i8, buf->att_out, N, C, buf->x_scales);
+            gemm_int8(buf->x, &layer->wo, buf->x_i8, N, C, C, buf->x_scales);
         }
         // Add output bias
         for (int i = 0; i < N; i++)
@@ -2449,7 +2453,7 @@ int main(int argc, char **argv) {
     // malloc buffer for SigLIP
     SigLIPBuffer *sbuf = NULL;
     if (enable_mm && model->config->support_mm) {
-        sbuf = malloc_siglip_buffer(model->vision_enc, model->config->quant);
+        sbuf = malloc_siglip_buffer(model->vision_enc->config, model->config->quant);
     }
     print_model_config(model);
 
