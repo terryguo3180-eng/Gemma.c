@@ -1,0 +1,125 @@
+{
+  "structs": {
+    "GemmaConfig": {
+      "fields": [
+        {"name": "n_layers", "type": "int"},
+        {"name": "n_heads", "type": "int"},
+        {"name": "n_kv_heads", "type": "int"},
+        {"name": "head_dim", "type": "int"},
+        {"name": "embed_dim", "type": "int"},
+        {"name": "mlp_dim", "type": "int"},
+        {"name": "q_pre_attn_scalar", "type": "int"},
+        {"name": "sliding_window", "type": "int"},
+        {"name": "tokens_per_image", "type": "int"},
+        {"name": "max_seq_len", "type": "int"},
+        {"name": "vocab_size", "type": "int"},
+        {"name": "local_theta", "type": "float", "fmt": "%.6f"},
+        {"name": "global_theta", "type": "float", "fmt": "%.6f"},
+        {"name": "eps", "type": "float", "fmt": "%.6f"},
+        {"name": "attn_softcapping", "type": "float", "fmt": "%.6f"},
+        {"name": "logit_softcapping", "type": "float", "fmt": "%.6f"},
+        {"name": "attn_local_layers", "type": "bool_array", "len_expr": "conf->n_layers"},
+        {"name": "support_mm", "type": "bool"},
+        {"name": "use_qk_norm", "type": "bool"},
+        {"name": "pre_ffwd_norm", "type": "bool"},
+        {"name": "post_ffwd_norm", "type": "bool"},
+        {"name": "quant", "type": "bool"}
+      ]
+    },
+    "GemmaTokenizer": {
+      "fields": [
+        {"name": "vocab_size", "type": "int"},
+        {"name": "n_merges", "type": "int"},
+        {"name": "bos", "type": "int"},
+        {"name": "eos", "type": "int"},
+        {"name": "sot", "type": "int"},
+        {"name": "eot", "type": "int"},
+        {"name": "soi", "type": "int"},
+        {"name": "eoi", "type": "int"},
+        {"name": "ist", "type": "int"}
+      ]
+    }
+  },
+  "memory_rules": {
+    "embedding": {
+      "dims": ["conf->embed_dim", "conf->vocab_size"],
+      "quantized": "conf->quant",
+      "scales": "conf->vocab_size"
+    },
+    "layers": {
+      "linear_dims": [
+        ["conf->embed_dim", "q_size"],
+        ["conf->embed_dim", "kv_size"],
+        ["conf->embed_dim", "kv_size"],
+        ["q_size", "conf->embed_dim"],
+        ["conf->embed_dim", "conf->mlp_dim"],
+        ["conf->embed_dim", "conf->mlp_dim"],
+        ["conf->mlp_dim", "conf->embed_dim"]
+      ],
+      "scale_dims": ["q_size", "kv_size", "kv_size", "conf->embed_dim", "conf->mlp_dim", "conf->mlp_dim", "conf->embed_dim"],
+      "norm_weights": ["n1", "n2"],
+      "optional_norms": {
+        "qk_norm": "conf->use_qk_norm ? 2 * conf->head_dim : 0",
+        "pre_ffwd_norm": "conf->pre_ffwd_norm ? conf->embed_dim : 0",
+        "post_ffwd_norm": "conf->post_ffwd_norm ? conf->embed_dim : 0"
+      }
+    },
+    "final_norm": {"dims": ["conf->embed_dim"]}
+  },
+  "buffers": {
+    "gemma": {
+      "common_dims": {
+        "C": "conf->embed_dim",
+        "L": "conf->n_layers",
+        "CH": "conf->head_dim",
+        "NH": "conf->n_heads",
+        "CM": "conf->mlp_dim",
+        "ppi": "model->vision_enc->config->image_size / model->vision_enc->config->patch_size",
+        "q_size": "NH * CH"
+      },
+      "mult_expr": "conf->support_mm && enable_mm && model->vision_enc != NULL? ppi * ppi : 1",
+      "members": [
+        {"name": "x_i8", "type": "int8_t", "dims": ["C"], "cond": "conf->quant"},
+        {"name": "xo_i8", "type": "int8_t", "dims": ["q_size"], "cond": "conf->quant"},
+        {"name": "xg_i8", "type": "int8_t", "dims": ["CM"], "cond": "conf->quant"},
+        {"name": "kv_cache", "type": "_Float16", "dims": ["L", "2", "seqlen", "kv_size"]},
+        {"name": "logits", "type": "_Float16", "dims": ["conf->vocab_size"]},
+        {"name": "x", "type": "_Float16", "dims": ["mult", "C"]},
+        {"name": "resid", "type": "_Float16", "dims": ["mult", "C"]},
+        {"name": "xq", "type": "_Float16", "dims": ["mult", "q_size"]},
+        {"name": "xk", "type": "_Float16", "dims": ["mult", "kv_size"]},
+        {"name": "csfreqs_slid", "type": "_Float16", "dims": ["mult", "CH"]},
+        {"name": "csfreqs_full", "type": "_Float16", "dims": ["mult", "CH"]},
+        {"name": "xv", "type": "_Float16", "dims": ["mult", "kv_size"]},
+        {"name": "xo", "type": "_Float16", "dims": ["mult", "q_size"]},
+        {"name": "att", "type": "_Float16", "dims": ["mult", "NH", "seqlen"]},
+        {"name": "xg", "type": "_Float16", "dims": ["mult", "CM"]},
+        {"name": "xu", "type": "_Float16", "dims": ["mult", "CM"]}
+      ]
+    },
+    "siglip": {
+      "enabled": "enable_mm && model->vision_enc != NULL",
+      "members": [
+        {"name": "x_i8", "type": "int8_t", "dims": ["n_patches", "C"], "cond": "conf->quant"},
+        {"name": "x_scales", "type": "_Float16", "dims": ["n_patches"], "cond": "conf->quant"},
+        {"name": "mlp_i8", "type": "int8_t", "dims": ["n_patches", "mlp_dim"], "cond": "conf->quant"},
+        {"name": "mlp_scales", "type": "_Float16", "dims": ["n_patches"], "cond": "conf->quant"},
+        {"name": "x", "type": "_Float16", "dims": ["n_patches", "C"]},
+        {"name": "resid", "type": "_Float16", "dims": ["n_patches", "C"]},
+        {"name": "xq", "type": "_Float16", "dims": ["n_patches", "C"]},
+        {"name": "xk", "type": "_Float16", "dims": ["n_patches", "C"]},
+        {"name": "xv", "type": "_Float16", "dims": ["n_patches", "C"]},
+        {"name": "att_out", "type": "_Float16", "dims": ["n_patches", "C"]},
+        {"name": "mlp_hidden", "type": "_Float16", "dims": ["n_patches", "mlp_dim"]},
+        {"name": "scores", "type": "_Float16", "dims": ["n_heads", "n_patches", "n_patches"]}
+      ],
+      "local_dims": {
+        "C": "vconf->hidden_dim",
+        "mlp_dim": "vconf->mlp_dim",
+        "ppi": "vconf->image_size / vconf->patch_size",
+        "n_patches": "ppi * ppi",
+        "n_heads": "vconf->n_heads"
+      }
+    }
+  }
+}

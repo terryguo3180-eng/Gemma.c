@@ -1,3 +1,5 @@
+/* Gemma 1 & 2 & 3 & 3n implemented in a single file of pure C */
+
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -9,9 +11,7 @@
 #include <time.h>
 #include <signal.h>
 
-#define FP16_MAX      (((union {_Float16 f; uint16_t b;}){.b = 0x7BFF}).f)
-#define EOT_SENTINEL  (-1)  // Sentinel for end of token array
-#define SAMPLE_ABORT  ((int *)(intptr_t)-1)
+#define FP16_MAX (((union {_Float16 f; uint16_t b;}){.b = 0x7BFF}).f)
 
 #ifdef DEBUG
 #pragma message("Debug mode on")
@@ -20,7 +20,7 @@
 // Global state for interruption handling
 static volatile bool g_interrupted = false;
 
-void signal_handler(int signum) {
+static void signal_handler(int signum) {
     (void)signum;
     g_interrupted = true;
 }
@@ -32,37 +32,141 @@ void setup_signal_handler(void) {
 #endif
 }
 
-// Safe memory operation wrappers
-void *safe_malloc(size_t size, const char *context) {
-    void *ptr = malloc(size);
-    if (ptr == NULL) {
-        fprintf(
-            stderr, "Memory allocation failed: %s (size: %zu)\n",
-            context, size
-        ); exit(1);
-    }
-    return ptr;
-}
+// Temporary macro for string concatenation, need to be freed after use
+#define __CAT(a, b) ({ \
+    char* __CAT_result = malloc(strlen(a) + strlen(b) + 1); \
+    if (__CAT_result) { \
+        strcpy_s(__CAT_result, strlen(a) + strlen(b) + 1, a); \
+        strcat_s(__CAT_result, strlen(a) + strlen(b) + 1, b); \
+    } \
+    __CAT_result; \
+})
 
-void *safe_calloc(size_t count, size_t size, const char *context) {
-    void *ptr = calloc(count, size);
-    if (ptr == NULL) {
-        fprintf(
-            stderr, "Memory allocation failed: %s (count: %zu, size: %zu)\n",
-            context, count, size
-        ); exit(1);
-    }
-    return ptr;
-}
+// Memory operation wrappers
+// You can pass in basically arbitrary text into macros, including spaces. So inside
+// void functions, simply use `MALLOC(ptr, count, name, )`, and it will be automatically
+// expanded to `... fprintf(...); return ; ...`
+#define MALLOC(ptr, count, name, fail) do { \
+    ptr = malloc((count) * sizeof(*(ptr)));  /* NOLINT */ \
+    if (ptr == NULL) { \
+        fprintf( \
+            stderr, "Memory allocation failed: %s (size: %zu)\n", \
+            (name), (count) * sizeof(*(ptr)));  /* NOLINT */\
+        return fail; \
+    } \
+} while(0)
 
-void safe_fread(void *ptr, size_t size, size_t count, FILE *fp, const char *context) {
-    size_t read = fread(ptr, size, count, fp);
-    if (read != count) {
-        fprintf(
-            stderr, "File read failed: %s (expected %zu, got %zu)\n",
-            context, count, read
-        ); exit(1);
+#define CALLOC(ptr, count, name, fail) do { \
+    ptr = calloc((count), sizeof(*(ptr)));  /* NOLINT */ \
+    if (ptr == NULL) { \
+        fprintf( \
+            stderr, "Memory allocation failed: %s (count: %zu, size: %zu)\n", \
+            (name), (count), sizeof(*(ptr)));  /* NOLINT */ \
+        return fail; \
+    } \
+} while(0)
+
+// Statement expressions: ({ ... }), an extension of GNU C. Not supported in MSVC
+#define FGETC(fp, name, fail) ({ \
+    int __FGETC_read = fgetc(fp); \
+    if (__FGETC_read == EOF) { \
+        fprintf(stderr, "File read failed: %s", (name)); \
+        return fail; \
+    } \
+    __FGETC_read; \
+})
+
+#define FREAD(ptr, count, fp, name, fail) do { \
+    size_t __FREAD_read = fread((ptr), sizeof(*(ptr)), (count), (fp)); \
+    if (__FREAD_read != (count)) { \
+        fprintf( \
+            stderr, "File read failed: %s (expected %d, got %zu)\n", \
+            (name), (count), __FREAD_read); \
+        return fail; \
+    } \
+} while(0)
+
+#define READ_UINT16(fp, fail) ({ \
+    /* Big-endian */ \
+    unsigned char __READ_UINT16_bytes[2]; \
+    FREAD(__READ_UINT16_bytes, 2, (fp), "uint16", fail); \
+    ((int)__READ_UINT16_bytes[0] << 8) | (int)__READ_UINT16_bytes[1]; \
+})
+
+#define READ_UINT32(fp, fail) ({ \
+    /* Big-endian */ \
+    unsigned char __READ_UINT32_bytes[4]; \
+    FREAD(__READ_UINT32_bytes, 4, (fp), "uint32", fail); \
+    ((uint32_t)__READ_UINT32_bytes[0] << 24) | \
+    ((uint32_t)__READ_UINT32_bytes[1] << 16) | \
+    ((uint32_t)__READ_UINT32_bytes[2] <<  8) | \
+    ((uint32_t)__READ_UINT32_bytes[3]); \
+})
+
+#define READ_FP32(fp, fail) ({ \
+    uint32_t __READ_FP32_buf = READ_UINT32((fp), fail); \
+    float __READ_FP32_f; \
+    memcpy(&__READ_FP32_f, &__READ_FP32_buf, sizeof(float)); \
+    __READ_FP32_f; \
+})
+
+#define READ_STR(fp, data, offset, name, fail) ({ \
+    /* Read a pascal-style string, the first byte indicates the length */ \
+    char *__READ_STR_len_name = __CAT((name), ".length"); \
+    int __READ_STR_len = FGETC(fp, __READ_STR_len_name, fail); \
+    free(__READ_STR_len_name); \
+    char *__READ_STR_str = (data) + *(offset); \
+    FREAD(__READ_STR_str, __READ_STR_len, (fp), (name), fail); \
+    (data)[*(offset) + __READ_STR_len] = '\0'; \
+    *(offset) += __READ_STR_len + 1; __READ_STR_str; \
+})
+
+#define READ_TENSOR(ptr, count, fp, name, fail) do { \
+    MALLOC((ptr), (count), (name), fail); \
+    FREAD((ptr), (count), (fp), (name), fail); \
+} while(0)
+
+#define READ_LINEAR(w, fp, m, n, quant, name, fail) do { \
+    MALLOC((w), 1, (name), fail); \
+    if (!(quant)) { \
+        (w)->dtype = DTYPE_FP16; \
+        char *__READ_LINEAR_fp16_name = __CAT((name), ".fp16"); \
+        READ_TENSOR((w)->fp16, (m) * (n), (fp), __READ_LINEAR_fp16_name, fail); \
+        free(__READ_LINEAR_fp16_name); \
+    } else { \
+        (w)->dtype = DTYPE_INT8; \
+        char *__READ_LINEAR_i8q_name = __CAT((name), ".i8.q"); \
+        char *__READ_LINEAR_i8scales_name = __CAT((name), ".i8.scales"); \
+        READ_TENSOR((w)->i8.q, (m) * (n), (fp), __READ_LINEAR_i8q_name, fail); \
+        READ_TENSOR((w)->i8.scales, (n), (fp), __READ_LINEAR_i8scales_name, fail); \
+        free(__READ_LINEAR_i8q_name); \
+        free(__READ_LINEAR_i8scales_name); \
+    } \
+} while(0)
+
+static inline int get_strarr_bytes(FILE *fp, int count) {
+    // Read a sequence of pascal-stype strings
+    int offset = 0;
+    long pos = ftell(fp);
+    if (pos == -1L) {
+        perror("ftell failed");
+        return -1;
     }
+    // Get the total number of bytes
+    for (int i = 0; i < count; i++) {
+        int len = FGETC(fp, "<str.length>", -1);
+        if (fseek(fp, len, SEEK_CUR) != 0) {
+            perror("fseek failed");
+            return -1;
+        }
+        offset += len + 1;
+    }
+    // Resume position
+    if (fseek(fp, pos, SEEK_SET) != 0) {
+        perror("fseek failed");
+        return -1;
+    }
+    return offset;
 }
 
 typedef struct {
@@ -71,7 +175,7 @@ typedef struct {
     int patch_size;
     int hidden_dim;
     int n_heads;
-    int mlp_hidden_dim;
+    int mlp_dim;
     float eps;
 } SigLIPConfig;
 
@@ -81,7 +185,7 @@ typedef struct {
     int n_kv_heads;       // Number of key & value heads (Grouped Query Attention)
     int head_dim;         // Dimensions of the attention heads
     int embed_dim;        // Dimensions of the embedding vectors
-    int mlp_hidden_dim;  // Dimensions of the MLP hidden layers
+    int mlp_dim;          // Dimensions of the MLP hidden layers
     // The scale applied to query vectors before computing attention scores
     int q_pre_attn_scalar;
     int sliding_window;   // Context size in sliding window attention
@@ -98,15 +202,16 @@ typedef struct {
     // Bool array that specifies which layers should use sliding window attention
     bool *attn_local_layers;
 
-    bool support_mm;          // Whether the model supports multi-modal
+    bool support_mm;      // Whether the model supports multi-modal
     bool use_qk_norm;     // Whether query & key normalization is applied
     bool pre_ffwd_norm;   // Whether pre-feedforward normalization is applied
     bool post_ffwd_norm;  // Whether post-feedforward normalization is applied
     bool quant;           // Whether int8 quantization is enabled
 } GemmaConfig;
 
-void free_config(GemmaConfig *conf) {
-    free(conf->attn_local_layers);
+static void free_config(GemmaConfig *conf) {
+    if (conf == NULL) return;
+    if (conf->attn_local_layers != NULL) { free(conf->attn_local_layers); }
     free(conf);
 }
 
@@ -115,11 +220,11 @@ typedef struct { char *str1; char *str2; int rank; } Merge;
 
 // Functions for qsort / bsearch
 
-int cmp_token(const void *a, const void *b) {
+static int cmp_token(const void *a, const void *b) {
     return strcmp(((Token *)a)->val, ((Token *)b)->val);
 }
 
-int cmp_merge(const void *a, const void *b) {
+static int cmp_merge(const void *a, const void *b) {
     int ret = strcmp(((Merge *)a)->str1, ((Merge *)b)->str1);
     if (ret != 0) { return ret; }
     return strcmp(((Merge *)a)->str2, ((Merge *)b)->str2);
@@ -142,18 +247,17 @@ typedef struct {
     Merge *ranks;
 } GemmaTokenizer;
 
-void free_tokenizer(GemmaTokenizer *tok) {
-    free(tok->vocab_data);
-    free(tok->merge_data);
-    free(tok->vocab);
-    free(tok->vocab_sorted);
-    free(tok->ranks);
+static void free_tokenizer(GemmaTokenizer *tok) {
+    if (tok == NULL) return;
+    if (tok->vocab_data != NULL) { free(tok->vocab_data); }
+    if (tok->merge_data != NULL) { free(tok->merge_data); }
+    if (tok->vocab != NULL) { free(tok->vocab); }
+    if (tok->vocab_sorted != NULL) { free(tok->vocab_sorted); }
+    if (tok->ranks != NULL) { free(tok->ranks); }
     free(tok);
 }
 
-// These kind of act as dictionaries in python
-
-int get_token_idx(GemmaTokenizer *tok, char *str) {
+static int get_token_idx(GemmaTokenizer *tok, char *str) {
     // Get idx_to_vocab[string]
     Token key = { .val = str };
     Token *val = bsearch(
@@ -163,7 +267,7 @@ int get_token_idx(GemmaTokenizer *tok, char *str) {
     return val->idx;
 }
 
-Merge *get_merge_rec(GemmaTokenizer *tok, char *str1, char *str2) {
+static Merge *get_merge_rec(GemmaTokenizer *tok, char *str1, char *str2) {
     // Get merges[(str1, str2)]
     Merge key = { .str1 = str1, .str2 = str2 };
     Merge *val = bsearch(
@@ -183,22 +287,26 @@ typedef struct {
     };
 } Linear;
 
-void free_linear(Linear l) {
-    if (l.dtype == DTYPE_FP16) { free(l.fp16); }
-    else { free(l.i8.q); free(l.i8.scales); }
+static void free_linear(Linear *l) {
+    if (l == NULL) return;
+    if (l->dtype == DTYPE_FP16 && l->fp16 != NULL) { free(l->fp16); }
+    else {
+        if (l->i8.q != NULL) { free(l->i8.q); }
+        if (l->i8.scales != NULL) { free(l->i8.scales); }
+    }
 }
 
 typedef struct {
     // Attention weights
     // 2D weights are transposed for higher CPU cache hits in GEMV
-    Linear wq;  // (embed_dim, n_heads * head_dim).T
-    Linear wk;  // (embed_dim, n_kv_heads * head_dim).T
-    Linear wv;  // (embed_dim, n_kv_heads * head_dim).T
-    Linear wo;  // (n_heads * head_dim, embed_dim).T
+    Linear *wq;    // (embed_dim, n_heads * head_dim).T
+    Linear *wk;    // (embed_dim, n_kv_heads * head_dim).T
+    Linear *wv;    // (embed_dim, n_kv_heads * head_dim).T
+    Linear *wo;    // (n_heads * head_dim, embed_dim).T
     // Feedforward weights
-    Linear w1;  // (embed_dim, mlp_hidden_dim).T
-    Linear w2;  // (embed_dim, mlp_hidden_dim).T
-    Linear w3;  // (mlp_hidden_dim, embed_dim).T
+    Linear *w1;    // (embed_dim, mlp_dim).T
+    Linear *w2;    // (embed_dim, mlp_dim).T
+    Linear *w3;    // (mlp_dim, embed_dim).T
     // RMSNorm weights
     _Float16 *nq;  // (head_dim,)
     _Float16 *nk;  // (head_dim,)
@@ -208,7 +316,8 @@ typedef struct {
     _Float16 *n4;  // (embed_dim,)
 } GemmaDecoderLayer;
 
-void free_gemma_layer(GemmaDecoderLayer *layer) {
+static void free_gemma_layer(GemmaDecoderLayer *layer) {
+    if (layer == NULL) return;
     free_linear(layer->wq);
     free_linear(layer->wk);
     free_linear(layer->wv);
@@ -216,8 +325,8 @@ void free_gemma_layer(GemmaDecoderLayer *layer) {
     free_linear(layer->w1);
     free_linear(layer->w2);
     free_linear(layer->w3);
-    free(layer->n1);
-    free(layer->n2);
+    if (layer->n1 != NULL) { free(layer->n1); }
+    if (layer->n2 != NULL) { free(layer->n2); }
     if (layer->nq != NULL) { free(layer->nq); }
     if (layer->nk != NULL) { free(layer->nk); }
     if (layer->n3 != NULL) { free(layer->n3); }
@@ -227,71 +336,76 @@ void free_gemma_layer(GemmaDecoderLayer *layer) {
 
 typedef struct {
     // ViT attention weights
-    Linear wq;  // (hidden_dim, hidden_dim).T
-    Linear wk;  // (hidden_dim, hidden_dim).T
-    Linear wv;  // (hidden_dim, hidden_dim).T
-    Linear wo;  // (hidden_dim, hidden_dim).T
+    Linear *wq;      // (hidden_dim, hidden_dim).T
+    Linear *wk;      // (hidden_dim, hidden_dim).T
+    Linear *wv;      // (hidden_dim, hidden_dim).T
+    Linear *wo;      // (hidden_dim, hidden_dim).T
     // ViT attention biases
-    _Float16 *bq;  // (hidden_dim,)
-    _Float16 *bk;  // (hidden_dim,)
-    _Float16 *bv;  // (hidden_dim,)
-    _Float16 *bo;  // (hidden_dim,)
+    _Float16 *bq;    // (hidden_dim,)
+    _Float16 *bk;    // (hidden_dim,)
+    _Float16 *bv;    // (hidden_dim,)
+    _Float16 *bo;    // (hidden_dim,)
     // ViT feedforward weights
-    Linear w1;  // (hidden_dim, mlp_hidden_dim).T
-    Linear w2;  // (hidden_dim, mlp_hidden_dim).T
+    Linear *w1;      // (hidden_dim, mlp_dim).T
+    Linear *w2;      // (hidden_dim, mlp_dim).T
     // ViT feedforward biases
-    _Float16 *b1;  // (mlp_hidden_dim,)
-    _Float16 *b2;  // (mlp_hidden_dim,)
+    _Float16 *b1;    // (mlp_dim,)
+    _Float16 *b2;    // (mlp_dim,)
     // ViT layernorm weights
-    _Float16 *n1;  // (hidden_dim,)
-    _Float16 *n2;  // (hidden_dim,)
+    _Float16 *n1;    // (hidden_dim,)
+    _Float16 *n2;    // (hidden_dim,)
     // ViT layernorm biases
     _Float16 *n1_b;  // (hidden_dim,)
     _Float16 *n2_b;  // (hidden_dim,)
 } SigLIPEncoderLayer;
 
-void free_siglip_layer(SigLIPEncoderLayer *layer) {
+static void free_siglip_layer(SigLIPEncoderLayer *layer) {
+    if (layer == NULL) return;
     free_linear(layer->wq);
     free_linear(layer->wk);
     free_linear(layer->wv);
     free_linear(layer->wo);
-    free(layer->bq);
-    free(layer->bk);
-    free(layer->bv);
-    free(layer->bo);
+    if (layer->bq != NULL) { free(layer->bq); }
+    if (layer->bk != NULL) { free(layer->bk); }
+    if (layer->bv != NULL) { free(layer->bv); }
+    if (layer->bo != NULL) { free(layer->bo); }
     free_linear(layer->w1);
     free_linear(layer->w2);
-    free(layer->b1);
-    free(layer->b2);
-    free(layer->n1);
-    free(layer->n2);
-    free(layer->n1_b);
-    free(layer->n2_b);
+    if (layer->b1 != NULL) { free(layer->b1); }
+    if (layer->b2 != NULL) { free(layer->b2); }
+    if (layer->n1 != NULL) { free(layer->n1); }
+    if (layer->n2 != NULL) { free(layer->n2); }
+    if (layer->n1_b != NULL) { free(layer->n1_b); }
+    if (layer->n2_b != NULL) { free(layer->n2_b); }
 }
 
 typedef struct {
     SigLIPConfig *config;
-    _Float16 *patch_emb;   // (hidden_dim, 3, patch_size, patch_size)
+    _Float16 *patch_emb;    // (hidden_dim, 3, patch_size, patch_size)
     _Float16 *patch_emb_b;  // (hidden_dim,)
-    Linear pos_embedding;  // ((image_size / patch_size)^2, hidden_dim)
+    Linear *pos_embedding;  // ((image_size / patch_size)^2, hidden_dim)
     SigLIPEncoderLayer **layers;
-    _Float16 *post_norm;  // (hidden_dim,)
+    _Float16 *post_norm;    // (hidden_dim,)
     _Float16 *post_norm_b;  // (hidden_dim,)
-    _Float16 *norm;  // (hidden_dim,)
-    Linear proj;  // (hidden_dim, embed_dim).T
+    _Float16 *norm;         // (hidden_dim,)
+    Linear *proj;           // (hidden_dim, embed_dim).T
 } SigLIPVisionEncoder;
 
 void free_siglip(SigLIPVisionEncoder *enc) {
-    free(enc->patch_emb);
-    free(enc->patch_emb_b);
-    free_linear(enc->pos_embedding);
-    for (int i = 0; i < enc->config->n_layers; i++) {
-        free_siglip_layer(enc->layers[i]);
+    if (enc == NULL) return;
+
+    if (enc->patch_emb != NULL) { free(enc->patch_emb); }
+    if (enc->patch_emb_b != NULL) { free(enc->patch_emb_b); }
+    if (enc->pos_embedding != NULL) { free_linear(enc->pos_embedding); }
+    if (enc->layers != NULL) {
+        for (int i = 0; i < enc->config->n_layers; i++) {
+            if (enc->layers[i] != NULL) { free_siglip_layer(enc->layers[i]); }
+        }
     }
-    free(enc->post_norm);
-    free(enc->post_norm_b);
-    free(enc->norm);
-    free_linear(enc->proj);
+    if (enc->post_norm != NULL) { free(enc->post_norm); }
+    if (enc->post_norm_b != NULL) { free(enc->post_norm_b); }
+    if (enc->norm != NULL) { free(enc->norm); }
+    if (enc->proj != NULL) { free_linear(enc->proj); } 
     free(enc);
 }
 
@@ -299,31 +413,33 @@ typedef struct {
     GemmaConfig *config;
     GemmaTokenizer *tokenizer;
     SigLIPVisionEncoder *vision_enc;
-    Linear embedding;   // (vocab_size, embed_dim)
+    Linear *embedding;      // (vocab_size, embed_dim)
     GemmaDecoderLayer **layers;
     _Float16 *final_norm;  // (embed_dim,)
 } GemmaModel;
 
 void free_model(GemmaModel *model) {
-    free_tokenizer(model->tokenizer);
-    if (model->vision_enc != NULL) {
-        free_siglip(model->vision_enc);
-    }
+    if (model == NULL) return;
+
+    if (model->tokenizer != NULL) { free_tokenizer(model->tokenizer); }
+    if (model->vision_enc != NULL) { free_siglip(model->vision_enc); }
     free_linear(model->embedding);
-    for (int i = 0; i < model->config->n_layers; i++) {
-        free_gemma_layer(model->layers[i]);
+    if (model->layers != NULL) {
+        for (int i = 0; i < model->config->n_layers; i++) {
+            if (model->layers[i] != NULL) { free_gemma_layer(model->layers[i]); }
+        }
     }
-    free(model->final_norm);
-    free_config(model->config);
-    free(model->layers);
+    if (model->final_norm != NULL) { free(model->final_norm); }
+    if (model->config != NULL) { free_config(model->config); }
+    if (model->layers != NULL) { free(model->layers); }
     free(model);
 }
 
 typedef struct {
     int8_t *x_i8;           // (n_patches, hidden_dim)
     _Float16 *x_scales;     // (n_patches,)
-    int8_t *mlp_hidden_i8;  // (n_patches, mlp_hidden_dim)
-    _Float16 *mlp_hidden_scales;  // (n_patches)
+    int8_t *mlp_i8;         // (n_patches, mlp_dim)
+    _Float16 *mlp_scales;   // (n_patches)
 
     _Float16 *x;            // (n_patches, hidden_dim)
     _Float16 *resid;        // (n_patches, hidden_dim)
@@ -331,288 +447,176 @@ typedef struct {
     _Float16 *xk;           // (n_patches, hidden_dim)
     _Float16 *xv;           // (n_patches, hidden_dim)
     _Float16 *att_out;      // (n_patches, hidden_dim)
-    _Float16 *mlp_hidden;   // (n_patches, mlp_hidden_dim)
+    _Float16 *mlp_hidden;   // (n_patches, mlp_dim)
     _Float16 *scores;
 } SigLIPBuffer;
 
 SigLIPBuffer *malloc_siglip_buffer(SigLIPConfig *vconf, bool quant) {
+    SigLIPBuffer *buf;
+    MALLOC(buf, 1, "SigLIPBuffer", NULL);
+
     int C = vconf->hidden_dim;
     int ppi = vconf->image_size / vconf->patch_size;
-    int NP = ppi * ppi;
-    int CM = vconf->mlp_hidden_dim;
+    int N = ppi * ppi;
+    int CM = vconf->mlp_dim;
     int NH = vconf->n_heads;
 
-    SigLIPBuffer *buf = safe_malloc(sizeof(*buf), "SigLIPBuffer");
-
     if (quant) {
-        buf->x_i8 = safe_malloc(NP * C * sizeof(int8_t), "Siglip x_i8");
-        buf->x_scales = safe_malloc(NP * sizeof(_Float16), "Siglip x_scales");
+        MALLOC(buf->x_i8, N, "SigLIP x_i8", NULL);
+        MALLOC(buf->x_scales, N, "SigLIP x_scales", NULL);
     }
 
-    buf->x = safe_malloc(NP * C * sizeof(_Float16), "SigLIP x");
-    buf->resid = safe_malloc(NP * C * sizeof(_Float16), "SigLIP resid");
-    buf->xq = safe_malloc(NP * C * sizeof(_Float16), "SigLIP q");
-    buf->xk = safe_malloc(NP * C * sizeof(_Float16), "SigLIP k");
-    buf->xv = safe_malloc(NP * C * sizeof(_Float16), "SigLIP v");
-    buf->att_out = safe_malloc(NP * C * sizeof(_Float16), "SigLIP attn_out");
-    buf->mlp_hidden = safe_malloc(NP * CM * sizeof(_Float16), "SigLIP mlp_hidden");
-    buf->scores = safe_malloc(NH * NP * NP * sizeof(_Float16), "SigLIP scores");
+    MALLOC(buf->x, N * C, "SigLIP x", NULL);
+    MALLOC(buf->resid, N * C, "SigLIP resid", NULL);
+    MALLOC(buf->xq, N * C, "SigLIP q", NULL);
+    MALLOC(buf->xk, N * C, "SigLIP k", NULL);
+    MALLOC(buf->xv, N * C, "SigLIP v", NULL);
+    MALLOC(buf->att_out, N * C, "SigLIP attn_out", NULL);
+    MALLOC(buf->mlp_hidden, N * CM, "SigLIP mlp_hidden", NULL);
+    MALLOC(buf->scores, NH * N * N, "SigLIP scores", NULL);
 
     return buf;
 }
 
 void free_siglip_buffer(SigLIPBuffer *buf, bool quant) {
+    if (buf == NULL) return;
     if (quant) {
-        free(buf->x_i8);
-        free(buf->x_scales);
+        if (buf->x_i8 != NULL) { free(buf->x_i8); }
+        if (buf->x_scales != NULL) { free(buf->x_scales); }
     }
-    free(buf->x);
-    free(buf->resid);
-    free(buf->xq);
-    free(buf->xk);
-    free(buf->xv);
-    free(buf->att_out);
-    free(buf->mlp_hidden);
-    free(buf->scores);
+    if (buf->x != NULL) { free(buf->x); }
+    if (buf->resid != NULL) { free(buf->resid); }
+    if (buf->xq != NULL) { free(buf->xq); }
+    if (buf->xk != NULL) { free(buf->xk); }
+    if (buf->xv != NULL) { free(buf->xv); }
+    if (buf->att_out != NULL) { free(buf->att_out); }
+    if (buf->mlp_hidden != NULL) { free(buf->mlp_hidden); }
+    if (buf->scores != NULL) { free(buf->scores); }
     free(buf);
 }
 
 typedef struct {
     int cache_len;
 
-    int8_t *x_i8;            // (embed_dim,)
-    int8_t *xo_i8;           // (n_heads, head_dim)
-    int8_t *xg_i8;           // (mlp_hidden_dim,)
+    int8_t *x_i8;            // ([n_patches], embed_dim,)
+    int8_t *xo_i8;           // (n_heads, [n_patches], head_dim)
+    int8_t *xg_i8;           // ([n_patches], mlp_dim,)
 
-    _Float16 *x;             // (embed_dim,)
-    _Float16 *resid;         // (embed_dim,)
-    _Float16 *xq;            // (n_heads, head_dim)
-    _Float16 *xk;            // (n_kv_heads, head_dim)
-    _Float16 *csfreqs_slid;  // (head_dim / 2, 2)
-    _Float16 *csfreqs_full;  // (head_dim / 2, 2)
-    _Float16 *xv;            // (n_kv_heads, head_dim)
-    _Float16 *xo;            // (n_heads, head_dim)
-    _Float16 *att;           // (n_heads, cache_len)
+    _Float16 *x;             // ([n_patches], embed_dim,)
+    _Float16 *resid;         // ([n_patches], embed_dim,)
+    _Float16 *xq;            // (n_heads, [n_patches], head_dim)
+    _Float16 *xk;            // (n_kv_heads, [n_patches], head_dim)
+    _Float16 *csfreqs_slid;  // ([n_patches], head_dim / 2, 2)
+    _Float16 *csfreqs_full;  // ([n_patches], head_dim / 2, 2)
+    _Float16 *xv;            // (n_kv_heads, [n_patches], head_dim)
+    _Float16 *xo;            // (n_heads, [n_patches], head_dim)
+    _Float16 *att;           // (n_heads, [n_patches], cache_len)
     _Float16 *kv_cache;      // (n_layers, 2, cache_len, n_kv_heads, head_dim)
-    _Float16 *xg;            // (mlp_hidden_dim,)
-    _Float16 *xu;            // (mlp_hidden_dim,)
+    _Float16 *xg;            // ([n_patches], mlp_dim,)
+    _Float16 *xu;            // ([n_patches], mlp_dim,)
     _Float16 *logits;        // (vocab_size,)
 } GemmaBuffer;
 
-GemmaBuffer *malloc_buffer(GemmaConfig *conf, int cache_len, bool enable_mm) {
-    GemmaBuffer *buf = safe_malloc(sizeof(*buf), "GemmaBuffer");
+GemmaBuffer *malloc_buffer(GemmaConfig *conf, SigLIPConfig *vconf, int cache_len, bool enable_mm) {
+    GemmaBuffer *buf;
+    MALLOC(buf, 1, "GemmaBuffer", NULL);
+
     buf->cache_len = cache_len;
 
     int C = conf->embed_dim;
+    int L = conf->n_layers;
     int CH = conf->head_dim;
     int NH = conf->n_heads;
-    int CM = conf->mlp_hidden_dim;
-    int NL = conf->n_layers;
+    int CM = conf->mlp_dim;
 
     int q_size = NH * CH;
     int kv_size = conf->n_kv_heads * CH;
-    
+
     if (conf->quant) {
-        buf->x_i8 = safe_malloc(C * sizeof(int8_t), "buffer x_i8");
-        buf->xo_i8 = safe_malloc(q_size * sizeof(int8_t), "buffer xo_i8");
-        buf->xg_i8 = safe_malloc(conf->mlp_hidden_dim * sizeof(int8_t), "buffer xg_i8");
+        MALLOC(buf->x_i8, C, "buf.x_i8", NULL);
+        MALLOC(buf->xo_i8, q_size, "buf.xo_i8", NULL);
+        MALLOC(buf->xg_i8, conf->mlp_dim, "buf.xg_i8", NULL);
     }
 
-    buf->x = safe_malloc(C * sizeof(*buf->x), "buffer x");
-    buf->resid = safe_malloc(C * sizeof(*buf->resid), "buffer resid");
+    MALLOC(buf->kv_cache, L * 2 * cache_len * kv_size, "buf.kv_cache", NULL);
+    MALLOC(buf->logits, conf->vocab_size, "buf.logits", NULL);
 
-    buf->xq = safe_malloc(q_size * sizeof(*buf->xq), "buffer xq");
-    buf->xk = safe_malloc(kv_size * sizeof(*buf->xk), "buffer xk");
-    buf->csfreqs_slid = safe_malloc(CH * sizeof(*buf->csfreqs_slid), "buffer csfreqs_slid");
-    buf->csfreqs_full = safe_malloc(CH * sizeof(*buf->csfreqs_full), "buffer csfreqs_full");
-    buf->xv = safe_malloc(kv_size * sizeof(*buf->xv), "buffer xv");
-    buf->xo = safe_malloc(q_size * sizeof(*buf->xo), "buffer xo");
-    buf->att = safe_malloc(NH * cache_len * sizeof(*buf->att), "buffer att");
-    buf->kv_cache = safe_malloc(NL * 2 * cache_len * kv_size * sizeof(*buf->kv_cache), "buffer kv_cache");
-    buf->xg = safe_malloc(CM * sizeof(*buf->xg), "buffer xg");
-    buf->xu = safe_malloc(CM * sizeof(*buf->xu), "buffer xu");
-    buf->logits = safe_malloc(conf->vocab_size * sizeof(*buf->logits), "buffer logits");
+    int mult = 1;
+    if (conf->support_mm && enable_mm && vconf != NULL) {
+        int ppi = vconf->image_size / vconf->patch_size;
+        mult = ppi * ppi;
+    }
+
+    MALLOC(buf->x, mult * C, "buf.x", NULL);
+    MALLOC(buf->resid, mult * C, "buf.resid", NULL);
+    MALLOC(buf->xq, mult * q_size, "buf.xq", NULL);
+    MALLOC(buf->xk, mult * kv_size, "buf.xk", NULL);
+    MALLOC(buf->csfreqs_slid, mult * CH, "buf.csfreqs_slid", NULL);
+    MALLOC(buf->csfreqs_full, mult * CH, "buf.csfreqs_full", NULL);
+    MALLOC(buf->xv, mult * kv_size, "buf.xv", NULL);
+    MALLOC(buf->xo, mult * q_size, "buf.xo", NULL);
+    MALLOC(buf->att, mult * NH * cache_len, "buf.att", NULL);
+    MALLOC(buf->xg, mult * CM, "buf.xg", NULL);
+    MALLOC(buf->xu, mult * CM, "buf.xu", NULL);
 
     return buf;
 }
 
 void free_buffer(GemmaBuffer *buf, bool quant) {
-    free(buf->x);
-    free(buf->resid);
-    free(buf->xq);
-    free(buf->xk);
-    free(buf->csfreqs_slid);
-    free(buf->csfreqs_full);
-    free(buf->xv);
-    free(buf->xo);
-    free(buf->att);
-    free(buf->kv_cache);
-    free(buf->xg);
-    free(buf->xu);
-    free(buf->logits);
-    if (quant) { free(buf->x_i8); free(buf->xo_i8); free(buf->xg_i8); }
+    if (buf->x != NULL) { free(buf->x); }
+    if (buf->resid != NULL) { free(buf->resid); }
+    if (buf->xq != NULL) { free(buf->xq); }
+    if (buf->xk != NULL) { free(buf->xk); }
+    if (buf->csfreqs_slid != NULL) { free(buf->csfreqs_slid); }
+    if (buf->csfreqs_full != NULL) { free(buf->csfreqs_full); }
+    if (buf->xv != NULL) { free(buf->xv); }
+    if (buf->xo != NULL) { free(buf->xo); }
+    if (buf->att != NULL) { free(buf->att); }
+    if (buf->kv_cache != NULL) { free(buf->kv_cache); }
+    if (buf->xg != NULL) { free(buf->xg); }
+    if (buf->xu != NULL) { free(buf->xu); }
+    if (buf->logits != NULL) { free(buf->logits); }
+    if (quant) {
+        if (buf->x_i8 != NULL) { free(buf->x_i8); }
+        if (buf->xo_i8 != NULL) { free(buf->xo_i8); }
+        if (buf->xg_i8 != NULL) { free(buf->xg_i8); }
+    }
     free(buf);
-}
-
-int read_uint16(FILE *fp) {
-    unsigned char bytes[2];
-    safe_fread(bytes, 1, 2, fp, "uint16");
-    // Big-endian ordering
-    return ((int)bytes[0] << 8) | (int)bytes[1];
-}
-
-uint32_t read_uint32(FILE *fp) {
-    unsigned char bytes[4];
-    safe_fread(bytes, 1, 4, fp, "uint32");
-    // Big-endian ordering
-    return (
-        ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
-        ((uint32_t)bytes[2] <<  8) | ((uint32_t)bytes[3])
-    );
-}
-
-float read_float32(FILE *fp) {
-    uint32_t buf = read_uint32(fp);
-    float f;
-    memcpy(&f, &buf, sizeof(float));
-    return f;
-}
-
-char *read_str(FILE *fp, char *data, int *offset) {
-    // Read a pascal-style string, the first byte indicates the length
-    int len = fgetc(fp);
-    if (len == EOF) {
-        fprintf(stderr, "File read failed: reading string length\n"); exit(1);
-    }
-    char *str = data + *offset;
-    safe_fread(str, sizeof(char), len, fp, "string data");
-    data[*offset + len] = '\0';  // Convert to C-style
-    *offset += len + 1;  // Advance offset
-    return str;
-}
-
-int get_strarr_bytes(FILE *fp, int count) {
-    // Read a sequence of pascal-stype strings
-    int offset = 0;
-    long pos = ftell(fp);
-    if (pos == -1L) {
-        perror("ftell failed"); exit(1);
-    }
-    // Get the total number of bytes
-    for (int i = 0; i < count; i++) {
-        int len = fgetc(fp);
-        if (len == EOF) {
-            fprintf(stderr, "File read failed: reading string length\n"); exit(1);
-        }
-        if (fseek(fp, len, SEEK_CUR) != 0) {
-            perror("fseek failed"); exit(1);
-        }
-        offset += len + 1;
-    }
-    // Resume position
-    if (fseek(fp, pos, SEEK_SET) != 0) {
-        perror("fseek failed"); exit(1);
-    }
-    return offset;
-}
-
-_Float16 *read_tensor_fp16(FILE *fp, int size) {
-    _Float16 *tensor = safe_malloc(size * sizeof(_Float16), "fp16 tensor");
-    safe_fread(tensor, sizeof(_Float16), size, fp, "fp16 tensor");
-    return tensor;
-}
-
-int8_t *read_tensor_int8(FILE *fp, int size) {
-    int8_t *tensor = safe_malloc(size * sizeof(int8_t), "int8 tensor");
-    safe_fread(tensor, sizeof(int8_t), size, fp, "int8 tensor");
-    return tensor;
-}
-
-Linear read_linear(FILE *fp, int m, int n, bool quant) {
-    Linear w;
-    if (!quant) {
-        // fp16 precision
-        w.dtype = DTYPE_FP16;
-        w.fp16 = read_tensor_fp16(fp, m * n);
-    } else {
-        // int8 quantization
-        w.dtype = DTYPE_INT8;
-        w.i8.q = read_tensor_int8(fp, m * n);
-        w.i8.scales = read_tensor_fp16(fp, n);
-    }
-    return w;
-}
-
-// Python-like repr() for error printing
-char *repr(const char *str) {
-    int len = strlen(str);
-    char *result = malloc(len * 4 + 3);
-    result[0] = '"';
-    int offset = 1;
-    for (int i = 0; i < len; i++) {
-        switch (str[i]) {
-        case '\n':
-            result[offset++] = '\\';
-            result[offset++] = 'n';
-            break;
-        case '\t':
-            result[offset++] = '\\';
-            result[offset++] = 't';
-            break;
-        case '\r':
-            result[offset++] = '\\';
-            result[offset++] = 'r';
-            break;
-        case '\\':
-            result[offset++] = '\\';
-            result[offset++] = '\\';
-            break;
-        case '"':
-            result[offset++] = '\\';
-            result[offset++] = '"';
-            break;
-        default:
-            result[offset++] = str[i];
-        }
-    }
-    result[offset++] = '"';
-    result[offset++] = '\0';
-    return result;
 }
 
 GemmaModel *read_model(const char *filename, bool enable_mm) {
     FILE *fp = fopen(filename, "rb");
-    if (fp == NULL) { perror(filename); exit(1); }
+    if (fp == NULL) { perror(filename); return NULL; }
 
-    GemmaTokenizer *tok = safe_malloc(sizeof(*tok), "GemmaTokenizer");
-    GemmaConfig *conf = safe_malloc(sizeof(*conf), "GemmaConfig");
+    GemmaTokenizer *tok;
+    MALLOC(tok, 1, "GemmaTokenizer", NULL);
+    GemmaConfig *conf;
+    MALLOC(conf, 1, "GemmaConfig", NULL);
 
     // Read the configs
-    conf->n_layers = fgetc(fp);
-    conf->n_heads = fgetc(fp);
-    conf->n_kv_heads = fgetc(fp);
-    conf->head_dim = read_uint16(fp);
-    conf->embed_dim = read_uint16(fp);
-    conf->mlp_hidden_dim = read_uint16(fp);
-    conf->q_pre_attn_scalar = read_uint16(fp);
-    conf->sliding_window = read_uint16(fp);
-    conf->tokens_per_image = read_uint16(fp);
-    conf->max_seq_len = (int)read_uint32(fp);
-    conf->vocab_size = (int)read_uint32(fp);
-    conf->local_theta = read_float32(fp);
-    conf->global_theta = read_float32(fp);
-    conf->eps = read_float32(fp);
-    conf->attn_softcapping = read_float32(fp);
-    conf->logit_softcapping = read_float32(fp);
+    conf->n_layers = FGETC(fp, "model.config.n_layers", NULL);
+    conf->n_heads = FGETC(fp, "model.config.n_heads", NULL);
+    conf->n_kv_heads = FGETC(fp, "model.config.n_kv_heads", NULL);
+    conf->head_dim = READ_UINT16(fp, NULL);
+    conf->embed_dim = READ_UINT16(fp, NULL);
+    conf->mlp_dim = READ_UINT16(fp, NULL);
+    conf->q_pre_attn_scalar = READ_UINT16(fp, NULL);
+    conf->sliding_window = READ_UINT16(fp, NULL);
+    conf->tokens_per_image = READ_UINT16(fp, NULL);
+    conf->max_seq_len = (int)READ_UINT32(fp, NULL);
+    conf->vocab_size = (int)READ_UINT32(fp, NULL);
+    conf->local_theta = READ_FP32(fp, NULL);
+    conf->global_theta = READ_FP32(fp, NULL);
+    conf->eps = READ_FP32(fp, NULL);
+    conf->attn_softcapping = READ_FP32(fp, NULL);
+    conf->logit_softcapping = READ_FP32(fp, NULL);
 
     // attn_local_layers
-    int n_bytes = fgetc(fp);
-    if (n_bytes == EOF) {
-        fprintf(stderr, "File read failed: reading attn_local_layers size\n"); exit(1);
-    }
-    char *buf = safe_malloc(n_bytes, "attn_local_layers buffer");
-    conf->attn_local_layers = safe_malloc(conf->n_layers * sizeof(bool), "attn_local_layers");
-    safe_fread(buf, 1, n_bytes, fp, "attn_local_layers data");
+    int n_bytes = FGETC(fp, "model.config.attn_local_layers", NULL);
+    char *buf;
+    MALLOC(buf, n_bytes, "model.config.attn_local_layers", NULL);
+    MALLOC(conf->attn_local_layers, conf->n_layers, "model.config.attn_local_layers", NULL);
+    FREAD(buf, n_bytes, fp, "model.config.attn_local_layers", NULL);
     for (int i = 0; i < conf->n_layers; i++) {
         int pos = i;
         int byte_idx = pos / 8;
@@ -622,10 +626,7 @@ GemmaModel *read_model(const char *filename, bool enable_mm) {
     free(buf);
 
     // Additional flags
-    int extra_flags = fgetc(fp);
-    if (extra_flags == EOF) {
-        fprintf(stderr, "File read failed: reading extra flags\n"); exit(1);
-    }
+    int extra_flags = FGETC(fp, "model.config.extra_flags", NULL);
     conf->support_mm = (extra_flags & 16) == 16;
     conf->use_qk_norm = (extra_flags & 8) == 8;
     conf->pre_ffwd_norm = (extra_flags & 4) == 4;
@@ -638,42 +639,44 @@ GemmaModel *read_model(const char *filename, bool enable_mm) {
     SigLIPConfig *vconf = NULL;
     if (use_mm) {
         // Read vision config
-        enc = malloc(sizeof(*enc));
-        vconf = malloc(sizeof(*vconf));
+        MALLOC(enc, 1, "model.vision_enc", NULL);
+        MALLOC(vconf, 1, "model.vision_enc.config", NULL);
         vconf->n_layers = fgetc(fp);
+        if (vconf->n_layers == EOF) { return NULL; }
         vconf->n_heads = fgetc(fp);
-        vconf->mlp_hidden_dim = read_uint16(fp);
-        vconf->hidden_dim = read_uint16(fp);
-        vconf->image_size = read_uint16(fp);
-        vconf->patch_size = read_uint16(fp);
-        vconf->eps = read_float32(fp);
+        if (vconf->n_heads == EOF) { return NULL; }
+        vconf->mlp_dim = READ_UINT16(fp, NULL);
+        vconf->hidden_dim = READ_UINT16(fp, NULL);
+        vconf->image_size = READ_UINT16(fp, NULL);
+        vconf->patch_size = READ_UINT16(fp, NULL);
+        vconf->eps = READ_FP32(fp, NULL);
         enc->config = vconf;
     } else if (conf->support_mm) {
-        for (int j = 0; j < 2; j++) { fgetc(fp); }
-        for (int j = 0; j < 4; j++) { read_uint16(fp); }
-        read_float32(fp);
+        for (int j = 0; j < 2; j++) { if (fgetc(fp) == EOF) { return NULL; }; }
+        for (int j = 0; j < 4; j++) { READ_UINT16(fp, NULL); }
+        READ_FP32(fp, NULL);
     }
 
     // dtype (only supports float16)
     int offset = 0;
     char dtype[10];
-    read_str(fp, dtype, &offset);
+    READ_STR(fp, dtype, &offset, "dtype", NULL);
     if (strcmp(dtype, "float16") != 0) {
-        char *repr_dtype = repr(dtype);
-        printf("dtype %s not supported\n", repr_dtype);
-        free(repr_dtype);
-        exit(1);
+        printf("dtype '%s' not supported\n", dtype);
+        return NULL;
     }
 
     // Build vocabulary
     offset = 0;
     tok->vocab_size = conf->vocab_size;
     if (conf->support_mm) { tok->vocab_size++; }  // ++ for the <image_soft_token>
-    tok->vocab_data = safe_malloc(get_strarr_bytes(fp, tok->vocab_size), "vocab_data");
-    tok->vocab = safe_malloc(tok->vocab_size * sizeof(*tok->vocab), "vocab");
-    tok->vocab_sorted = safe_malloc(tok->vocab_size * sizeof(*tok->vocab_sorted), "vocab_sorted");
+    MALLOC(tok->vocab_data, get_strarr_bytes(fp, tok->vocab_size), "model.tokenizer.vocab_data", NULL);
+    MALLOC(tok->vocab, tok->vocab_size, "model.tokenizer.vocab", NULL);
+    MALLOC(tok->vocab_sorted, tok->vocab_size, "model.tokenizer.vocab_sorted", NULL);
     for (int i = 0; i < tok->vocab_size; i++) {
-        char *str = read_str(fp, tok->vocab_data, &offset);
+        char name[64];
+        snprintf(name, sizeof(name), "model.tokenizer.vocab_data.%d", i);
+        char *str = READ_STR(fp, tok->vocab_data, &offset, name, NULL);
         tok->vocab[i] = str;
         tok->vocab_sorted[i].idx = i;
         tok->vocab_sorted[i].val = str;
@@ -689,14 +692,17 @@ GemmaModel *read_model(const char *filename, bool enable_mm) {
     tok->ist = get_token_idx(tok, "<image_soft_token>");
 
     // Build merges
-    tok->n_merges = read_uint32(fp);
-    tok->ranks = safe_malloc(tok->n_merges * sizeof(*tok->ranks), "ranks");
-    tok->merge_data = safe_malloc(get_strarr_bytes(fp, tok->n_merges * 2), "merge_data");
+    tok->n_merges = (int)READ_UINT32(fp, NULL);
+    MALLOC(tok->ranks, tok->n_merges, "model.tokenizer.ranks", NULL);
+    MALLOC(tok->merge_data, get_strarr_bytes(fp, tok->n_merges * 2), "model.tokenizer.merge_data", NULL);
 
     offset = 0;
     for (int i = 0; i < tok->n_merges; i++) {
-        char *str1 = read_str(fp, tok->merge_data, &offset);
-        char *str2 = read_str(fp, tok->merge_data, &offset);
+        char name0[64], name1[64];
+        snprintf(name0, sizeof(name0), "model.tokenizer.merge_data.%d.0", i);
+        snprintf(name1, sizeof(name1), "model.tokenizer.merge_data.%d.1", i);
+        char *str1 = READ_STR(fp, tok->merge_data, &offset, name0, NULL);
+        char *str2 = READ_STR(fp, tok->merge_data, &offset, name1, NULL);
         tok->ranks[i].rank = i;
         tok->ranks[i].str1 = str1;
         tok->ranks[i].str2 = str2;
@@ -704,7 +710,8 @@ GemmaModel *read_model(const char *filename, bool enable_mm) {
     qsort(tok->ranks, tok->n_merges, sizeof(tok->ranks[0]), cmp_merge);
 
     // Build the model
-    GemmaModel *model = safe_malloc(sizeof(*model), "GemmaModel");
+    GemmaModel *model;
+    MALLOC(model, 1, "model", NULL);
     model->vision_enc = enc;
 
     // Read the weights
@@ -715,103 +722,160 @@ GemmaModel *read_model(const char *filename, bool enable_mm) {
     // rather than per-channel like other weights. Gemma uses tied weights, which means
     // the final lm_head shares the same weights with the embedding table, but transposed.
     // So it becomes per-channel quantization in the final lm_head
-    model->embedding = read_linear(fp, conf->embed_dim, conf->vocab_size, conf->quant);
-    model->layers = safe_malloc(conf->n_layers * sizeof(*model->layers), "model layers");
+    int C = conf->embed_dim;
+
+    READ_LINEAR(model->embedding, fp, C, conf->vocab_size, conf->quant, "model.embedding", NULL);
+    MALLOC(model->layers, conf->n_layers, "model.layers", NULL);
 
     int q_size = conf->n_heads * conf->head_dim;
     int kv_size = conf->n_kv_heads * conf->head_dim;
 
     // Read all the layers
     for (int l = 0; l < conf->n_layers; l++) {
-        GemmaDecoderLayer *layer = safe_malloc(sizeof(*layer), "GemmaDecoderLayer");
+        char layer_name[64];
+        snprintf(layer_name, sizeof(layer_name), "model.layers.%d", l);
+        GemmaDecoderLayer *layer;
+        MALLOC(layer, 1, layer_name, NULL);
+
+        char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
+        snprintf(wq_name, sizeof(wq_name), "model.layers.%d.wq", l);
+        snprintf(wk_name, sizeof(wk_name), "model.layers.%d.wk", l);
+        snprintf(wv_name, sizeof(wv_name), "model.layers.%d.wv", l);
+        snprintf(wo_name, sizeof(wo_name), "model.layers.%d.wo", l);
 
         // Attention weights
-        layer->wq = read_linear(fp, conf->embed_dim, q_size, conf->quant);
-        layer->wk = read_linear(fp, conf->embed_dim, kv_size, conf->quant);
-        layer->wv = read_linear(fp, conf->embed_dim, kv_size, conf->quant);
-        layer->wo = read_linear(fp, q_size, conf->embed_dim, conf->quant);
+        READ_LINEAR(layer->wq, fp, C, q_size, conf->quant, wq_name, NULL);
+        READ_LINEAR(layer->wk, fp, C, kv_size, conf->quant, wk_name, NULL);
+        READ_LINEAR(layer->wv, fp, C, kv_size, conf->quant, wv_name, NULL);
+        READ_LINEAR(layer->wo, fp, q_size, C, conf->quant, wo_name, NULL);
 
         if (conf->use_qk_norm) {
-            layer->nq = read_tensor_fp16(fp, conf->head_dim);
-            layer->nk = read_tensor_fp16(fp, conf->head_dim);
+            char nq_name[64], nk_name[64];
+            snprintf(nq_name, sizeof(nq_name), "model.layers.%d.nq", l);
+            snprintf(nk_name, sizeof(nk_name), "model.layers.%d.nk", l);
+            READ_TENSOR(layer->nq, conf->head_dim, fp, nq_name, NULL);
+            READ_TENSOR(layer->nk, conf->head_dim, fp, nk_name, NULL);
         } else {
             layer->nq = NULL;
             layer->nk = NULL;
         }
 
+        char w1_name[64], w2_name[64], w3_name[64];
+        snprintf(w1_name, sizeof(w1_name), "model.layers.%d.w1", l);
+        snprintf(w2_name, sizeof(w2_name), "model.layers.%d.w2", l);
+        snprintf(w3_name, sizeof(w3_name), "model.layers.%d.w3", l);
+
         // Feedforward weights
-        layer->w1 = read_linear(fp, conf->embed_dim, conf->mlp_hidden_dim, conf->quant);
-        layer->w2 = read_linear(fp, conf->embed_dim, conf->mlp_hidden_dim, conf->quant);
-        layer->w3 = read_linear(fp, conf->mlp_hidden_dim, conf->embed_dim, conf->quant);
+        READ_LINEAR(layer->w1, fp, C, conf->mlp_dim, conf->quant, w1_name, NULL);
+        READ_LINEAR(layer->w2, fp, C, conf->mlp_dim, conf->quant, w2_name, NULL);
+        READ_LINEAR(layer->w3, fp, conf->mlp_dim, C, conf->quant, w3_name, NULL);
+
+        char n1_name[64], n2_name[64];
+        snprintf(n1_name, sizeof(n1_name), "model.layers.%d.n1", l);
+        snprintf(n2_name, sizeof(n2_name), "model.layers.%d.n2", l);
 
         // RMSNorm weights
-        layer->n1 = read_tensor_fp16(fp, conf->embed_dim);
-        layer->n2 = read_tensor_fp16(fp, conf->embed_dim);
+        READ_TENSOR(layer->n1, C, fp, n1_name, NULL);
+        READ_TENSOR(layer->n2, C, fp, n2_name, NULL);
 
         if (conf->pre_ffwd_norm) {
-            layer->n3 = read_tensor_fp16(fp, conf->embed_dim);
+            char n3_name[64];
+            snprintf(n3_name, sizeof(n3_name), "model.layers.%d.n3", l);
+            READ_TENSOR(layer->n3, C, fp, n3_name, NULL);
         } else {
             layer->n3 = NULL;
         }
         if (conf->post_ffwd_norm) {
-            layer->n4 = read_tensor_fp16(fp, conf->embed_dim);
+            char n4_name[64];
+            snprintf(n4_name, sizeof(n4_name), "model.layers.%d.n4", l);
+            READ_TENSOR(layer->n4, C, fp, n4_name, NULL);
         } else {
             layer->n4 = NULL;
         }
         model->layers[l] = layer;
     }
-    model->final_norm = read_tensor_fp16(fp, conf->embed_dim);
+    READ_TENSOR(model->final_norm, C, fp, "model.final_norm", NULL);
 
     if (use_mm) {
-        enc->patch_emb = read_tensor_fp16(fp, vconf->hidden_dim * 3 * vconf->patch_size * vconf->patch_size);
-        enc->patch_emb_b = read_tensor_fp16(fp, vconf->hidden_dim);
-        int n_patches = vconf->image_size / vconf->patch_size;
+        int P = vconf->patch_size;
+        int VC = vconf->hidden_dim;
+
+        READ_TENSOR(enc->patch_emb, VC * 3 * P * P, fp, "model.vision_enc.patch_emb", NULL);
+        READ_TENSOR(enc->patch_emb_b, VC, fp, "model.vision_enc.patch_emb_b", NULL);
+        int n_patches = vconf->image_size / P;
         n_patches *= n_patches;
-        // Same as here, the real shape is (n_patches, vconf->hidden_dim)
-        enc->pos_embedding = read_linear(fp, vconf->hidden_dim, n_patches, conf->quant);
-        enc->layers = malloc(vconf->n_layers * sizeof(*enc->layers));
+        // Same as here, the real shape is (n_patches, VC)
+        READ_LINEAR(enc->pos_embedding, fp, VC, n_patches, conf->quant, "model.vision_enc.pos_embedding", NULL);
+        MALLOC(enc->layers, vconf->n_layers, "model.vision_enc.layers", NULL);
 
         // Read all the layers of ViT
         for (int l = 0; l < vconf->n_layers; l++) {
-            SigLIPEncoderLayer *layer = safe_malloc(sizeof(*layer), "SigLIPEncoderLayer");
+            char layer_name[64];
+            snprintf(layer_name, sizeof(layer_name), "model.vision_enc.layers.%d", l);
+            SigLIPEncoderLayer *layer;
+            MALLOC(layer, 1, layer_name, NULL);
             
             // First layernorm
-            layer->n1 = read_tensor_fp16(fp, vconf->hidden_dim);
-            layer->n1_b = read_tensor_fp16(fp, vconf->hidden_dim);
+            char n1_name[64], n1b_name[64];
+            snprintf(n1_name, sizeof(n1_name), "model.vision_enc.layers.%d.n1", l);
+            snprintf(n1b_name, sizeof(n1b_name), "model.vision_enc.layers.%d.n1_b", l);
+            READ_TENSOR(layer->n1, VC, fp, n1_name, NULL);
+            READ_TENSOR(layer->n1_b, VC, fp, n1b_name, NULL);
 
             // Attention weights
-            layer->wq = read_linear(fp, vconf->hidden_dim, vconf->hidden_dim, conf->quant);
-            layer->wk = read_linear(fp, vconf->hidden_dim, vconf->hidden_dim, conf->quant);
-            layer->wv = read_linear(fp, vconf->hidden_dim, vconf->hidden_dim, conf->quant);
-            layer->wo = read_linear(fp, vconf->hidden_dim, vconf->hidden_dim, conf->quant);
+            char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
+            snprintf(wq_name, sizeof(wq_name), "model.vision_enc.layers.%d.wq", l);
+            snprintf(wk_name, sizeof(wk_name), "model.vision_enc.layers.%d.wk", l);
+            snprintf(wv_name, sizeof(wv_name), "model.vision_enc.layers.%d.wv", l);
+            snprintf(wo_name, sizeof(wo_name), "model.vision_enc.layers.%d.wo", l);
+            READ_LINEAR(layer->wq, fp, VC, VC, conf->quant, wq_name, NULL);
+            READ_LINEAR(layer->wk, fp, VC, VC, conf->quant, wk_name, NULL);
+            READ_LINEAR(layer->wv, fp, VC, VC, conf->quant, wv_name, NULL);
+            READ_LINEAR(layer->wo, fp, VC, VC, conf->quant, wo_name, NULL);
+            
             // Attention biases
-            layer->bq = read_tensor_fp16(fp, vconf->hidden_dim);
-            layer->bk = read_tensor_fp16(fp, vconf->hidden_dim);
-            layer->bv = read_tensor_fp16(fp, vconf->hidden_dim);
-            layer->bo = read_tensor_fp16(fp, vconf->hidden_dim);
+            char bq_name[64], bk_name[64], bv_name[64], bo_name[64];
+            snprintf(bq_name, sizeof(bq_name), "model.vision_enc.layers.%d.bq", l);
+            snprintf(bk_name, sizeof(bk_name), "model.vision_enc.layers.%d.bk", l);
+            snprintf(bv_name, sizeof(bv_name), "model.vision_enc.layers.%d.bv", l);
+            snprintf(bo_name, sizeof(bo_name), "model.vision_enc.layers.%d.bo", l);
+            READ_TENSOR(layer->bq, VC, fp, bq_name, NULL);
+            READ_TENSOR(layer->bk, VC, fp, bk_name, NULL);
+            READ_TENSOR(layer->bv, VC, fp, bv_name, NULL);
+            READ_TENSOR(layer->bo, VC, fp, bo_name, NULL);
 
             // Second layernorm
-            layer->n2 = read_tensor_fp16(fp, vconf->hidden_dim);
-            layer->n2_b = read_tensor_fp16(fp, vconf->hidden_dim);
+            char n2_name[64], n2b_name[64];
+            snprintf(n2_name, sizeof(n2_name), "model.vision_enc.layers.%d.n2", l);
+            snprintf(n2b_name, sizeof(n2b_name), "model.vision_enc.layers.%d.n2_b", l);
+            READ_TENSOR(layer->n2, VC, fp, n2_name, NULL);
+            READ_TENSOR(layer->n2_b, VC, fp, n2b_name, NULL);
 
             // Feedforward weights
-            layer->w1 = read_linear(fp, vconf->hidden_dim, vconf->mlp_hidden_dim, conf->quant);
-            layer->w2 = read_linear(fp, vconf->mlp_hidden_dim, vconf->hidden_dim, conf->quant);
+            char w1_name[64], w2_name[64];
+            snprintf(w1_name, sizeof(w1_name), "model.vision_enc.layers.%d.w1", l);
+            snprintf(w2_name, sizeof(w2_name), "model.vision_enc.layers.%d.w2", l);
+            READ_LINEAR(layer->w1, fp, VC, vconf->mlp_dim, conf->quant, w1_name, NULL);
+            READ_LINEAR(layer->w2, fp, vconf->mlp_dim, VC, conf->quant, w2_name, NULL);
+            
             // Feedforward biases
-            layer->b1 = read_tensor_fp16(fp, vconf->mlp_hidden_dim);
-            layer->b2 = read_tensor_fp16(fp, vconf->hidden_dim);
+            char b1_name[64], b2_name[64];
+            snprintf(b1_name, sizeof(b1_name), "model.vision_enc.layers.%d.b1", l);
+            snprintf(b2_name, sizeof(b2_name), "model.vision_enc.layers.%d.b2", l);
+            READ_TENSOR(layer->b1, vconf->mlp_dim, fp, b1_name, NULL);
+            READ_TENSOR(layer->b2, VC, fp, b2_name, NULL);
             
             enc->layers[l] = layer;
         }
 
         // Post layernorm
-        enc->post_norm = read_tensor_fp16(fp, vconf->hidden_dim);
-        enc->post_norm_b = read_tensor_fp16(fp, vconf->hidden_dim);
+        READ_TENSOR(enc->post_norm, VC, fp, "model.vision_enc.post_norm", NULL);
+        READ_TENSOR(enc->post_norm_b, VC, fp, "model.vision_enc.post_norm_b", NULL);
 
         // Soft embedding RMSNorm
-        enc->norm = read_tensor_fp16(fp, vconf->hidden_dim);
+        READ_TENSOR(enc->norm, VC, fp, "model.vision_enc.norm", NULL);
         // Final projection
-        enc->proj = read_linear(fp, vconf->hidden_dim, conf->embed_dim, conf->quant);
+        READ_LINEAR(enc->proj, fp, VC, C, conf->quant, "model.vision_enc.proj", NULL);
     }
 
     fclose(fp);
@@ -822,17 +886,17 @@ GemmaModel *read_model(const char *filename, bool enable_mm) {
 #ifdef __GNUC__
 __attribute__((optimize("no-fast-math")))
 #endif
-static inline _Float16 clamp_fp16(_Float16 v) {
 #ifdef __clang__
 #pragma float_control(precise, on, push)
 #endif
+static inline _Float16 clamp_fp16(_Float16 v) {
     return fminf(FP16_MAX, fmaxf(-FP16_MAX, v));
+}
 #ifdef __clang__
 #pragma float_control(pop)
 #endif
-}
 
-void rmsnorm(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps) {
+static void rmsnorm(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps) {
     float sqsum = 0.0f;
     #pragma omp simd reduction(+:sqsum)  // Only using SIMD here
     for (int i = 0; i < dim; i++) {
@@ -846,7 +910,7 @@ void rmsnorm(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps)
     }
 }
 
-void rmsnorm_omp(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps) {
+static void rmsnorm_omp(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps) {
     // OpenMP parallelized version of RMSNorm
     float sqsum = 0.0f;
     #pragma omp parallel for reduction(+:sqsum)
@@ -862,7 +926,7 @@ void rmsnorm_omp(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float 
 }
 
 // LayerNorm used in SigLIP
-void layernorm(_Float16 *dst, _Float16 *src, _Float16 *weight, _Float16 *bias, int dim, float eps) {
+static void layernorm(_Float16 *dst, _Float16 *src, _Float16 *weight, _Float16 *bias, int dim, float eps) {
     float mean = 0.0f;
     for (int i = 0; i < dim; i++) {
         mean += (float)src[i];
@@ -883,7 +947,7 @@ void layernorm(_Float16 *dst, _Float16 *src, _Float16 *weight, _Float16 *bias, i
     }
 }
 
-_Float16 quantize_act(int8_t *dst, _Float16 *vec, int dim) {
+static _Float16 quantize_act(int8_t *dst, _Float16 *vec, int dim) {
     // Symmetricly quantize the activations into [-127, 127]
     _Float16 amax = 0.0f;  // Find the abs max in vec
     #pragma omp parallel for reduction(max:amax)
@@ -907,7 +971,7 @@ _Float16 quantize_act(int8_t *dst, _Float16 *vec, int dim) {
     return (_Float16)qscale;
 }
 
-void quantize_act_rows(
+static void quantize_act_rows(
     int8_t *restrict dst,
     const _Float16 *restrict src,
     int m, int n,
@@ -934,7 +998,7 @@ void quantize_act_rows(
     }
 }
 
-void gemv_fp16(
+static void gemv_fp16(
     _Float16 *restrict dst,
     const Linear *restrict mat,
     _Float16 *restrict vec,
@@ -951,7 +1015,7 @@ void gemv_fp16(
     }
 }
 
-void gemv_int8(
+static void gemv_int8(
     _Float16 *restrict dst,
     const Linear *restrict mat,
     int8_t *restrict vec,
@@ -973,7 +1037,7 @@ void gemv_int8(
     }
 }
 
-void gemm_fp16(_Float16 *dst, const Linear *mat, _Float16 *src, int m, int n, int k) {
+static void gemm_fp16(_Float16 *dst, const Linear *mat, _Float16 *src, int m, int n, int k) {
     // fp16 src (m, k) @ (fp16 mat (n, k)).T = fp16 dst (m, n)
     #pragma omp parallel for
     for (int i = 0; i < m; i++)
@@ -989,7 +1053,7 @@ void gemm_fp16(_Float16 *dst, const Linear *mat, _Float16 *src, int m, int n, in
     }
 }
 
-void gemm_int8(
+static void gemm_int8(
     _Float16 *restrict dst,
     const Linear *restrict mat,
     const int8_t *restrict src,
@@ -1017,7 +1081,7 @@ void gemm_int8(
     }
 }
 
-_Float16 dot(_Float16 *v1, _Float16 *v2, int dim) {
+static _Float16 dot(_Float16 *v1, _Float16 *v2, int dim) {
     // Must use float instead of _Float16
     float sum = 0.0f;
     for (int i = 0; i < dim; i++) {
@@ -1026,7 +1090,7 @@ _Float16 dot(_Float16 *v1, _Float16 *v2, int dim) {
     return (_Float16)sum;
 }
 
-void softmax(_Float16 *dst, _Float16 *src, int dim) {
+static void softmax(_Float16 *dst, _Float16 *src, int dim) {
     _Float16 max = -(_Float16)INFINITY;
     for (int i = 0; i < dim; i++) {
         if (src[i] > max) { max = src[i]; }
@@ -1045,7 +1109,7 @@ void softmax(_Float16 *dst, _Float16 *src, int dim) {
     }
 }
 
-void softmax_omp(_Float16 *dst, _Float16 *src, int dim) {
+static void softmax_omp(_Float16 *dst, _Float16 *src, int dim) {
     // OpenMP parallelized version of softmax
     _Float16 max = -(_Float16)INFINITY;
     #pragma omp parallel for reduction(max:max)
@@ -1107,6 +1171,7 @@ static void warn_stats(const char *name, const _Float16 *data, int len, int laye
 #endif
 }
 
+// TODO: Integrate this into the language model (tons and tons of work to do...)
 void forward_siglip(
     SigLIPVisionEncoder *enc, GemmaConfig *conf, SigLIPBuffer *buf,
     _Float16 *img, _Float16 *out
@@ -1121,15 +1186,15 @@ void forward_siglip(
     int kernel_size = (vconf->image_size / vconf->patch_size) / side_len;
 
     int head_dim = C / vconf->n_heads;
-    int mlp_dim = vconf->mlp_hidden_dim;
-
-    if (conf->quant) {
-        fprintf(stderr, "Error: SigLIP int8 quantization not supported in this build.\n");
-        exit(1);
-    }
+    int mlp_dim = vconf->mlp_dim;
 
     // Patch Embedding
     int in_dim = 3 * patch * patch;
+
+    // NOTE: The consecutive "naked" for-loops (no braces) stacked right on top of
+    // each other are intentional here, I like to write it in this way. Think of
+    // them as one combined loop nest, like nested sigma notation. Only the innermost
+    // statement gets braces
     for (int oy = 0; oy < ppi; oy++)
     for (int ox = 0; ox < ppi; ox++) {
         int token_idx = oy * ppi + ox;
@@ -1146,14 +1211,17 @@ void forward_siglip(
                 int w_idx = oc * in_dim + c * patch * patch + py * patch + px;
                 sum += (float)enc->patch_emb[w_idx] * (float)img[in_idx];
             }
-            buf->x[token_idx * C + oc] = clamp_fp16((_Float16)(sum + (float)enc->patch_emb_b[oc]));
+            // Clangd love to remind me about my unconventional style, have to put `// NOLINT`
+            // everywhere to shut it up
+            buf->x[token_idx * C + oc] = clamp_fp16((_Float16)(sum + (float)enc->patch_emb_b[oc]));  // NOLINT
         }
     }
-    warn_stats("patch_emb", buf->x, N * C, 0, 0, 0);
+
+    warn_stats("patch_emb", buf->x, N * C, 0, 0, 0);  // NOLINT
 
     // Position Embedding
     for (int i = 0; i < N; i++) {
-        _Float16 *pos_vec = enc->pos_embedding.fp16 + i * C;
+        _Float16 *pos_vec = enc->pos_embedding->fp16 + i * C;
         for (int j = 0; j < C; j++) {
             buf->x[i * C + j] = clamp_fp16(buf->x[i * C + j] + pos_vec[j]);
         }
@@ -1170,14 +1238,14 @@ void forward_siglip(
 
         // QKV projections
         if (!conf->quant) {
-            gemm_fp16(buf->xq, &layer->wq, buf->x, N, C, C);
-            gemm_fp16(buf->xk, &layer->wk, buf->x, N, C, C);
-            gemm_fp16(buf->xv, &layer->wv, buf->x, N, C, C);
+            gemm_fp16(buf->xq, layer->wq, buf->x, N, C, C);
+            gemm_fp16(buf->xk, layer->wk, buf->x, N, C, C);
+            gemm_fp16(buf->xv, layer->wv, buf->x, N, C, C);
         } else {
             quantize_act_rows(buf->x_i8, buf->x, N, C, buf->x_scales);
-            gemm_int8(buf->xq, &layer->wq, buf->x_i8, N, C, C, buf->x_scales);
-            gemm_int8(buf->xk, &layer->wk, buf->x_i8, N, C, C, buf->x_scales);
-            gemm_int8(buf->xv, &layer->wv, buf->x_i8, N, C, C, buf->x_scales);
+            gemm_int8(buf->xq, layer->wq, buf->x_i8, N, C, C, buf->x_scales);
+            gemm_int8(buf->xk, layer->wk, buf->x_i8, N, C, C, buf->x_scales);
+            gemm_int8(buf->xv, layer->wv, buf->x_i8, N, C, C, buf->x_scales);
         }
         warn_stats("q", buf->xq, N * C, l, 0, 8);
         warn_stats("k", buf->xk, N * C, l, 0, 8);
@@ -1193,7 +1261,7 @@ void forward_siglip(
         }
 
         // Attention
-        memset(buf->att_out, 0, N * C * sizeof(_Float16));
+        memset(buf->att_out, 0, N * C * sizeof(_Float16));  // NOLINT
         float scale = 1.0f / sqrtf((float)head_dim);
 
         #pragma omp parallel for
@@ -1231,17 +1299,17 @@ void forward_siglip(
 
         // Output projection
         if (!conf->quant) {
-            gemm_fp16(buf->x, &layer->wo, buf->att_out, N, C, C);
+            gemm_fp16(buf->x, layer->wo, buf->att_out, N, C, C);
         } else {
             quantize_act_rows(buf->x_i8, buf->att_out, N, C, buf->x_scales);
-            gemm_int8(buf->x, &layer->wo, buf->x_i8, N, C, C, buf->x_scales);
+            gemm_int8(buf->x, layer->wo, buf->x_i8, N, C, C, buf->x_scales);
         }
         // Add output bias
         for (int i = 0; i < N; i++)
         for (int j = 0; j < C; j++) {
             buf->x[i * C + j] += layer->bo[j];
         }
-        warn_stats("att_out", buf->x, N * C, l, 0, 8);
+        warn_stats("att_out", buf->x, N * C, l, 0, 8);  // NOLINT
 
         // Residual connection
         for (int i = 0; i < N * C; i++) {
@@ -1255,10 +1323,10 @@ void forward_siglip(
 
         // x @ fc1 = mlp_hidden
         if (!conf->quant) {
-            gemm_fp16(buf->mlp_hidden, &layer->w1, buf->x, N, mlp_dim, C);
+            gemm_fp16(buf->mlp_hidden, layer->w1, buf->x, N, mlp_dim, C);
         } else {
             quantize_act_rows(buf->x_i8, buf->x, N, C, buf->x_scales);
-            gemm_int8(buf->mlp_hidden, &layer->w1, buf->x_i8, N, mlp_dim, C, buf->x_scales);
+            gemm_int8(buf->mlp_hidden, layer->w1, buf->x_i8, N, mlp_dim, C, buf->x_scales);
         }
 
         for (int i = 0; i < N; i++)
@@ -1270,21 +1338,21 @@ void forward_siglip(
             val = 0.5f * val * (1.0f + tanhf(c * (val + 0.044715f * val * val * val)));
             buf->mlp_hidden[i * mlp_dim + j] = (_Float16)val;
         }
-        warn_stats("mlp_hidden", buf->mlp_hidden, N * mlp_dim, l, 0, 8);
+        warn_stats("mlp_hidden", buf->mlp_hidden, N * mlp_dim, l, 0, 8);  // NOLINT
 
         // mlp_hidden @ fc2 = x
         if (!conf->quant) {
-            gemm_fp16(buf->x, &layer->w2, buf->mlp_hidden, N, C, mlp_dim);
+            gemm_fp16(buf->x, layer->w2, buf->mlp_hidden, N, C, mlp_dim);
         } else {
-            quantize_act_rows(buf->mlp_hidden_i8, buf->mlp_hidden, N, mlp_dim, buf->mlp_hidden_scales);
-            gemm_int8(buf->x, &layer->w2, buf->mlp_hidden_i8, N, C, mlp_dim, buf->mlp_hidden_scales);
+            quantize_act_rows(buf->mlp_i8, buf->mlp_hidden, N, mlp_dim, buf->mlp_scales);
+            gemm_int8(buf->x, layer->w2, buf->mlp_i8, N, C, mlp_dim, buf->mlp_scales);
         }
         // x += b2
         for (int i = 0; i < N; i++)
         for (int j = 0; j < C; j++) {
             buf->x[i * C + j] += layer->b2[j];
         }
-        warn_stats("mlp_out", buf->x, N * C, l, 0, 8);
+        warn_stats("mlp_out", buf->x, N * C, l, 0, 8);  // NOLINT
         // Residual connection
         for (int i = 0; i < N * C; i++) {
             buf->x[i] = clamp_fp16(buf->x[i] + buf->resid[i]);
@@ -1310,28 +1378,28 @@ void forward_siglip(
                 int token_idx = (py * ppi + px) * C + d;
                 sum += (float)buf->x[token_idx];
             }
-            buf->x[out_idx + d] = (_Float16)(sum / (kernel_size * kernel_size));
+            buf->x[out_idx + d] = (_Float16)(sum / (kernel_size * kernel_size));  // NOLINT
         }
     }
-    warn_stats("avg_pool", buf->x, tokens_per_image * C, 0, 0, 0);
+    warn_stats("avg_pool", buf->x, tokens_per_image * C, 0, 0, 0);  // NOLINT
 
     // RMSNorm
     rmsnorm(buf->x, buf->x, enc->norm, C, vconf->eps);
     warn_stats("rmsnorm", buf->x, tokens_per_image * C, 0, 0, 0);
 
     // Final projection
-    gemm_fp16(out, &enc->proj, buf->x, tokens_per_image, conf->embed_dim, C);
+    gemm_fp16(out, enc->proj, buf->x, tokens_per_image, conf->embed_dim, C);
     warn_stats("proj", out, tokens_per_image * conf->embed_dim, 0, 0, 0);
 }
 
-void forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos) {
+int forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos) {
     GemmaConfig *conf = model->config;
     
+    int C = conf->embed_dim;
+    
     if (pos >= buf->cache_len) {
-        printf("\nKV Cache is full, exiting...");
-        free_buffer(buf, conf->quant);
-        free_model(model);
-        exit(1);
+        fprintf(stderr, "\nError: KV Cache is full");
+        return 1;
     }
 
     // I can't directly scale the embedding weight beforehand (see export.py),
@@ -1342,20 +1410,20 @@ void forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos) {
     _Float16 embed_scale = 1.0f;  // equivalent to sqrt(embed_dim) * (1/sqrt(embed_dim))
     if (conf->quant) {
         // Dequantize
-        embed_scale *= model->embedding.i8.scales[tok];
+        embed_scale *= model->embedding->i8.scales[tok];
     }
 
     // x = embedding[tok] * embed_scale
     #pragma omp parallel for
-    for (int i = 0; i < conf->embed_dim; i++) {
+    for (int i = 0; i < C; i++) {
         if (!conf->quant) {
-            buf->x[i] = model->embedding.fp16[tok*conf->embed_dim + i] * embed_scale;
+            buf->x[i] = model->embedding->fp16[tok*C + i] * embed_scale;
         } else {
-            buf->x[i] = model->embedding.i8.q[tok*conf->embed_dim + i] * embed_scale;
+            buf->x[i] = model->embedding->i8.q[tok*C + i] * embed_scale;
         }
     }
 
-    warn_stats("embedding", buf->x, conf->embed_dim, 0, pos, 0);
+    warn_stats("embedding", buf->x, C, 0, pos, 0);
     
     int q_size = conf->n_heads * conf->head_dim;
     int kv_size = conf->n_kv_heads * conf->head_dim;
@@ -1383,21 +1451,21 @@ void forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos) {
     for (int l = 0; l < conf->n_layers; l++) {
         GemmaDecoderLayer *layer = model->layers[l];
 
-        memcpy(buf->resid, buf->x, conf->embed_dim*sizeof(_Float16));
+        memcpy(buf->resid, buf->x, C*sizeof(_Float16));
 
-        rmsnorm_omp(buf->x, buf->x, layer->n1, conf->embed_dim, conf->eps);
-        warn_stats("norm1", buf->x, conf->embed_dim, l, pos, 8);
+        rmsnorm_omp(buf->x, buf->x, layer->n1, C, conf->eps);
+        warn_stats("norm1", buf->x, C, l, pos, 8);
 
         // The attention block
         if (!conf->quant) {
-            gemv_fp16(buf->xq, &layer->wq, buf->x, q_size, conf->embed_dim);  // (n_heads, head_dim)
-            gemv_fp16(buf->xk, &layer->wk, buf->x, kv_size, conf->embed_dim);  // (n_kv_heads, head_dim)
-            gemv_fp16(buf->xv, &layer->wv, buf->x, kv_size, conf->embed_dim);  // (n_kv_heads, head_dim)
+            gemv_fp16(buf->xq, layer->wq, buf->x, q_size, C);  // (n_heads, head_dim)
+            gemv_fp16(buf->xk, layer->wk, buf->x, kv_size, C);  // (n_kv_heads, head_dim)
+            gemv_fp16(buf->xv, layer->wv, buf->x, kv_size, C);  // (n_kv_heads, head_dim)
         } else {
-            float xscale = quantize_act(buf->x_i8, buf->x, conf->embed_dim);
-            gemv_int8(buf->xq, &layer->wq, buf->x_i8, q_size, conf->embed_dim, xscale);
-            gemv_int8(buf->xk, &layer->wk, buf->x_i8, kv_size, conf->embed_dim, xscale);
-            gemv_int8(buf->xv, &layer->wv, buf->x_i8, kv_size, conf->embed_dim, xscale);
+            float xscale = quantize_act(buf->x_i8, buf->x, C);
+            gemv_int8(buf->xq, layer->wq, buf->x_i8, q_size, C, xscale);
+            gemv_int8(buf->xk, layer->wk, buf->x_i8, kv_size, C, xscale);
+            gemv_int8(buf->xv, layer->wv, buf->x_i8, kv_size, C, xscale);
         }
 
         if (conf->use_qk_norm) {
@@ -1509,21 +1577,21 @@ void forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos) {
 
         // Map xo back to x
         if (!conf->quant) {
-            gemv_fp16(buf->x, &layer->wo, buf->xo, conf->embed_dim, q_size);
+            gemv_fp16(buf->x, layer->wo, buf->xo, C, q_size);
         } else {
             float xoscale = quantize_act(buf->xo_i8, buf->xo, q_size);
-            gemv_int8(buf->x, &layer->wo, buf->xo_i8, conf->embed_dim, q_size, xoscale);
+            gemv_int8(buf->x, layer->wo, buf->xo_i8, C, q_size, xoscale);
         }
-        warn_stats("attn_out", buf->x, conf->embed_dim, l, pos, 8);
+        warn_stats("attn_out", buf->x, C, l, pos, 8);
 
-        rmsnorm_omp(buf->x, buf->x, layer->n2, conf->embed_dim, conf->eps);
-        warn_stats("norm2", buf->x, conf->embed_dim, l, pos, 8);
+        rmsnorm_omp(buf->x, buf->x, layer->n2, C, conf->eps);
+        warn_stats("norm2", buf->x, C, l, pos, 8);
 
         // Combine the residual stream
         _Float16 *restrict x = buf->x;
         _Float16 *restrict resid = buf->resid;
         #pragma omp simd
-        for (int d = 0; d < conf->embed_dim; d++) {
+        for (int d = 0; d < C; d++) {
             // Sometimes the residual stream accumulates huge values on certain channels,
             // especially in pretrained/bigger models (Sun et al. https://arxiv.org/abs/2402.17762)
             // It works fine in fp32 or bf16, but it can easily overflow fp16 and become
@@ -1534,27 +1602,27 @@ void forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos) {
             // afterwards (see export.py), the clamp here is more of a last-resort safety net
             buf->x[d] = clamp_fp16(x[d] + resid[d]);
         }
-        warn_stats("resid1", buf->x, conf->embed_dim, l, pos, 8);
+        warn_stats("resid1", buf->x, C, l, pos, 8);
 
-        memcpy(buf->resid, buf->x, conf->embed_dim * sizeof(_Float16));
+        memcpy(buf->resid, buf->x, C * sizeof(_Float16));
 
         if (conf->pre_ffwd_norm) {
-            rmsnorm_omp(buf->x, buf->x, layer->n3, conf->embed_dim, conf->eps);
+            rmsnorm_omp(buf->x, buf->x, layer->n3, C, conf->eps);
         }
 
         // MLP feedforward layer
         if (!conf->quant) {
-            gemv_fp16(buf->xg, &layer->w2, buf->x, conf->mlp_hidden_dim, conf->embed_dim);
-            gemv_fp16(buf->xu, &layer->w1, buf->x, conf->mlp_hidden_dim, conf->embed_dim);
+            gemv_fp16(buf->xg, layer->w2, buf->x, conf->mlp_dim, C);
+            gemv_fp16(buf->xu, layer->w1, buf->x, conf->mlp_dim, C);
         } else {
-            float xscale = quantize_act(buf->x_i8, buf->x, conf->embed_dim);
-            gemv_int8(buf->xg, &layer->w2, buf->x_i8, conf->mlp_hidden_dim, conf->embed_dim, xscale);
-            gemv_int8(buf->xu, &layer->w1, buf->x_i8, conf->mlp_hidden_dim, conf->embed_dim, xscale);
+            float xscale = quantize_act(buf->x_i8, buf->x, C);
+            gemv_int8(buf->xg, layer->w2, buf->x_i8, conf->mlp_dim, C, xscale);
+            gemv_int8(buf->xu, layer->w1, buf->x_i8, conf->mlp_dim, C, xscale);
         }
 
         // GELU layer
         #pragma omp parallel for
-        for (int d = 0; d < conf->mlp_hidden_dim; d++) {
+        for (int d = 0; d < conf->mlp_dim; d++) {
             // Tanh approximation of GELU
             float x = (float)buf->xg[d];
             float c = 0.79788456080287f;  // sqrt(2 / pi)
@@ -1565,33 +1633,34 @@ void forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos) {
         }
         
         if (!conf->quant) {
-            gemv_fp16(buf->x, &layer->w3, buf->xg, conf->embed_dim, conf->mlp_hidden_dim);
+            gemv_fp16(buf->x, layer->w3, buf->xg, C, conf->mlp_dim);
         } else {
-            float xscale = quantize_act(buf->xg_i8, buf->xg, conf->mlp_hidden_dim);
-            gemv_int8(buf->x, &layer->w3, buf->xg_i8, conf->embed_dim, conf->mlp_hidden_dim, xscale);
+            float xscale = quantize_act(buf->xg_i8, buf->xg, conf->mlp_dim);
+            gemv_int8(buf->x, layer->w3, buf->xg_i8, C, conf->mlp_dim, xscale);
         }
-        warn_stats("down_proj", buf->x, conf->embed_dim, l, pos, 8);
+        warn_stats("down_proj", buf->x, C, l, pos, 8);
 
         if (conf->post_ffwd_norm) {
-            rmsnorm_omp(buf->x, buf->x, layer->n4, conf->embed_dim, conf->eps);
-            warn_stats("norm4", buf->x, conf->embed_dim, l, pos, 8);
+            rmsnorm_omp(buf->x, buf->x, layer->n4, C, conf->eps);
+            warn_stats("norm4", buf->x, C, l, pos, 8);
         }
 
         // Combine the residual stream
         x = buf->x;
         resid = buf->resid;
         #pragma omp simd
-        for (int d = 0; d < conf->embed_dim; d++) {
+        for (int d = 0; d < C; d++) {
             buf->x[d] = clamp_fp16(x[d] + resid[d]);
         }
-        warn_stats("resid2", buf->x, conf->embed_dim, l, pos, 8);
+        warn_stats("resid2", buf->x, C, l, pos, 8);
     }
 
     // Final RMSNorm
-    rmsnorm_omp(buf->x, buf->x, model->final_norm, conf->embed_dim, conf->eps);
+    rmsnorm_omp(buf->x, buf->x, model->final_norm, C, conf->eps);
+    return 0;
 }
 
-int argmax(_Float16 *logits, int vocab_size) {
+static int argmax(_Float16 *logits, int vocab_size) {
     // Pick the index with the max value
     int max_idx = -1;
     _Float16 max_val = -(_Float16)INFINITY;
@@ -1626,7 +1695,7 @@ static inline uint32_t qs_rand(void) {
     return (uint32_t)qs_rand_state;
 }
 
-int partition_desc(FloatIdx *arr, int lo, int hi) {
+static int partition_desc(FloatIdx *arr, int lo, int hi) {
     // Pick the pivot randomly (use a seperate rand sequence)
     int r = lo + qs_rand() % (hi - lo + 1);
     swap_fi(&arr[r], &arr[hi]);
@@ -1641,7 +1710,7 @@ int partition_desc(FloatIdx *arr, int lo, int hi) {
     return i;
 }
 
-void quickselect_topk(FloatIdx *arr, int lo, int hi, int k_idx) {
+static void quickselect_topk(FloatIdx *arr, int lo, int hi, int k_idx) {
     while (lo < hi) {
         int p = partition_desc(arr, lo, hi);
         if (p == k_idx) return;
@@ -1650,7 +1719,7 @@ void quickselect_topk(FloatIdx *arr, int lo, int hi, int k_idx) {
     }
 }
 
-void apply_topk(_Float16 *logits, FloatIdx *logit_indices, int vocab_size, int k) {
+static void apply_topk(_Float16 *logits, FloatIdx *logit_indices, int vocab_size, int k) {
     if (k <= 0) { k = 1; }
     if (k > vocab_size) { k = vocab_size; }
 
@@ -1668,7 +1737,7 @@ void apply_topk(_Float16 *logits, FloatIdx *logit_indices, int vocab_size, int k
     for (int i = 0; i < k; i++) { logits[logit_indices[i].idx] = logit_indices[i].val; }
 }
 
-void sift_down(FloatIdx *arr, int n, int i) {
+static void sift_down(FloatIdx *arr, int n, int i) {
     // Make sure the parent node arr[i] is greater than its children in the heap
     for (;;) {
         // l & r are the two children node
@@ -1681,11 +1750,11 @@ void sift_down(FloatIdx *arr, int n, int i) {
     }
 }
 
-void build_heap(FloatIdx *arr, int n) {
+static void build_heap(FloatIdx *arr, int n) {
     for (int i = n/2 - 1; i >= 0; i--) { sift_down(arr, n, i); }
 }
 
-void apply_topp(
+static void apply_topp(
     _Float16 *logits, _Float16 *fpbuf, FloatIdx *logit_indices,
     int vocab_size, int k, float p
 ) {
@@ -1749,12 +1818,11 @@ void sample(
     int topk,
     float topp,
     float rpen,
-    int *(*token_callback)(int, GemmaTokenizer *)
+    int *(*token_callback)(int, GemmaTokenizer *, bool *)
 ) {
-    if (tokens == SAMPLE_ABORT) return;
-
     GemmaConfig *conf = model->config;
     int vs = conf->vocab_size;
+    bool quit = false;
 
     // Boolean flags
     bool dosample = temperature != 0 && topk != 1;
@@ -1766,20 +1834,22 @@ void sample(
     // Used in rpen (repetition penalty)
     bool *visited = NULL;
     if (use_rpen) {
-        visited = safe_calloc(vs, sizeof(bool), "visited tokens");
+        bool *visited;
+        // Will expand to "... return ; ...". No return values
+        CALLOC(visited, vs, "visited", );
     }
     int pos, token;
 
     // Prefill all the prompt tokens except the last one
     clock_t prefill_start = clock();
     pos = 0;
-    for (int *t = tokens; *t != EOT_SENTINEL && *(t+1) != EOT_SENTINEL; t++) {
+    for (int *t = tokens; *t != EOF && *(t+1) != EOF; t++) {
         if (g_interrupted) {
             if (use_rpen) { free(visited); }
             return;
         }
         if (use_rpen) { visited[*t] = true; }
-        forward_gemma(model, buf, *t, pos++);  // forward in the current pos
+        if (forward_gemma(model, buf, *t, pos++) == 1) { goto end; }  // forward in the current pos
     }
     clock_t prefill_end = clock();
     double prefill_elapsed = (double)(prefill_end - prefill_start) / CLOCKS_PER_SEC;
@@ -1789,15 +1859,11 @@ void sample(
     _Float16 *probs = NULL;
 
     // Only allocate probs if needed
-    if (temperature != 0.0f) {
-        probs = safe_malloc(vs * sizeof(*probs), "probs");
-    }
+    if (temperature != 0.0f) { MALLOC(probs, vs, "probs", ); }
 
     // Logit indices for topk & topp
     FloatIdx *logit_indices = NULL;
-    if (use_topk || use_topp) {
-        logit_indices = safe_malloc(vs * sizeof(*logit_indices), "FloatIdx array");
-    }
+    if (use_topk || use_topp) { MALLOC(logit_indices, vs, "logit_indices", ); }
 
     // Record tok/s
     clock_t gen_start = clock();
@@ -1807,14 +1873,14 @@ void sample(
         if (g_interrupted) break;
 
         if (use_rpen) visited[token] = true;
-        forward_gemma(model, buf, token, pos);
+        if (forward_gemma(model, buf, token, pos) == 1) { goto end; }
 
         // Compute logits
         if (!conf->quant) {
-            gemv_fp16(buf->logits, &model->embedding, buf->x, vs, conf->embed_dim);
+            gemv_fp16(buf->logits, model->embedding, buf->x, vs, conf->embed_dim);
         } else {
             float xscale = quantize_act(buf->x_i8, buf->x, conf->embed_dim);
-            gemv_int8(buf->logits, &model->embedding, buf->x_i8, vs, conf->embed_dim, xscale);
+            gemv_int8(buf->logits, model->embedding, buf->x_i8, vs, conf->embed_dim, xscale);
         }
 
         if (!dosample) {
@@ -1860,17 +1926,17 @@ void sample(
         }
 
         gen_tokens++;
-        int *ret = token_callback(token, model->tokenizer);
+        int *ret = token_callback(token, model->tokenizer, &quit);
 
-        if (ret == SAMPLE_ABORT) break;
+        if (quit) break;
         else if (ret != NULL) {
-            // Injected a token array (ends with EOT_SENTINEL)
+            // Injected a token array (ends with EOF)
             // Prefill all the tokens except the last one
             int i;
-            for (i = 0; (token = ret[i]) != EOT_SENTINEL && ret[i+1] != EOT_SENTINEL; i++) {
+            for (i = 0; (token = ret[i]) != EOF && ret[i+1] != EOF; i++) {
                 if (g_interrupted) break;
                 if (use_rpen) { visited[token] = true; }
-                forward_gemma(model, buf, token, ++pos);  // forward in the next pos
+                if (forward_gemma(model, buf, token, ++pos) == 1) { goto end; }  // Forward in the next pos
             }
             if (g_interrupted) break;
             token = ret[i];  // The last element
@@ -1878,6 +1944,7 @@ void sample(
         // ret == NULL: do nothing
     }
 
+end:
     clock_t gen_end = clock();
     double gen_elapsed = (double)(gen_end - gen_start) / CLOCKS_PER_SEC;
 
@@ -1991,8 +2058,9 @@ int *encode(GemmaTokenizer *tok, const char *sstr, int *tokens, int *n_tokens) {
                 char merged[128];
                 snprintf(merged, sizeof(merged), "%s%s", best_pair->str1, best_pair->str2);
                 tokens[i] = get_token_idx(tok, merged);
-                for (int j = i + 1; j < tok_i - 1; j++)
-                tokens[j] = tokens[j + 1];
+                for (int j = i + 1; j < tok_i - 1; j++) {
+                    tokens[j] = tokens[j + 1];
+                }
                 tok_i--;
             }
             i++;
@@ -2018,17 +2086,15 @@ const char *decode(GemmaTokenizer *tok, int id, char *byte_buf) {
     return s;
 }
 
-int *generate_callback(int token, GemmaTokenizer *tok) {
-    if (token == tok->eos || token == tok->eot) {
-        return SAMPLE_ABORT;
-    }
+static int *generate_callback(int token, GemmaTokenizer *tok, bool *quit) {
+    if (token == tok->eos || token == tok->eot) { *quit = true; }
     char byte_buf[2];
     printf("%s", decode(tok, token, byte_buf));
     fflush(stdout);
     return NULL;
 }
 
-void generate(
+int generate(
     GemmaModel *model, GemmaBuffer *buf,
     const char *prompt,
     int seqlen, float temperature, int topk, float topp, float rpen
@@ -2042,22 +2108,21 @@ void generate(
     int tokens[size + 1];
     tokens[0] = tok->bos;
     encode(tok, prompt, tokens + 1, &n_tokens);
-    tokens[n_tokens] = EOT_SENTINEL;
+    tokens[n_tokens] = EOF;
 
     sample(model, buf, tokens, seqlen, temperature, topk, topp, rpen, generate_callback);
+
+    return 0;
 }
 
-int *new_turn(GemmaTokenizer *tok, bool bos) {
-    if (bos) {
-        printf("User: ");
-    } else {
-        printf("\nUser: ");
-    }
+static int *new_turn(GemmaTokenizer *tok, bool bos, bool *quit) {
+    if (bos) { printf("User: "); }
+    else { printf("\nUser: "); }
 
     char user_prompt[65536];
     if (fgets(user_prompt, sizeof(user_prompt), stdin) == NULL) {
         fprintf(stderr, "Failed to read user input\n");
-        exit(1);
+        *quit = true;
     }
     user_prompt[strcspn(user_prompt, "\n")] = '\0';
 
@@ -2071,7 +2136,8 @@ int *new_turn(GemmaTokenizer *tok, bool bos) {
     int n_tokens = 0;
     int size = strlen("user") + strlen(user_prompt) + strlen("model") + 6;
     if (bos) size++;
-    int *tokens = safe_malloc((size + 1) * sizeof(*tokens), "chat tokens");
+    int *tokens;
+    MALLOC(tokens, size + 1, "tokens", (*quit = true, NULL));
 
     if (bos) tokens[n_tokens++] = tok->bos;
     tokens[n_tokens++] = tok->sot;
@@ -2081,33 +2147,32 @@ int *new_turn(GemmaTokenizer *tok, bool bos) {
     tokens[n_tokens++] = get_token_idx(tok, "\n");
     tokens[n_tokens++] = tok->sot;
     encode(tok, "model\n", tokens + n_tokens, &n_tokens);
-    tokens[n_tokens++] = EOT_SENTINEL;
+    tokens[n_tokens++] = EOF;
 
     printf("Model: ");
     return tokens;
 }
 
-int *chat_callback(int token, GemmaTokenizer *tok) {
-    if (token == tok->eos || token == tok->eot) {
-        return new_turn(tok, false);
-    }
+static int *chat_callback(int token, GemmaTokenizer *tok, bool *quit) {
+    if (token == tok->eos || token == tok->eot) { return new_turn(tok, false, quit); }
     char byte_buf[2];
     printf("%s", decode(tok, token, byte_buf));
     fflush(stdout);
     return NULL;
 }
 
-void chat(
+int chat(
     GemmaModel *model, GemmaBuffer *buf,
     int seqlen, float temperature, int topk, float topp, float rpen
 ) {
-    sample(
-        model, buf, new_turn(model->tokenizer, true),
-        seqlen, temperature, topk, topp, rpen, chat_callback
-    );
+    bool quit = false;
+    int *first_turn = new_turn(model->tokenizer, true, &quit);
+    if (quit) { return 1; }
+    sample(model, buf, first_turn, seqlen, temperature, topk, topp, rpen, chat_callback);
+    return 0;
 }
 
-bool safe_atoui(const char *str, unsigned int *result) {
+static inline bool safe_atoui(const char *str, unsigned int *result) {
     if (str == NULL) { return false; }
 
     char *endptr;
@@ -2128,7 +2193,7 @@ bool safe_atoui(const char *str, unsigned int *result) {
     return true;
 }
 
-bool safe_atof(const char *str, float *result) {
+static inline bool safe_atof(const char *str, float *result) {
     if (str == NULL) { return false; }
     
     char *endptr;
@@ -2216,7 +2281,7 @@ static char** get_utf8_argv(int *argc_out) {
 }
 
 static void free_utf8_argv(char **argv, int argc) {
-    if (!argv) return;
+    if (argv == NULL) return;
     for (int i = 0; i < argc; i++) free(argv[i]);
     free(argv);
 }
@@ -2235,118 +2300,194 @@ static const char* safe_get_arg(int i, int argc, char **argv) {
     return argv[i + 1];
 }
 
-void print_model_config(GemmaModel *model) {
+// Auto-generated by gen_print.py
+void print_model_config(GemmaModel *model, int seqlen, bool enable_mm) {
     (void)model;
+    (void)seqlen;
+    (void)enable_mm;
 #ifdef DEBUG
     GemmaConfig *conf = model->config;
     GemmaTokenizer *tok = model->tokenizer;
-    
+
     printf("\n========== Model Configuration ==========\n");
     printf("Architecture:\n");
-    printf("  n_layers:           %d\n", conf->n_layers);
-    printf("  n_heads:            %d\n", conf->n_heads);
-    printf("  n_kv_heads:         %d\n", conf->n_kv_heads);
-    printf("  head_dim:           %d\n", conf->head_dim);
-    printf("  embed_dim:          %d\n", conf->embed_dim);
-    printf("  mlp_hidden_dim:     %d\n", conf->mlp_hidden_dim);
-    printf("  vocab_size:         %d\n", conf->vocab_size);
-    printf("  max_seq_len:        %d\n", conf->max_seq_len);
-    printf("  sliding_window:     %d\n", conf->sliding_window);
-    
-    printf("\nAttention:\n");
-    printf("  q_pre_attn_scalar:  %d\n", conf->q_pre_attn_scalar);
-    printf("  attn_softcapping:   %.6f\n", conf->attn_softcapping);
-    printf("  use_qk_norm:        %s\n", conf->use_qk_norm ? "true" : "false");
-    
-    printf("\nRoPE:\n");
-    printf("  local_theta:        %.6f\n", conf->local_theta);
-    printf("  global_theta:       %.6f\n", conf->global_theta);
-    
-    printf("\nNormalization:\n");
-    printf("  eps:                %.6f\n", conf->eps);
-    printf("  pre_ffwd_norm:      %s\n", conf->pre_ffwd_norm ? "true" : "false");
-    printf("  post_ffwd_norm:     %s\n", conf->post_ffwd_norm ? "true" : "false");
-    
-    printf("\nQuantization:\n");
-    printf("  quant:              %s\n", conf->quant ? "true (int8)" : "false (fp16)");
-    
-    printf("\nLogits:\n");
-    printf("  logit_softcapping:  %.6f\n", conf->logit_softcapping);
-    
-    printf("\nAttention Local Layers:\n");
-    printf("  ");
+
+    printf("  %-*s: %d\n", 19, "n_layers", conf->n_layers);
+    printf("  %-*s: %d\n", 19, "n_heads", conf->n_heads);
+    printf("  %-*s: %d\n", 19, "n_kv_heads", conf->n_kv_heads);
+    printf("  %-*s: %d\n", 19, "head_dim", conf->head_dim);
+    printf("  %-*s: %d\n", 19, "embed_dim", conf->embed_dim);
+    printf("  %-*s: %d\n", 19, "mlp_dim", conf->mlp_dim);
+    printf("  %-*s: %d\n", 19, "q_pre_attn_scalar", conf->q_pre_attn_scalar);
+    printf("  %-*s: %d\n", 19, "sliding_window", conf->sliding_window);
+    printf("  %-*s: %d\n", 19, "tokens_per_image", conf->tokens_per_image);
+    printf("  %-*s: %d\n", 19, "max_seq_len", conf->max_seq_len);
+    printf("  %-*s: %d\n", 19, "vocab_size", conf->vocab_size);
+    printf("  %-*s: %.6f\n", 19, "local_theta", conf->local_theta);
+    printf("  %-*s: %.6f\n", 19, "global_theta", conf->global_theta);
+    printf("  %-*s: %.6f\n", 19, "eps", conf->eps);
+    printf("  %-*s: %.6f\n", 19, "attn_softcapping", conf->attn_softcapping);
+    printf("  %-*s: %.6f\n", 19, "logit_softcapping", conf->logit_softcapping);
+    printf("  %-*s: ", 19, "attn_local_layers");
     for (int i = 0; i < conf->n_layers; i++) {
         printf("%d", conf->attn_local_layers[i] ? 1 : 0);
-        if ((i + 1) % 32 == 0 && i + 1 < conf->n_layers) { printf("\n  "); }
+        if ((i + 1) % 18 == 0 && i + 1 < conf->n_layers) { printf("\n                       "); }
     }
     printf("\n");
-    
+    printf("  %-*s: %s\n", 19, "support_mm", conf->support_mm ? "true" : "false");
+    printf("  %-*s: %s\n", 19, "use_qk_norm", conf->use_qk_norm ? "true" : "false");
+    printf("  %-*s: %s\n", 19, "pre_ffwd_norm", conf->pre_ffwd_norm ? "true" : "false");
+    printf("  %-*s: %s\n", 19, "post_ffwd_norm", conf->post_ffwd_norm ? "true" : "false");
+    printf("  %-*s: %s\n", 19, "quant", conf->quant ? "true" : "false");
+
     printf("\nTokenizer:\n");
-    printf("  vocab_size:         %d\n", tok->vocab_size);
-    printf("  n_merges:           %d\n", tok->n_merges);
-    printf("  bos token:          %d\n", tok->bos);
-    printf("  eos token:          %d\n", tok->eos);
-    printf("  sot token:          %d\n", tok->sot);
-    printf("  eot token:          %d\n", tok->eot);
-    printf("  soi token:          %d\n", tok->soi);
-    printf("  eoi token:          %d\n", tok->eoi);
-    printf("  ist token:          %d\n", tok->ist);
-    
+
+    printf("  %-*s: %d\n", 19, "vocab_size", tok->vocab_size);
+    printf("  %-*s: %d\n", 19, "n_merges", tok->n_merges);
+    printf("  %-*s: %d\n", 19, "bos", tok->bos);
+    printf("  %-*s: %d\n", 19, "eos", tok->eos);
+    printf("  %-*s: %d\n", 19, "sot", tok->sot);
+    printf("  %-*s: %d\n", 19, "eot", tok->eot);
+    printf("  %-*s: %d\n", 19, "soi", tok->soi);
+    printf("  %-*s: %d\n", 19, "eoi", tok->eoi);
+    printf("  %-*s: %d\n", 19, "ist", tok->ist);
+
     printf("\nMemory Footprint (estimated):\n");
-    
+
     size_t total_bytes = 0;
-    int q_size = conf->n_heads * conf->head_dim;
-    int kv_size = conf->n_kv_heads * conf->head_dim;
-    
+
     // Embedding
-    if (!conf->quant) {
+    if (!(conf->quant)) {
         total_bytes += conf->embed_dim * conf->vocab_size * sizeof(_Float16);
     } else {
         total_bytes += conf->embed_dim * conf->vocab_size * sizeof(int8_t);
         total_bytes += conf->vocab_size * sizeof(_Float16);  // scales
     }
-    
+
     // Each layer
     for (int l = 0; l < conf->n_layers; l++) {
-        int n_params = (
-            conf->embed_dim * q_size +   // wq
-            conf->embed_dim * kv_size +  // wk
-            conf->embed_dim * kv_size +  // wv
-            q_size * conf->embed_dim +   // wo
-            conf->embed_dim * conf->mlp_hidden_dim +  // w1
-            conf->embed_dim * conf->mlp_hidden_dim +  // w2
-            conf->mlp_hidden_dim * conf->embed_dim    // w3
-        )
+        int q_size  = conf->n_heads * conf->head_dim;
+        int kv_size = conf->n_kv_heads * conf->head_dim;
+
+        int layer_params = conf->embed_dim * q_size
+            + conf->embed_dim * kv_size
+            + conf->embed_dim * kv_size
+            + q_size * conf->embed_dim
+            + conf->embed_dim * conf->mlp_dim
+            + conf->embed_dim * conf->mlp_dim
+            + conf->mlp_dim * conf->embed_dim;
+
         if (!conf->quant) {
-            total_bytes += n_params * sizeof(_Float16);
+            total_bytes += layer_params * sizeof(_Float16);
         } else {
-            total_bytes += n_params * sizeof(int8_t);
-            // Add scales
+            total_bytes += layer_params * sizeof(int8_t);
             total_bytes += (
-                q_size + kv_size + kv_size + conf->embed_dim +
-                conf->mlp_hidden_dim + conf->mlp_hidden_dim + conf->embed_dim
-            ) * sizeof(_Float16);
+                q_size
+                + kv_size
+                + kv_size
+                + conf->embed_dim
+                + conf->mlp_dim
+                + conf->mlp_dim
+                + conf->embed_dim
+            ) * sizeof(_Float16);  // scales
         }
-        // Norm weights
-        total_bytes += (conf->embed_dim + conf->embed_dim) * sizeof(_Float16);  // n1, n2
-        if (conf->use_qk_norm) {
-            total_bytes += 2 * conf->head_dim * sizeof(_Float16);  // nq, nk
+
+        total_bytes += conf->embed_dim * sizeof(_Float16);  // n1
+        total_bytes += conf->embed_dim * sizeof(_Float16);  // n2
+        if (conf->use_qk_norm ? 2 * conf->head_dim : 0) {
+            total_bytes += conf->use_qk_norm ? 2 * conf->head_dim : 0 * sizeof(_Float16);  // qk_norm
         }
-        if (conf->pre_ffwd_norm) {
-            total_bytes += conf->embed_dim * sizeof(_Float16);  // n3
+        if (conf->pre_ffwd_norm ? conf->embed_dim : 0) {
+            total_bytes += conf->pre_ffwd_norm ? conf->embed_dim : 0 * sizeof(_Float16);  // pre_ffwd_norm
         }
-        if (conf->post_ffwd_norm) {
-            total_bytes += conf->embed_dim * sizeof(_Float16);  // n4
+        if (conf->post_ffwd_norm ? conf->embed_dim : 0) {
+            total_bytes += conf->post_ffwd_norm ? conf->embed_dim : 0 * sizeof(_Float16);  // post_ffwd_norm
         }
     }
-    total_bytes += conf->embed_dim * sizeof(_Float16);  // final_norm
-    
-    printf("  Weights:            %.2f GB\n", total_bytes / (1024.0 * 1024.0 * 1024.0));
-    
-    // KV Cache (per token)
+
+    // Final norm
+    total_bytes += conf->embed_dim * sizeof(_Float16);
+
+    printf("  %-*s: %.2f GB\n", 19, "Weights", total_bytes / (1024.0 * 1024.0 * 1024.0));
+
+    // KV Cache per token
+    int kv_size = conf->n_kv_heads * conf->head_dim;
     size_t kv_cache_bytes = conf->n_layers * 2 * kv_size * sizeof(_Float16);
-    printf("  KV Cache (tok):     %.2f KB\n", kv_cache_bytes / 1024.0);
-    
+    printf("  %-*s: %.2f KB\n", 19, "KV Cache (tok)", kv_cache_bytes / 1024.0);
+
+    // GemmaBuffer
+
+    int C = conf->embed_dim;
+    int L = conf->n_layers;
+    int CH = conf->head_dim;
+    int NH = conf->n_heads;
+    int CM = conf->mlp_dim;
+    int ppi = model->vision_enc->config->image_size / model->vision_enc->config->patch_size;
+    int q_size = NH * CH;
+    int mult = conf->support_mm && enable_mm && model->vision_enc != NULL? ppi * ppi : 1;
+
+    size_t buf_bytes = 0;
+
+    if (conf->quant) {
+        buf_bytes += C * sizeof(int8_t);  // x_i8
+    }
+    if (conf->quant) {
+        buf_bytes += q_size * sizeof(int8_t);  // xo_i8
+    }
+    if (conf->quant) {
+        buf_bytes += CM * sizeof(int8_t);  // xg_i8
+    }
+    buf_bytes += L * 2 * seqlen * kv_size * sizeof(_Float16);  // kv_cache
+    buf_bytes += conf->vocab_size * sizeof(_Float16);  // logits
+    buf_bytes += mult * C * sizeof(_Float16);  // x
+    buf_bytes += mult * C * sizeof(_Float16);  // resid
+    buf_bytes += mult * q_size * sizeof(_Float16);  // xq
+    buf_bytes += mult * kv_size * sizeof(_Float16);  // xk
+    buf_bytes += mult * CH * sizeof(_Float16);  // csfreqs_slid
+    buf_bytes += mult * CH * sizeof(_Float16);  // csfreqs_full
+    buf_bytes += mult * kv_size * sizeof(_Float16);  // xv
+    buf_bytes += mult * q_size * sizeof(_Float16);  // xo
+    buf_bytes += mult * NH * seqlen * sizeof(_Float16);  // att
+    buf_bytes += mult * CM * sizeof(_Float16);  // xg
+    buf_bytes += mult * CM * sizeof(_Float16);  // xu
+
+    printf("  %-*s: %.2f MB\n", 19, "Gemma Buffer", buf_bytes / (1024.0 * 1024.0));
+
+    if (enable_mm && model->vision_enc != NULL) {
+        SigLIPConfig *vconf = model->vision_enc->config;
+
+        int C = vconf->hidden_dim;
+        int mlp_dim = vconf->mlp_dim;
+        int ppi = vconf->image_size / vconf->patch_size;
+        int n_patches = ppi * ppi;
+        int n_heads = vconf->n_heads;
+
+        size_t siglip_bytes = 0;
+
+        if (conf->quant) {
+            siglip_bytes += n_patches * C * sizeof(int8_t);  // x_i8
+        }
+        if (conf->quant) {
+            siglip_bytes += n_patches * sizeof(_Float16);  // x_scales
+        }
+        if (conf->quant) {
+            siglip_bytes += n_patches * mlp_dim * sizeof(int8_t);  // mlp_i8
+        }
+        if (conf->quant) {
+            siglip_bytes += n_patches * sizeof(_Float16);  // mlp_scales
+        }
+        siglip_bytes += n_patches * C * sizeof(_Float16);  // x
+        siglip_bytes += n_patches * C * sizeof(_Float16);  // resid
+        siglip_bytes += n_patches * C * sizeof(_Float16);  // xq
+        siglip_bytes += n_patches * C * sizeof(_Float16);  // xk
+        siglip_bytes += n_patches * C * sizeof(_Float16);  // xv
+        siglip_bytes += n_patches * C * sizeof(_Float16);  // att_out
+        siglip_bytes += n_patches * mlp_dim * sizeof(_Float16);  // mlp_hidden
+        siglip_bytes += n_heads * n_patches * n_patches * sizeof(_Float16);  // scores
+
+        printf("  %-*s: %.2f MB\n", 19, "SigLIP Buffer", siglip_bytes / (1024.0 * 1024.0));
+    }
+
     printf("=========================================\n\n");
 #endif
 }
@@ -2449,27 +2590,32 @@ int main(int argc, char **argv) {
     srand(seed);
 
     GemmaModel *model = read_model(modelfile, enable_mm);
-    GemmaBuffer *buf = malloc_buffer(model->config, seqlen, enable_mm);
+    if (model == NULL) { goto end; }
+
+    GemmaConfig *conf = model->config;
+    SigLIPConfig *vconf = NULL;
+    if (model->vision_enc != NULL) { vconf = model->vision_enc->config; }
+
+    GemmaBuffer *buf = malloc_buffer(conf, vconf, seqlen, enable_mm);
+    if (buf == NULL) { goto end; }
+
     // malloc buffer for SigLIP
     SigLIPBuffer *sbuf = NULL;
-    if (enable_mm && model->config->support_mm) {
-        sbuf = malloc_siglip_buffer(model->vision_enc->config, model->config->quant);
+    if (enable_mm && conf->support_mm) {
+        sbuf = malloc_siglip_buffer(vconf, conf->quant);
+        if (sbuf == NULL) { goto end; }
     }
-    print_model_config(model);
+    print_model_config(model, seqlen, enable_mm);
 
-    if (chatmode) {
-        chat(model, buf, seqlen, temperature, topk, topp, rpen);
-    } else {
-        generate(model, buf, prompt, seqlen, temperature, topk, topp, rpen);
-    }
+    if (chatmode) { chat(model, buf, seqlen, temperature, topk, topp, rpen); }
+    else { generate(model, buf, prompt, seqlen, temperature, topk, topp, rpen); }
 
-    if (g_interrupted) {
-        printf("\n\nInterrupted by user\n");
-    }
+    if (g_interrupted) { printf("\n\nInterrupted by user\n"); }
 
-    if (utf8_argv != NULL) { free_utf8_argv(utf8_argv, argc); }
-    free_buffer(buf, model->config->quant);
-    if (sbuf != NULL) { free(sbuf); }
+end:
+    free_utf8_argv(utf8_argv, argc);
+    free_buffer(buf, conf->quant);
+    free_siglip_buffer(sbuf, conf->quant);
     free_model(model);
     return 0;
 }
