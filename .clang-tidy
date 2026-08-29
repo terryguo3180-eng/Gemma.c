@@ -1,4 +1,0 @@
-Checks: >
-  clang-analyzer-*,
-  cppcoreguidelines-no-malloc,
-  cppcoreguidelines-owning-memory

@@ -1,6 +1,2 @@
 InlayHints:
   ParameterNames: false
-Diagnostics:
-  ClangTidy:
-    Add: [clang-analyzer-*, cppcoreguidelines-*]
-    FastCheckFilter: None
