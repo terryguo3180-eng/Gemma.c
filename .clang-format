@@ -56,8 +56,7 @@ AlwaysBreakAfterDefinitionReturnType: None
 AlwaysBreakAfterReturnType: TopLevelDefinitions
 AlwaysBreakBeforeMultilineStrings: true
 AlwaysBreakTemplateDeclarations: Yes
-AttributeMacros:
-  - __capability
+AttributeMacros: [restrict]
 BinPackArguments: true
 BinPackParameters: false
 BitFieldColonSpacing: Both

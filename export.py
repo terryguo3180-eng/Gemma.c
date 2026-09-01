@@ -1,7 +1,6 @@
 import math
 import struct
 
-import numpy as np
 import torch
 
 from model import (
@@ -260,7 +259,7 @@ def export_hf(
         if is_multimodal:
             # Dump the vision model config
             assert isinstance(vconfig, SiglipVisionConfig)
-            f.write(struct.pack("> cc HHHH ff", *(
+            f.write(struct.pack("> cc HHHH f", *(
                 bytes([vconfig.num_hidden_layers]),
                 bytes([vconfig.num_attention_heads]),
                 vconfig.intermediate_size,
@@ -293,8 +292,8 @@ def export_hf(
             write_str(rhs.replace("▁", " "))
 
         def write_tensor(tensor: torch.Tensor):
-            arr = tensor.contiguous().numpy()
-            arr.tofile(f)
+            t = tensor.contiguous().cpu()
+            t.untyped_storage()._write_file(f, False, False, 1)
 
         # Get the total amount of weight tensors for progress bar display
         # Such a terrible idea :(
@@ -601,7 +600,6 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
         # dtype
         dtype_str = read_str()
         dtype = getattr(torch, dtype_str)
-        dtype_np = getattr(np, dtype_str)
 
         # Model config
         config = GemmaConfig(
@@ -646,11 +644,13 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
         )
 
         # Build weights
-        def read_tensor(shape: tuple, dtype=dtype_np) -> torch.Tensor:
-            numel = math.prod(shape)
-            return torch.from_numpy(np.fromfile(f, dtype, numel)).view(shape)
+        def read_tensor(shape, dtype=dtype):
+            nbytes = torch.tensor([], dtype=dtype).element_size() * int(torch.prod(torch.tensor(shape)))
+            data = f.read(nbytes)
+            storage = torch.UntypedStorage.from_buffer(data, dtype=torch.uint8)
+            return torch.empty(shape, dtype=dtype).set_(storage.view(dtype))  # type: ignore
 
-        dtype_q = np.int8 if quant else dtype_np
+        dtype_q = torch.int8 if quant else dtype
 
         model.embedding.weight.data = read_tensor((vocab_size, embed_dim), dtype_q)
         if quant:
@@ -717,7 +717,7 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
             v_mlp_hidden_size = vision_config.mlp_hidden_size
 
             ve.patch_emb.weight.data = read_tensor(
-                (v_hidden_dim, 3, vision_config.patch_size, vision_config.patch_size), dtype_np
+                (v_hidden_dim, 3, vision_config.patch_size, vision_config.patch_size)
             )
             ve.patch_emb.bias.data = read_tensor((v_hidden_dim,))  # type: ignore
 

@@ -1,10 +1,9 @@
 /* Gemma 1 & 2 & 3 & 3n implemented in a single file of pure C.
  *
- * One big self-contained inference engine. No external deps beyond
- * the C standard library + OpenMP for the parallel bits.
- * Supports FP16 and int8 quantized weights, sliding-window + full
- * attention, optional SigLIP vision encoder for multimodal models (not
- * finished), and a simple BPE tokenizer.
+ * One big self-contained inference engine. No external deps beyond the C
+ * standard library + OpenMP for the parallel bits.
+ * Supports W8A8 quantization, sliding-window + full attention, optional SigLIP
+ * vision encoder for multimodal models, and a simple BPE tokenizer.
  */
 
 #include <errno.h>
@@ -18,37 +17,142 @@
 #include <string.h>
 #include <time.h>
 
-/* Max value for _Float16 so we can clamp safely */
-#define FP16_MAX   \
-  (((union {       \
-    _Float16 f;    \
-    uint16_t b;    \
-  }){.b = 0x7BFF}) \
-          .f)
-
 #ifdef DEBUG
-#  pragma message("Debug mode on")
+#  pragma message("debug build")
 #endif
 
+#define DEFAULT_SEQLEN      16384
+#define DEFAULT_TOPK        0
+#define DEFAULT_CHUNK_SIZE  64
+#define DEFAULT_TEMPERATURE 1.0
+#define DEFAULT_TOPP        1.0
+#define DEFAULT_RPEN        1.0
+#define DEFAULT_PROMPT      "Once upon a time"
+
+#define TOSTRING(x) STRINGIFY_(x)
+// I usually use a trailing underscore to indicate a variable/function/macro is
+// temporary
+#define STRINGIFY_(x) #x
+
+// To compile the code for a different dtype, simply append -DDTYPE=... (e.g.
+// -DTYPE=DTYPE_BF16)
+#define DTYPE_FP16 1
+#define DTYPE_BF16 2
+#define DTYPE_FP32 3
+
+#ifndef DTYPE
+#  define DTYPE DTYPE_FP16
+#endif
+
+#if DTYPE == DTYPE_FP16
+#  define floatx _Float16
+#  define DTYPE_STR "float16"
+#  define FLOATX_MAX \
+    (((union {       \
+      _Float16 f;    \
+      uint16_t b;    \
+    }){.b = 0x7BFF}) \
+            .f)
+#elif DTYPE == DTYPE_BF16
+#  define floatx __bf16
+#  define DTYPE_STR "bfloat16"
+#  define FLOATX_MAX \
+    (((union {       \
+      __bf16   f;    \
+      uint16_t i;    \
+    }){.i = 0x7F7F}) \
+            .f)
+#elif DTYPE == DTYPE_FP32
+#  define floatx float
+#  define DTYPE_STR "float32"
+#  define FLOATX_MAX     \
+    (((union {           \
+      float    f;        \
+      uint32_t i;        \
+    }){.i = 0x7F7FFFFF}) \
+            .f)
+#else
+#  error "unsupported DTYPE"
+#endif
+
+// safe MIN/MAX macros
+
+// Statement expressions: ({ }), an extension of GNU C. Not supported in MSVC
+#define MAX(a, b)                      \
+  ({                                   \
+    __typeof__(a) _max_a = (a);        \
+    __typeof__(b) _max_b = (b);        \
+    _max_a > _max_b ? _max_a : _max_b; \
+  })
+
+#define MIN(a, b)                      \
+  ({                                   \
+    __typeof__(a) _max_a = (a);        \
+    __typeof__(b) _max_b = (b);        \
+    _max_a < _max_b ? _max_a : _max_b; \
+  })
+
+/* Block size of blockwise causal masking */
+static _Thread_local unsigned int qk_block_size = 64;
+
 /* ------------------------------------------------------------------ */
-/* Global interruption handling (Ctrl+C)                              */
+/* Interruption handling                                              */
 /* ------------------------------------------------------------------ */
 
-static volatile bool g_interrupted = false;
+/* Global interruption flag */
+static volatile sig_atomic_t g_interrupted = 0;
 
+/* */
 static void
 signal_handler(int signum)
 {
   (void)signum;
-  g_interrupted = true;
+  g_interrupted = 1;
 }
 
+#ifdef _WIN32
+#  include <windows.h>
+#  define SLEEP_SEC(sec) Sleep((sec) * 1000)
+#  define GETPID()       GetCurrentProcessId()
+BOOL WINAPI
+console_handler_(DWORD dwCtrlType)
+{
+  switch (dwCtrlType)
+  {
+    case CTRL_C_EVENT:         // Ctrl+C
+    case CTRL_BREAK_EVENT:     // Ctrl+Break
+    case CTRL_CLOSE_EVENT:     // Closed console window
+    case CTRL_LOGOFF_EVENT:    // User logoff
+    case CTRL_SHUTDOWN_EVENT:  // System shutdown
+      g_interrupted = 1;
+      return TRUE;
+    default: return FALSE;
+  }
+}
+#else
+#  include <unistd.h>
+#  define SLEEP_SEC(sec) sleep(sec)
+#  define GETPID()       getpid()
+#endif
+
+/* */
 void
 setup_signal_handler(void)
 {
-  signal(SIGINT, signal_handler);
-#ifdef SIGTERM
-  signal(SIGTERM, signal_handler);
+#ifdef _WIN32
+  if (!SetConsoleCtrlHandler(console_handler_, TRUE))
+  {
+    // Should almost never happen
+    signal(SIGINT, signal_handler);
+  }
+#else
+  struct sigaction sa;
+  sa.sa_handler = signal_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+
+  if (sigaction(SIGINT, &sa, NULL) == -1) { perror("sigaction(SIGINT)"); }
+  if (sigaction(SIGTERM, &sa, NULL) == -1) { perror("sigaction(SIGTERM)"); }
 #endif
 }
 
@@ -56,57 +160,55 @@ setup_signal_handler(void)
 /* Memory wrappers, fail fast and print a useful message              */
 /* ------------------------------------------------------------------ */
 
-#define MALLOC(ptr, count, name, fail)                                      \
-  do {                                                                      \
-    ptr = malloc((count) * sizeof(*(ptr)));                                 \
-    if (ptr == NULL)                                                        \
-    {                                                                       \
-      fprintf(stderr, "Memory allocation failed: %s (size: %zu)\n", (name), \
-          (count) * sizeof(*(ptr)));                                        \
-      fail                                                                  \
-    }                                                                       \
-  }                                                                         \
+#define MALLOC(ptr, count, name, fail)                                     \
+  do {                                                                     \
+    ptr = malloc((count) * sizeof(*(ptr)));                                \
+    if (ptr == NULL)                                                       \
+    {                                                                      \
+      fprintf(stderr, "error: memory allocation failed: %s (size: %zu)\n", \
+          (name), (count) * sizeof(*(ptr)));                               \
+      fail                                                                 \
+    }                                                                      \
+  }                                                                        \
   while (0)
 
-#define CALLOC(ptr, count, name, fail)                                      \
-  do {                                                                      \
-    ptr = calloc((count), sizeof(*(ptr)));                                  \
-    if (ptr == NULL)                                                        \
-    {                                                                       \
-      fprintf(stderr, "Memory allocation failed: %s (size: %zu)\n", (name), \
-          (count) * sizeof(*(ptr)));                                        \
-      fail                                                                  \
-    }                                                                       \
-  }                                                                         \
+#define CALLOC(ptr, count, name, fail)                                     \
+  do {                                                                     \
+    ptr = calloc((count), sizeof(*(ptr)));                                 \
+    if (ptr == NULL)                                                       \
+    {                                                                      \
+      fprintf(stderr, "error: memory allocation failed: %s (size: %zu)\n", \
+          (name), (count) * sizeof(*(ptr)));                               \
+      fail                                                                 \
+    }                                                                      \
+  }                                                                        \
   while (0)
 
 /* ------------------------------------------------------------------ */
 /* File-reading helpers (big-endian integers + pascal strings)        */
 /* ------------------------------------------------------------------ */
 
-// Statement expressions: ({ ... }), an extension of GNU C. Not supported in
-// MSVC
-#define FGETC(fp, name, fail)                          \
-  ({                                                   \
-    int _fgetc_ret = fgetc(fp);                        \
-    if (_fgetc_ret == EOF)                             \
-    {                                                  \
-      fprintf(stderr, "File read failed: %s", (name)); \
-      fail                                             \
-    }                                                  \
-    _fgetc_ret;                                        \
+#define FGETC(fp, name, fail)                                 \
+  ({                                                          \
+    int _fgetc_ret = fgetc(fp);                               \
+    if (_fgetc_ret == EOF)                                    \
+    {                                                         \
+      fprintf(stderr, "error: File read failed: %s", (name)); \
+      fail                                                    \
+    }                                                         \
+    _fgetc_ret;                                               \
   })
 
-#define FREAD(ptr, count, fp, name, fail)                                      \
-  do {                                                                         \
-    size_t _fread_buf = fread((ptr), sizeof(*(ptr)), (count), (fp));           \
-    if (_fread_buf != (count))                                                 \
-    {                                                                          \
-      fprintf(stderr, "File read failed: %s (expected %d, got %zu)\n", (name), \
-          (count), _fread_buf);                                                \
-      fail                                                                     \
-    }                                                                          \
-  }                                                                            \
+#define FREAD(ptr, count, fp, name, fail)                                     \
+  do {                                                                        \
+    size_t _fread_buf = fread((ptr), sizeof(*(ptr)), (count), (fp));          \
+    if (_fread_buf != (count))                                                \
+    {                                                                         \
+      fprintf(stderr, "error: file read failed: %s (expected %d, got %zu)\n", \
+          (name), (count), _fread_buf);                                       \
+      fail                                                                    \
+    }                                                                         \
+  }                                                                           \
   while (0)
 
 #define READ_UINT16(fp, name, fail)               \
@@ -134,7 +236,7 @@ setup_signal_handler(void)
     _rfp32_val;                                             \
   })
 
-/* Pascal-style string: first byte is length, then that many chars */
+// Pascal-style string: first byte is length, then that many chars
 #define READ_STR(fp, data, offset, name, fail)          \
   ({                                                    \
     char _rstr_len_name[128];                           \
@@ -154,16 +256,16 @@ setup_signal_handler(void)
   }                                             \
   while (0)
 
-/* Linear layer weights: either plain FP16 or int8 + per-channel scales */
+// Linear layer weights: either plain floatx or int8 + per-channel scales
 #define READ_LINEAR(w, fp, m, n, quant, name, fail)                         \
   do {                                                                      \
     MALLOC((w), 1, (name), fail);                                           \
     if (!(quant))                                                           \
     {                                                                       \
-      (w)->dtype = DTYPE_FP16;                                              \
-      char _rlinear_fp16_name[128];                                         \
-      snprintf(_rlinear_fp16_name, 128, "%s.fp16", (name));                 \
-      READ_TENSOR((w)->fp16, (m) * (n), (fp), _rlinear_fp16_name, fail);    \
+      (w)->dtype = DTYPE_FPX;                                               \
+      char _rlinear_fpx_name[128];                                          \
+      snprintf(_rlinear_fpx_name, 128, "%s.fpx", (name));                   \
+      READ_TENSOR((w)->fpx, (m) * (n), (fp), _rlinear_fpx_name, fail);      \
     }                                                                       \
     else                                                                    \
     {                                                                       \
@@ -252,6 +354,7 @@ typedef struct
   bool  quant;  // int8 weights
 } GemmaConfig;
 
+/* */
 static void
 free_config(GemmaConfig *conf)
 {
@@ -277,12 +380,14 @@ typedef struct
   int   rank;
 } Merge;
 
+/* */
 static int
 cmp_token(const void *a, const void *b)
 {
   return strcmp(((Token *)a)->val, ((Token *)b)->val);
 }
 
+/* */
 static int
 cmp_merge(const void *a, const void *b)
 {
@@ -291,6 +396,7 @@ cmp_merge(const void *a, const void *b)
   return strcmp(((Merge *)a)->str2, ((Merge *)b)->str2);
 }
 
+/* */
 typedef struct
 {
   int n_merges;
@@ -310,6 +416,7 @@ typedef struct
   Merge *ranks;         // sorted merges for BPE
 } GemmaTokenizer;
 
+/* */
 static void
 free_tokenizer(GemmaTokenizer *tok)
 {
@@ -448,6 +555,7 @@ encode(GemmaTokenizer *tok, const char *sstr, int *tokens, int *n_tokens)
   return tokens;
 }
 
+/* */
 const char *
 decode(GemmaTokenizer *tok, int id, char *byte_buf)
 {
@@ -474,30 +582,31 @@ decode(GemmaTokenizer *tok, int id, char *byte_buf)
 /* */
 typedef enum
 {
-  DTYPE_FP16,
+  DTYPE_FPX,
   DTYPE_INT8
 } WeightDType;
 
-/* A linear layer, either dense FP16 or int8 + scales */
+/* A linear layer, either dense fpx or int8 + scales */
 typedef struct
 {
   WeightDType dtype;
   union
   {
-    _Float16 *fp16;
+    floatx *fpx;
     struct
     {
-      int8_t   *q;
-      _Float16 *scales;
+      int8_t *q;
+      floatx *scales;
     } i8;
   };
 } Linear;
 
+/* */
 static void
 free_linear(Linear *l)
 {
   if (l == NULL) return;
-  if (l->dtype == DTYPE_FP16) { free(l->fp16); }
+  if (l->dtype == DTYPE_FPX) { free(l->fpx); }
   else
   {
     free(l->i8.q);
@@ -523,14 +632,15 @@ typedef struct
   Linear *w3;  // (mlp_dim, embed_dim).T
 
   // RMSNorm weights (Gemma adds 1.0 to the weight)
-  _Float16 *nq;  // (head_dim,)
-  _Float16 *nk;  // (head_dim,)
-  _Float16 *n1;  // (embed_dim,)
-  _Float16 *n2;  // (embed_dim,)
-  _Float16 *n3;  // (embed_dim,)
-  _Float16 *n4;  // (embed_dim,)
+  floatx *nq;  // (head_dim,)
+  floatx *nk;  // (head_dim,)
+  floatx *n1;  // (embed_dim,)
+  floatx *n2;  // (embed_dim,)
+  floatx *n3;  // (embed_dim,)
+  floatx *n4;  // (embed_dim,)
 } GemmaDecoderLayer;
 
+/* */
 static void
 free_gemma_layer(GemmaDecoderLayer *layer)
 {
@@ -561,28 +671,29 @@ typedef struct
   Linear *wo;  // (hidden_dim, hidden_dim).T
 
   // ViT attention biases
-  _Float16 *bq;  // (hidden_dim,)
-  _Float16 *bk;  // (hidden_dim,)
-  _Float16 *bv;  // (hidden_dim,)
-  _Float16 *bo;  // (hidden_dim,)
+  floatx *bq;  // (hidden_dim,)
+  floatx *bk;  // (hidden_dim,)
+  floatx *bv;  // (hidden_dim,)
+  floatx *bo;  // (hidden_dim,)
 
   // ViT feedforward weights
   Linear *w1;  // (hidden_dim, mlp_dim).T
   Linear *w2;  // (hidden_dim, mlp_dim).T
 
   // ViT feedforward biases
-  _Float16 *b1;  // (mlp_dim,)
-  _Float16 *b2;  // (mlp_dim,)
+  floatx *b1;  // (mlp_dim,)
+  floatx *b2;  // (mlp_dim,)
 
   // ViT layernorm weights
-  _Float16 *n1;  // (hidden_dim,)
-  _Float16 *n2;  // (hidden_dim,)
+  floatx *n1;  // (hidden_dim,)
+  floatx *n2;  // (hidden_dim,)
 
   // ViT layernorm biases
-  _Float16 *n1_b;  // (hidden_dim,)
-  _Float16 *n2_b;  // (hidden_dim,)
+  floatx *n1_b;  // (hidden_dim,)
+  floatx *n2_b;  // (hidden_dim,)
 } SigLIPEncoderLayer;
 
+/* */
 static void
 free_siglip_layer(SigLIPEncoderLayer *layer)
 {
@@ -606,22 +717,24 @@ free_siglip_layer(SigLIPEncoderLayer *layer)
   free(layer);
 }
 
+/* */
 typedef struct
 {
   SigLIPConfig *config;
 
-  _Float16 *patch_emb;      // (hidden_dim, 3, patch_size, patch_size)
-  _Float16 *patch_emb_b;    // (hidden_dim,)
-  Linear   *pos_embedding;  // ((image_size / patch_size)^2, hidden_dim)
+  floatx *patch_emb;      // (hidden_dim, 3, patch_size, patch_size)
+  floatx *patch_emb_b;    // (hidden_dim,)
+  Linear *pos_embedding;  // ((image_size / patch_size)^2, hidden_dim)
 
   SigLIPEncoderLayer **layers;
 
-  _Float16 *post_norm;    // (hidden_dim,)
-  _Float16 *post_norm_b;  // (hidden_dim,)
-  _Float16 *norm;         // (hidden_dim,)
-  Linear   *proj;         // (hidden_dim, embed_dim).T
+  floatx *post_norm;    // (hidden_dim,)
+  floatx *post_norm_b;  // (hidden_dim,)
+  floatx *norm;         // (hidden_dim,)
+  Linear *proj;         // (hidden_dim, embed_dim).T
 } SigLIPVisionEncoder;
 
+/* */
 void
 free_siglip(SigLIPVisionEncoder *enc)
 {
@@ -655,9 +768,10 @@ typedef struct
   Linear *
       embedding;  // (vocab_size, embed_dim), shared with lm_head (tied weights)
   GemmaDecoderLayer **layers;
-  _Float16           *final_norm;  // (embed_dim,)
+  floatx             *final_norm;  // (embed_dim,)
 } GemmaModel;
 
+/* */
 void
 free_model(GemmaModel *model)
 {
@@ -683,24 +797,30 @@ free_model(GemmaModel *model)
 /* Runtime buffers (allocated once, reused every step)                */
 /* ------------------------------------------------------------------ */
 
-/* */
+/**
+ * SigLIP vision model runtime buffer
+ * N  = n_patches
+ * C  = hidden_dim
+ * CM = mlp_dim
+ */
 typedef struct
 {
-  int8_t   *x_i8;        // (n_patches, hidden_dim)
-  _Float16 *x_scales;    // (n_patches,)
-  int8_t   *mlp_i8;      // (n_patches, mlp_dim)
-  _Float16 *mlp_scales;  // (n_patches)
+  int8_t *x_i8;        // (N, C)
+  floatx *x_scales;    // (N,)
+  int8_t *mlp_i8;      // (N, CM)
+  floatx *mlp_scales;  // (N)
 
-  _Float16 *x;           // (n_patches, hidden_dim)
-  _Float16 *resid;       // (n_patches, hidden_dim)
-  _Float16 *xq;          // (n_patches, hidden_dim)
-  _Float16 *xk;          // (n_patches, hidden_dim)
-  _Float16 *xv;          // (n_patches, hidden_dim)
-  _Float16 *att_out;     // (n_patches, hidden_dim)
-  _Float16 *mlp_hidden;  // (n_patches, mlp_dim)
-  _Float16 *scores;
+  floatx *x;           // (N, C)
+  floatx *resid;       // (N, C)
+  floatx *xq;          // (N, C)
+  floatx *xk;          // (N, C)
+  floatx *xv;          // (N, C)
+  floatx *att_out;     // (N, C)
+  floatx *mlp_hidden;  // (N, CM)
+  floatx *scores;
 } SigLIPBuffer;
 
+/* */
 void
 free_siglip_buffer(SigLIPBuffer *buf, bool quant)
 {
@@ -723,6 +843,7 @@ free_siglip_buffer(SigLIPBuffer *buf, bool quant)
   free(buf);
 }
 
+/* */
 SigLIPBuffer *
 malloc_siglip_buffer(SigLIPConfig *vconf, bool quant)
 {
@@ -748,7 +869,7 @@ malloc_siglip_buffer(SigLIPConfig *vconf, bool quant)
   MALLOC(buf->xq, N * C, "sbuf.q", goto fail;);
   MALLOC(buf->xk, N * C, "sbuf.k", goto fail;);
   MALLOC(buf->xv, N * C, "sbuf.v", goto fail;);
-  MALLOC(buf->att_out, N * C, "sbuf.attn_out", goto fail;);
+  MALLOC(buf->att_out, N * C, "sbuf.att_out", goto fail;);
   MALLOC(buf->mlp_hidden, N * CM, "sbuf.mlp_hidden", goto fail;);
   MALLOC(buf->scores, NH * N * N, "sbuf.scores", goto fail;);
 
@@ -759,37 +880,50 @@ fail:
   return NULL;
 }
 
+/**
+ * Gemma language model runtime buffer
+ * T     = number of input tokens (used in prefilling)
+ * L     = n_layers
+ * C     = embed_dim
+ * CM    = mlp_dim
+ * NH    = n_heads
+ * NH_kv = n_kv_heads
+ */
 typedef struct
 {
   int cache_len;
 
   // Temporary quantized activations (when quant=true)
-  int8_t *x_i8;   // ([n_patches], embed_dim,)
-  int8_t *xo_i8;  // (n_heads, [n_patches], head_dim)
-  int8_t *xg_i8;  // ([n_patches], mlp_dim,)
+  int8_t *x_i8;       // ([T], C,)
+  floatx *x_scales;   // ([T],)
+  int8_t *xo_i8;      // (NH, [T], CH)
+  floatx *xo_scales;  // ([T],)
+  int8_t *xg_i8;      // ([T], CM,)
+  floatx *xg_scales;  // ([T],)
 
   // Pre-computed cos/sin for RoPE
-  _Float16 *csfreqs_slid;  // ([n_patches], head_dim / 2, 2)
-  _Float16 *csfreqs_full;  // ([n_patches], head_dim / 2, 2)
+  floatx *csfreqs_slid;  // ([T], CH / 2, 2)
+  floatx *csfreqs_full;  // ([T], CH / 2, 2)
 
   // Residual stream
-  _Float16 *x;      // ([n_patches], embed_dim,)
-  _Float16 *resid;  // ([n_patches], embed_dim,)
+  floatx *x;      // ([T], C,)
+  floatx *resid;  // ([T], C,)
 
   // Attention buffers
-  _Float16 *xq;        // (n_heads, [n_patches], head_dim)
-  _Float16 *xk;        // (n_kv_heads, [n_patches], head_dim)
-  _Float16 *xv;        // (n_kv_heads, [n_patches], head_dim)
-  _Float16 *xo;        // (n_heads, [n_patches], head_dim)
-  _Float16 *att;       // (n_heads, [n_patches], cache_len)
-  _Float16 *kv_cache;  // (n_layers, 2, cache_len, n_kv_heads, head_dim)
+  floatx *xq;        // (NH, [T], CH)
+  floatx *xk;        // (NH_kv, [T], CH)
+  floatx *xv;        // (NH_kv, CH, [T])
+  floatx *xo;        // ([T], NH, CH)
+  floatx *att;       // (NH, [T], cache_len)
+  floatx *kv_cache;  // (L, 2, NH_kv, cache_len, CH)
 
   // MLP buffers
-  _Float16 *xg;      // ([n_patches], mlp_dim,)
-  _Float16 *xu;      // ([n_patches], mlp_dim,)
-  _Float16 *logits;  // (vocab_size,)
+  floatx *xg;      // ([T], CM,)
+  floatx *xu;      // ([T], CM,)
+  floatx *logits;  // (vocab_size,)
 } GemmaBuffer;
 
+/* */
 void
 free_buffer(GemmaBuffer *buf, bool quant)
 {
@@ -811,18 +945,26 @@ free_buffer(GemmaBuffer *buf, bool quant)
   if (quant)
   {
     free(buf->x_i8);
+    free(buf->x_scales);
     free(buf->xo_i8);
+    free(buf->xo_scales);
     free(buf->xg_i8);
+    free(buf->xg_scales);
   }
   free(buf);
 }
 
+/* */
 GemmaBuffer *
-malloc_buffer(
-    GemmaConfig *conf, SigLIPConfig *vconf, int cache_len, bool enable_mm)
+malloc_buffer(GemmaConfig *conf,
+    SigLIPConfig          *vconf,
+
+    int  cache_len,
+    int  prefill_chunk,
+    bool enable_mm)
 {
   GemmaBuffer *buf = NULL;
-  CALLOC(buf, 1, "buf", goto fail;);
+  CALLOC(buf, 1, "buf", goto fail;);  // Init to all NULL
 
   buf->cache_len = cache_len;
 
@@ -835,23 +977,31 @@ malloc_buffer(
   int Cq  = NH * CH;
   int Ckv = conf->n_kv_heads * CH;
 
-  if (conf->quant)
-  {
-    MALLOC(buf->x_i8, C, "buf.x_i8", goto fail;);
-    MALLOC(buf->xo_i8, Cq, "buf.xo_i8", goto fail;);
-    MALLOC(buf->xg_i8, conf->mlp_dim, "buf.xg_i8", goto fail;);
-  }
-
   MALLOC(buf->kv_cache, L * 2 * cache_len * Ckv, "buf.kv_cache", goto fail;);
   MALLOC(buf->logits, conf->vocab_size, "buf.logits", goto fail;);
 
+  int mult = prefill_chunk;
+
   // Multimodal models need space for a whole image worth of tokens
-  int mult = 1;
   if (conf->support_mm && enable_mm && vconf != NULL)
   {
-    int ppi = vconf->image_size / vconf->patch_size;
+    mult = MAX(mult, conf->image_toks);
+  }
 
-    mult = ppi * ppi;
+  if (conf->quant)
+  {
+    // Quantization buffers for text tokens
+    MALLOC(buf->x_i8, mult * C, "buf.x_i8", goto fail;);
+    MALLOC(buf->xo_i8, mult * Cq, "buf.xo_i8", goto fail;);
+    MALLOC(buf->xg_i8, mult * CM, "buf.xg_i8", goto fail;);
+  }
+
+  if (conf->quant && mult > 1)
+  {
+    // Quantization buffers for vision tokens
+    MALLOC(buf->x_scales, mult, "buf.x_scales", goto fail;);
+    MALLOC(buf->xo_scales, mult, "buf.xo_scales", goto fail;);
+    MALLOC(buf->xg_scales, mult, "buf.xg_scales", goto fail;);
   }
 
   MALLOC(buf->x, mult * C, "buf.x", goto fail;);
@@ -893,7 +1043,7 @@ read_model(const char *filename, bool enable_mm)
   fp = fopen(filename, "rb");
   if (fp == NULL)
   {
-    fprintf(stderr, "Failed to open file: %s\n", filename);
+    fprintf(stderr, "error: failed to open file: %s\n", filename);
     goto fail;
   }
 
@@ -973,11 +1123,11 @@ read_model(const char *filename, bool enable_mm)
     READ_FP32(fp, "model.config.eps", goto fail;);
   }
 
-  // dtype (only supports float16)
+  // dtype
   int  offset = 0;
   char dtype[10];
   READ_STR(fp, dtype, &offset, "dtype", goto fail;);
-  if (strcmp(dtype, "float16") != 0)
+  if (strcmp(dtype, DTYPE_STR) != 0)
   {
     printf("dtype '%s' not supported\n", dtype);
     goto fail;
@@ -1019,8 +1169,10 @@ read_model(const char *filename, bool enable_mm)
   // Build merges
   tok->n_merges = (int)READ_UINT32(fp, "model.tokenizer.n_merges", goto fail;);
   MALLOC(tok->ranks, tok->n_merges, "model.tokenizer.ranks", goto fail;);
-  MALLOC(tok->merge_data, get_strarr_bytes(fp, tok->n_merges * 2),
-         "model.tokenizer.merge_data", goto fail;);
+  int merge_bytes = get_strarr_bytes(fp, tok->n_merges * 2);
+  if (merge_bytes == -1) { goto fail; }
+  MALLOC(
+      tok->merge_data, merge_bytes, "model.tokenizer.merge_data", goto fail;);
 
   offset = 0;
   for (int i = 0; i < tok->n_merges; i++)
@@ -1044,11 +1196,12 @@ read_model(const char *filename, bool enable_mm)
   model->config    = conf;
   model->tokenizer = tok;
 
-  // The shape is actually (vocab_size, embed_dim), but it uses per-tensor
-  // quantization rather than per-channel like other weights. Gemma uses tied
-  // weights, which means the final lm_head shares the same weights with the
-  // embedding table, but transposed. So it becomes per-channel quantization in
-  // the final lm_head
+  /* The embedding shape is (vocab_size, embed_dim), but it uses per-tensor
+   * quantization rather than per-channel like other weights. Gemma uses tied
+   * weights, which means the final lm_head shares the same weights with the
+   * embedding table, but transposed. So it becomes per-channel quantization in
+   * the final lm_head.
+   */
   int C = conf->embed_dim;
 
   READ_LINEAR(model->embedding, fp, C, conf->vocab_size, conf->quant,
@@ -1257,10 +1410,10 @@ __attribute__((optimize("no-fast-math")))
 #  pragma float_control(precise, on, push)
 #endif
 /* */
-static inline _Float16
-clamp_fp16(_Float16 v)
+static inline floatx
+clamp_fpx(floatx v)
 {
-  return (_Float16)fminf(FP16_MAX, fmaxf((float)-FP16_MAX, (float)v));
+  return (floatx)fminf(FLOATX_MAX, fmaxf((float)-FLOATX_MAX, (float)v));
 }
 #ifdef __clang__
 #  pragma float_control(pop)
@@ -1268,52 +1421,47 @@ clamp_fp16(_Float16 v)
 
 /* Gemma-style RMSNorm: (x * rsqrt(mean(x²) + eps)) * (weight + 1) */
 static void
-rmsnorm(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps)
-{
-  float sqsum = 0.0f;
-  #pragma omp simd reduction(+ : sqsum)  // Only using SIMD here
-  for (int i = 0; i < dim; i++) { sqsum += (float)src[i] * (float)src[i]; }
-  float rms = 1.0f / sqrtf(sqsum / (float)dim + eps);
-  #pragma omp simd
-  for (int i = 0; i < dim; i++)
-  {
-    // Gemma uses (weight + 1) instead of (weight)
-    dst[i] = (_Float16)((float)src[i] * rms * (float)(weight[i] + 1));
-  }
-}
+rmsnorm(floatx   *dst,
+    const floatx *src,
+    const floatx *weight,
 
-/* Gemma-style RMSNorm with OpenMP parallel reduction for larger dims */
-static void
-rmsnorm_omp(_Float16 *dst, _Float16 *src, _Float16 *weight, int dim, float eps)
+    int   dim,
+    float eps,
+
+    bool omp)
 {
   // OpenMP parallelized version of RMSNorm
   float sqsum = 0.0f;
-  #pragma omp parallel for reduction(+ : sqsum)
+  #pragma omp parallel for reduction(+ : sqsum) if (omp)
   for (int i = 0; i < dim; i++) { sqsum += (float)src[i] * (float)src[i]; }
   float rms = 1.0f / sqrtf(sqsum / (float)dim + eps);
-  #pragma omp simd
+  #pragma omp parallel for if (omp)
   for (int i = 0; i < dim; i++)
   {
     // Gemma uses (weight + 1) instead of (weight)
-    dst[i] = (_Float16)((float)src[i] * rms * (float)(weight[i] + 1));
+    dst[i] = (floatx)((float)src[i] * rms * (float)(weight[i] + 1));
   }
 }
 
 /* Classic LayerNorm used inside the SigLIP vision tower */
 static void
-layernorm(_Float16 *dst,
-    _Float16       *src,
-    _Float16       *weight,
-    _Float16       *bias,
+layernorm(floatx *dst,
+    const floatx *src,
+    const floatx *weight,
+    const floatx *bias,
 
     int   dim,
-    float eps)
+    float eps,
+
+    bool omp)
 {
   float mean = 0.0f;
+  #pragma omp parallel for reduction (+ : mean) if (omp)
   for (int i = 0; i < dim; i++) { mean += (float)src[i]; }
   mean /= (float)dim;
 
   float var = 0.0f;
+  #pragma omp parallel for reduction (+ : var) if (omp)
   for (int i = 0; i < dim; i++)
   {
     float diff = (float)src[i] - mean;
@@ -1322,247 +1470,301 @@ layernorm(_Float16 *dst,
   var /= (float)dim;
 
   float inv_std = 1.0f / sqrtf(var + eps);
-  #pragma omp simd
+
+  #pragma omp parallel for if (omp)
   for (int i = 0; i < dim; i++)
   {
-    dst[i] = (_Float16)(((float)src[i] - mean) * inv_std * (float)weight[i] +
-                        (float)bias[i]);
+    dst[i] = (floatx)(((float)src[i] - mean) * inv_std * (float)weight[i] +
+                      (float)bias[i]);
   }
 }
 
-/* Symmetric per-vector quantization into int8 [-127, 127] */
-static _Float16
-quantize_act(int8_t *dst, _Float16 *vec, int dim)
+/* Symmetric per-vector quantization into int8 [-127, 127]
+ * Q(fpx src (dim,)) ~= int8 dst (dim,) * fpx vec_scale (1,) */
+static floatx
+quantize_act(int8_t *dst, const floatx *vec, int dim, bool omp)
 {
-  _Float16 amax = 0.0f;  // Find the abs max in vec
-                         #pragma omp parallel for reduction(max : amax)
+  floatx amax = 0.0f;  // Find the abs max in vec
+
+  #pragma omp parallel for reduction(max : amax) if (omp)
   for (int d = 0; d < dim; d++)
   {
-    _Float16 av = vec[d] >= 0 ? vec[d] : -vec[d];
+    floatx av = vec[d] >= 0 ? vec[d] : -vec[d];
     if (av > amax) { amax = av; }
   }
 
-  // 1.0f just to make sure we are not dividing by zero
-  float qscale = (float)amax > 0.0f ? (float)amax / 127.0f : 1.0f;
+  // 1.0f to make sure we are not dividing by zero
+  float vec_scale = (float)amax > 0.0f ? (float)amax / 127.0f : 1.0f;
 
   // Quantize vec into qbuf
-  #pragma omp simd
+  #pragma omp parallel for if (omp)
   for (int d = 0; d < dim; d++)
   {
-    int q = (int)roundf((float)vec[d] / qscale);
+    int q = (int)roundf((float)vec[d] / vec_scale);
     if (q > 127) { q = 127; }
     else if (q < -127) { q = -127; }
     dst[d] = (int8_t)q;
   }
 
-  return (_Float16)qscale;
+  return (floatx)vec_scale;
 }
 
-/* Symmetric int8 quantization for a matrix of rows (used in vision GEMMs) */
+/* Symmetric int8 quantization for a matrix of rows
+ * Q(fpx src (m, n)) ~= int8 dst (m, n) * fpx dst_scales (m,) */
 static void
-quantize_act_rows(int8_t *restrict dst,
-    const _Float16 *restrict src,
+quantize_acts(int8_t *restrict dst,
+    floatx *restrict           dst_scales,
+    const floatx *restrict     src,
+    int                        src_stride,
 
     int m,
     int n,
 
-    _Float16 *restrict scales_rows)
+    bool omp)
 {
-  #pragma omp parallel for
-  for (int r = 0; r < m; r++)
+  // 0 to indicate contiguous
+  if (src_stride == 0) { src_stride = n; }
+
+  #pragma omp parallel for if (omp)
+  for (int i = 0; i < m; i++)
   {
-    const _Float16 *row  = src + r * n;
-    _Float16        amax = 0.0f;
-    for (int c = 0; c < n; c++)
+    const floatx *row  = src + i * src_stride;
+    floatx        amax = 0.0f;
+
+    for (int j = 0; j < n; j++)
     {
-      _Float16 av = row[c] >= 0 ? row[c] : -row[c];
+      floatx av = row[j] >= 0 ? row[j] : -row[j];
       if (av > amax) { amax = av; }
     }
-    float qscale   = (float)amax > 0.0f ? (float)amax / 127.0f : 1.0f;
-    scales_rows[r] = (_Float16)qscale;
+    float row_scale = (float)amax > 0.0f ? (float)amax / 127.0f : 1.0f;
+    dst_scales[i]   = (floatx)row_scale;
 
-    #pragma omp simd
-    for (int c = 0; c < n; c++)
+    for (int j = 0; j < n; j++)
     {
-      int q = (int)roundf((float)row[c] / qscale);
+      int q = (int)roundf((float)row[j] / row_scale);
       if (q > 127) { q = 127; }
       else if (q < -127) { q = -127; }
-      dst[r * n + c] = (int8_t)q;
+      dst[i * n + j] = (int8_t)q;
     }
   }
 }
 
-/* fp16 matrix-vector multiply */
+/* fpx matrix-vector multiply
+ * fpx mat (m, n) @ fpx vec (n,) = fpx dst (m,) */
 static void
-gemv_fp16(_Float16 *restrict dst,
-    const Linear *restrict mat,
-    _Float16 *restrict vec,
+gemv_fpx(floatx *restrict  dst,
+    const floatx *restrict mat,
+    const floatx *restrict vec,
 
     int m,
-    int n)
+    int n,
+
+    bool omp)
 {
-  // fp16 mat (m, n) @ fp16 vec (n,) = fp16 dst (m,)
-  #pragma omp parallel for
+  #pragma omp parallel for if (omp)
   for (int i = 0; i < m; i++)
   {
     float sum = 0;
     for (int j = 0; j < n; j++)
     {
-      sum += (float)mat->fp16[i * n + j] * (float)vec[j];
+      sum += (float)mat[i * n + j] * (float)vec[j];
     }
-    dst[i] = clamp_fp16((_Float16)sum);
+    dst[i] = (floatx)sum;
   }
 }
 
-/* int8 matrix-vector multiply + dequant */
+/* int8 matrix-vector multiply + dequant
+ *   (int8 mat (m, n) * fpx mat_scales (m,))
+ * @ (int8 vec (n,)   * fpx vec_scale  (1,)) = fpx dst (m,) */
 static void
-gemv_int8(_Float16 *restrict dst,
-    const Linear *restrict mat,
-    int8_t *restrict vec,
+gemv_int8(floatx *restrict dst,
+    const int8_t *restrict mat,
+    const floatx *restrict mat_scales,
+    const int8_t *restrict vec,
+    floatx                 vec_scale,
 
     int m,
     int n,
 
-    _Float16 qscale)
+    bool omp)
 {
-  float fqscale = (float)qscale;
-
-  // int8 mat (m, n) @ int8 vec (n,) = fp16 dst (m,)
-  #pragma omp parallel for
+  #pragma omp parallel for if (omp)
   for (int i = 0; i < m; i++)
   {
     int32_t sum = 0;
     for (int j = 0; j < n; j++)
     {
-      sum += (int32_t)mat->i8.q[i * n + j] * (int32_t)vec[j];
+      sum += (int32_t)mat[i * n + j] * (int32_t)vec[j];
     }
     // Dequantize
-    float val = (float)sum * fqscale * (float)mat->i8.scales[i];
-    dst[i]    = clamp_fp16((_Float16)val);
+    floatx val = (float)sum * (float)vec_scale * (float)mat_scales[i];
+    dst[i]     = (floatx)val;
   }
 }
 
-/* fp16 matrix-matrix (used by vision tower) */
+/* fpx matrix-matrix multiply (NT)
+ * fpx src (m, k) @ fpx mat.T (k, n) = fpx dst (m, n) */
 static void
-gemm_fp16(_Float16 *dst, const Linear *mat, _Float16 *src, int m, int n, int k)
-{
-  // fp16 src (m, k) @ (fp16 mat (n, k)).T = fp16 dst (m, n)
-  if (k <= 0) return;
-
-  #pragma omp parallel for
-  for (int i = 0; i < m; i++)
-    for (int j = 0; j < n; j++)
-    {
-      float           sum     = 0.0f;
-      const _Float16 *src_row = src + i * k;
-      const _Float16 *w_row   = mat->fp16 + j * k;
-      #pragma omp simd reduction(+ : sum)
-      for (int l = 0; l < k; l++)
-      {
-        sum += (float)src_row[l] * (float)w_row[l];
-      }
-      dst[i * n + j] = clamp_fp16((_Float16)sum);
-    }
-}
-
-/* int8 matrix-matrix + dequant */
-static void
-gemm_int8(_Float16 *restrict dst,
-    const Linear *restrict mat,
-    const int8_t *restrict src,
+gemm_fpx(floatx *restrict  dst,
+    int                    dst_stride,
+    const floatx *restrict mat,
+    const floatx *restrict src,
+    int                    src_stride,
 
     int m,
     int n,
     int k,
 
-    const _Float16 *restrict scales_rows)
+    bool omp)
 {
-  // int8 src (m, k) @ (int8 mat (n, k)).T = fp16 dst (m, n)
+  if (k <= 0) return;
+  if (dst_stride == 0) { dst_stride = n; }
+  if (src_stride == 0) { src_stride = k; }
+
+  #pragma omp parallel for if (omp)
+  for (int i = 0; i < m; i++)
+    for (int j = 0; j < n; j++)
+    {
+      float         sum     = 0.0f;
+      const floatx *src_row = src + i * src_stride;
+      const floatx *w_row   = mat + j * k;
+
+      for (int l = 0; l < k; l++)
+      {
+        sum += (float)src_row[l] * (float)w_row[l];
+      }
+      dst[i * dst_stride + j] = sum;
+    }
+}
+
+/* fpx matrix-matrix multiply (NN)
+ * fpx src (m, k) @ fpx mat (k, n) = fpx dst (m, n) */
+static void
+gemm_fpx_nn(floatx *restrict dst,
+    int                      dst_stride,
+    const floatx *restrict   mat,
+    const floatx *restrict   src,
+    int                      src_stride,
+
+    int m,
+    int n,
+    int k,
+
+    bool omp)
+{
   if (k <= 0) return;
 
-  #pragma omp parallel for
+  if (dst_stride == 0) { dst_stride = n; }
+  if (src_stride == 0) { src_stride = k; }
+
+  #pragma omp parallel for if (omp)
   for (int i = 0; i < m; i++)
   {
-    float fscale = (float)scales_rows[i];
+    float acc[n];
+    memset(acc, 0, n * sizeof(float));
+
+    const floatx *src_row = src + i * src_stride;
+
+    for (int l = 0; l < k; l++)
+    {
+      float         a       = (float)src_row[l];
+      const floatx *mat_row = mat + l * n;
+
+      for (int j = 0; j < n; j++) { acc[j] += a * (float)mat_row[j]; }
+    }
+
+    floatx *dst_row = dst + i * dst_stride;
+
+    for (int j = 0; j < n; j++) { dst_row[j] = (floatx)acc[j]; }
+  }
+}
+
+/* int8 matrix-matrix multiply (NT) + dequant
+ *
+ *   (int8 src (m, k) * fpx src_scales (m,))
+ * @ (int8 mat (n, k) * fpx mat_scales (n,)).T = (fpx dst (m, n)) */
+static void
+gemm_int8(floatx *restrict dst,
+    int                    dst_stride,
+    const int8_t *restrict mat,
+    const floatx *restrict mat_scales,
+    const int8_t *restrict src,
+    int                    src_stride,
+    const floatx *restrict src_scales,
+
+    int m,
+    int n,
+    int k,
+
+    bool omp)
+{
+  if (k <= 0) return;
+  if (dst_stride == 0) { dst_stride = n; }
+  if (src_stride == 0) { src_stride = k; }
+
+  #pragma omp parallel for if (omp)
+  for (int i = 0; i < m; i++)
+  {
+    float fscale = (float)src_scales[i];
     for (int j = 0; j < n; j++)
     {
       int32_t       sum     = 0;
-      const int8_t *src_row = src + i * k;
-      const int8_t *w_row   = mat->i8.q + j * k;
+      const int8_t *src_row = src + i * src_stride;
+      const int8_t *mat_row = mat + j * k;
 
-      #pragma omp simd reduction(+ : sum)
       for (int l = 0; l < k; l++)
       {
-        sum += (int32_t)src_row[l] * (int32_t)w_row[l];
+        sum += (int32_t)src_row[l] * (int32_t)mat_row[l];
       }
 
       // Dequantize
-      float val      = (float)sum * fscale * (float)mat->i8.scales[j];
-      dst[i * n + j] = clamp_fp16((_Float16)val);
+      float val               = (float)sum * fscale * (float)mat_scales[j];
+      dst[i * dst_stride + j] = (floatx)val;
     }
   }
 }
 
-static _Float16
-dot(_Float16 *v1, _Float16 *v2, int dim)
+/* */
+static floatx
+dot(const floatx *v1, const floatx *v2, int dim, bool omp)
 {
-  // Must use float instead of _Float16
+  // Must use float instead of floatx
   float sum = 0.0f;
+  #pragma omp parallel for reduction(+ : sum) if (omp)
   for (int i = 0; i < dim; i++) { sum += (float)v1[i] * (float)v2[i]; }
-  return (_Float16)sum;
+  return (floatx)sum;
 }
 
+/* */
 static void
-softmax(_Float16 *dst, _Float16 *src, int dim)
+softmax(floatx *dst, const floatx *src, int dim, bool omp)
 {
   if (dim <= 0) return;
 
-  _Float16 max = -(_Float16)INFINITY;
+  floatx max = -(floatx)INFINITY;
+  #pragma omp parallel for reduction(max : max) if (omp)
   for (int i = 0; i < dim; i++)
   {
     if (src[i] > max) { max = src[i]; }
   }
 
   float expsum = 0.0f;
+  #pragma omp parallel for reduction(+ : expsum) if (omp)
   for (int i = 0; i < dim; i++)
   {
     float val = expf((float)(src[i] - max));
-    dst[i]    = (_Float16)val;
+    dst[i]    = (floatx)val;
     expsum += val;
   }
 
-  #pragma omp simd
-  for (int i = 0; i < dim; i++) { dst[i] = (_Float16)((float)dst[i] / expsum); }
-}
-
-static void
-softmax_omp(_Float16 *dst, _Float16 *src, int dim)
-{
-  // OpenMP parallelized version of softmax
-  _Float16 max = -(_Float16)INFINITY;
-  #pragma omp parallel for reduction(max : max)
-  for (int i = 0; i < dim; i++)
-  {
-    if (src[i] > max) { max = src[i]; }
-  }
-
-  float expsum = 0.0f;
-  #pragma omp parallel for reduction(+ : expsum)
-  for (int i = 0; i < dim; i++)
-  {
-    float val = expf((float)(src[i] - max));
-    dst[i]    = (_Float16)val;
-    expsum += val;
-  }
-
-  #pragma omp parallel for
-  for (int i = 0; i < dim; i++) { dst[i] = (_Float16)((float)dst[i] / expsum); }
+  #pragma omp parallel for if (omp)
+  for (int i = 0; i < dim; i++) { dst[i] = (floatx)((float)dst[i] / expsum); }
 }
 
 /* Optional debug helper, prints stats when activations look suspicious */
 static void
 warn_stats(const char *name,
-    const _Float16    *data,
+    const floatx      *data,
 
     int len,
     int layer,
@@ -1596,12 +1798,12 @@ warn_stats(const char *name,
     sumsq += (double)v * v;
   }
 
-  if (max >= 0.8 * FP16_MAX || min <= -0.8 * FP16_MAX || inf_cnt >= 1 ||
+  if (max >= 0.8 * FLOATX_MAX || min <= -0.8 * FLOATX_MAX || inf_cnt >= 1 ||
       nan_cnt >= 1)
   {
     double mean = sum / len;
     double var  = sumsq / len - mean * mean;
-    double std  = sqrt(var > 0 ? var : 0);
+    double std  = sqrt(MAX(var, 0));
 
     printf(
         "\nWARNING: [L%02d P%04d] %-20s: min=%9.3f max=%9.3f mean=%9.3f "
@@ -1621,11 +1823,10 @@ forward_siglip(SigLIPVisionEncoder *enc,
 
     GemmaConfig  *conf,
     SigLIPBuffer *buf,
-    _Float16     *img,
-    _Float16     *out)
+    floatx       *img,
+    floatx       *out)
 {
-  // TODO: Integrate this into the language model (tons and tons of work to
-  // do...)
+  // TODO: Integrate this into the language model (almost there!)
   SigLIPConfig *vconf = enc->config;
 
   int C        = vconf->hidden_dim;
@@ -1659,7 +1860,7 @@ forward_siglip(SigLIPVisionEncoder *enc,
               sum += (float)enc->patch_emb[w_idx] * (float)img[in_idx];
             }
         buf->x[token_idx * C + oc] =
-            clamp_fp16((_Float16)(sum + (float)enc->patch_emb_b[oc]));
+            clamp_fpx((floatx)(sum + (float)enc->patch_emb_b[oc]));
       }
     }
 
@@ -1670,10 +1871,10 @@ forward_siglip(SigLIPVisionEncoder *enc,
   {
     for (int i = 0; i < N; i++)
     {
-      _Float16 *pos_vec = enc->pos_embedding->fp16 + i * C;
+      floatx *pos_vec = enc->pos_embedding->fpx + i * C;
       for (int j = 0; j < C; j++)
       {
-        buf->x[i * C + j] = clamp_fp16(buf->x[i * C + j] + pos_vec[j]);
+        buf->x[i * C + j] = clamp_fpx(buf->x[i * C + j] + pos_vec[j]);
       }
     }
   }
@@ -1686,7 +1887,7 @@ forward_siglip(SigLIPVisionEncoder *enc,
       for (int j = 0; j < C; j++)
       {
         float val         = (float)enc->pos_embedding->i8.q[i * C + j] * scale;
-        buf->x[i * C + j] = clamp_fp16(buf->x[i * C + j] + (_Float16)val);
+        buf->x[i * C + j] = clamp_fpx(buf->x[i * C + j] + (floatx)val);
       }
     }
   }
@@ -1697,23 +1898,26 @@ forward_siglip(SigLIPVisionEncoder *enc,
   {
     SigLIPEncoderLayer *layer = enc->layers[l];
 
-    memcpy(buf->resid, buf->x, N * C * sizeof(_Float16));
-    layernorm(buf->x, buf->x, layer->n1, layer->n1_b, C, vconf->eps);
+    memcpy(buf->resid, buf->x, N * C * sizeof(floatx));
+    layernorm(buf->x, buf->x, layer->n1, layer->n1_b, C, vconf->eps, true);
     warn_stats("ln1", buf->x, N * C, l, 0, 8);
 
     // QKV projections
     if (!conf->quant)
     {
-      gemm_fp16(buf->xq, layer->wq, buf->x, N, C, C);
-      gemm_fp16(buf->xk, layer->wk, buf->x, N, C, C);
-      gemm_fp16(buf->xv, layer->wv, buf->x, N, C, C);
+      gemm_fpx(buf->xq, 0, layer->wq->fpx, buf->x, 0, N, C, C, true);
+      gemm_fpx(buf->xk, 0, layer->wk->fpx, buf->x, 0, N, C, C, true);
+      gemm_fpx(buf->xv, 0, layer->wv->fpx, buf->x, 0, N, C, C, true);
     }
     else
     {
-      quantize_act_rows(buf->x_i8, buf->x, N, C, buf->x_scales);
-      gemm_int8(buf->xq, layer->wq, buf->x_i8, N, C, C, buf->x_scales);
-      gemm_int8(buf->xk, layer->wk, buf->x_i8, N, C, C, buf->x_scales);
-      gemm_int8(buf->xv, layer->wv, buf->x_i8, N, C, C, buf->x_scales);
+      quantize_acts(buf->x_i8, buf->x_scales, buf->x, 0, N, C, true);
+      gemm_int8(buf->xq, 0, layer->wq->i8.q, layer->wq->i8.scales, buf->x_i8, 0,
+          buf->x_scales, N, C, C, true);
+      gemm_int8(buf->xk, 0, layer->wk->i8.q, layer->wk->i8.scales, buf->x_i8, 0,
+          buf->x_scales, N, C, C, true);
+      gemm_int8(buf->xv, 0, layer->wv->i8.q, layer->wv->i8.scales, buf->x_i8, 0,
+          buf->x_scales, N, C, C, true);
     }
     warn_stats("q", buf->xq, N * C, l, 0, 8);
     warn_stats("k", buf->xk, N * C, l, 0, 8);
@@ -1730,55 +1934,59 @@ forward_siglip(SigLIPVisionEncoder *enc,
       }
 
     // Attention
-    memset(buf->att_out, 0, N * C * sizeof(_Float16));
+    memset(buf->att_out, 0, N * C * sizeof(floatx));
     float scale = 1.0f / sqrtf((float)CH);
 
     #pragma omp parallel for
     for (int h = 0; h < vconf->n_heads; h++)
     {
-      _Float16 *scores = buf->scores + h * N * N;  // (N, N) for this head
+      floatx *scores = buf->scores + h * N * N;  // (N, N) for this head
 
       // Compute scores
       for (int i = 0; i < N; i++)
       {
-        _Float16 *q_vec = buf->xq + i * C + h * CH;
+        floatx *q_vec = buf->xq + i * C + h * CH;
         for (int j = 0; j < N; j++)
         {
-          _Float16 *k_vec = buf->xk + j * C + h * CH;
-          float     dot   = 0.0f;
+          floatx *k_vec = buf->xk + j * C + h * CH;
+          float   dot   = 0.0f;
           for (int d = 0; d < CH; d++)
           {
             dot += (float)q_vec[d] * (float)k_vec[d];
           }
-          scores[i * N + j] = (_Float16)(dot * scale);
+          scores[i * N + j] = (floatx)(dot * scale);
         }
         // Softmax over j
-        softmax(scores + i * N, scores + i * N, N);
+        softmax(scores + i * N, scores + i * N, N, false);
       }
 
       // Weighted sum of values
       for (int i = 0; i < N; i++)
       {
-        _Float16 *out_vec = buf->att_out + i * C + h * CH;
+        floatx *out_vec = buf->att_out + i * C + h * CH;
         for (int d = 0; d < CH; d++)
         {
           float sum = 0.0f;
           for (int j = 0; j < N; j++)
           {
-            _Float16 *v_vec = buf->xv + j * C + h * CH;
+            floatx *v_vec = buf->xv + j * C + h * CH;
             sum += (float)v_vec[d] * (float)scores[i * N + j];
           }
-          out_vec[d] = (_Float16)sum;
+          out_vec[d] = (floatx)sum;
         }
       }
     }
 
     // Output projection
-    if (!conf->quant) { gemm_fp16(buf->x, layer->wo, buf->att_out, N, C, C); }
+    if (!conf->quant)
+    {
+      gemm_fpx(buf->x, 0, layer->wo->fpx, buf->att_out, 0, N, C, C, true);
+    }
     else
     {
-      quantize_act_rows(buf->x_i8, buf->att_out, N, C, buf->x_scales);
-      gemm_int8(buf->x, layer->wo, buf->x_i8, N, C, C, buf->x_scales);
+      quantize_acts(buf->x_i8, buf->x_scales, buf->att_out, 0, N, C, true);
+      gemm_int8(buf->x, 0, layer->wo->i8.q, layer->wo->i8.scales, buf->x_i8, 0,
+          buf->x_scales, N, C, C, true);
     }
     // Add output bias
     for (int i = 0; i < N; i++)
@@ -1788,23 +1996,24 @@ forward_siglip(SigLIPVisionEncoder *enc,
     // Residual connection
     for (int i = 0; i < N * C; i++)
     {
-      buf->x[i] = clamp_fp16(buf->x[i] + buf->resid[i]);
+      buf->x[i] = clamp_fpx(buf->x[i] + buf->resid[i]);
     }
     warn_stats("resid1", buf->x, N * C, l, 0, 8);
 
-    memcpy(buf->resid, buf->x, N * C * sizeof(_Float16));
-    layernorm(buf->x, buf->x, layer->n2, layer->n2_b, C, vconf->eps);
+    memcpy(buf->resid, buf->x, N * C * sizeof(floatx));
+    layernorm(buf->x, buf->x, layer->n2, layer->n2_b, C, vconf->eps, true);
     warn_stats("ln2", buf->x, N * C, l, 0, 8);
 
     // x @ fc1 = mlp_hidden
     if (!conf->quant)
     {
-      gemm_fp16(buf->mlp_hidden, layer->w1, buf->x, N, CM, C);
+      gemm_fpx(buf->mlp_hidden, 0, layer->w1->fpx, buf->x, 0, N, CM, C, true);
     }
     else
     {
-      quantize_act_rows(buf->x_i8, buf->x, N, C, buf->x_scales);
-      gemm_int8(buf->mlp_hidden, layer->w1, buf->x_i8, N, CM, C, buf->x_scales);
+      quantize_acts(buf->x_i8, buf->x_scales, buf->x, 0, N, C, true);
+      gemm_int8(buf->mlp_hidden, 0, layer->w1->i8.q, layer->w1->i8.scales,
+          buf->x_i8, 0, buf->x_scales, N, CM, C, true);
     }
 
     for (int i = 0; i < N; i++)
@@ -1816,19 +2025,21 @@ forward_siglip(SigLIPVisionEncoder *enc,
         float c = 0.79788456080287f;
         val     = 0.5f * val *
               (1.0f + tanhf(c * (val + 0.044715f * val * val * val)));
-        buf->mlp_hidden[i * CM + j] = (_Float16)val;
+        buf->mlp_hidden[i * CM + j] = (floatx)val;
       }
     warn_stats("mlp_hidden", buf->mlp_hidden, N * CM, l, 0, 8);
 
     // mlp_hidden @ fc2 = x
     if (!conf->quant)
     {
-      gemm_fp16(buf->x, layer->w2, buf->mlp_hidden, N, C, CM);
+      gemm_fpx(buf->x, 0, layer->w2->fpx, buf->mlp_hidden, 0, N, C, CM, true);
     }
     else
     {
-      quantize_act_rows(buf->mlp_i8, buf->mlp_hidden, N, CM, buf->mlp_scales);
-      gemm_int8(buf->x, layer->w2, buf->mlp_i8, N, C, CM, buf->mlp_scales);
+      quantize_acts(
+          buf->mlp_i8, buf->mlp_scales, buf->mlp_hidden, 0, N, CM, true);
+      gemm_int8(buf->x, 0, layer->w2->i8.q, layer->w2->i8.scales, buf->mlp_i8,
+          0, buf->mlp_scales, N, C, CM, true);
     }
     // x += b2
     for (int i = 0; i < N; i++)
@@ -1837,13 +2048,14 @@ forward_siglip(SigLIPVisionEncoder *enc,
     // Residual connection
     for (int i = 0; i < N * C; i++)
     {
-      buf->x[i] = clamp_fp16(buf->x[i] + buf->resid[i]);
+      buf->x[i] = clamp_fpx(buf->x[i] + buf->resid[i]);
     }
     warn_stats("resid2", buf->x, N * C, l, 0, 8);
   }
 
   // Post-norm + average pooling down to image_toks tokens
-  layernorm(buf->x, buf->x, enc->post_norm, enc->post_norm_b, C, vconf->eps);
+  layernorm(
+      buf->x, buf->x, enc->post_norm, enc->post_norm_b, C, vconf->eps, true);
   warn_stats("post_ln", buf->x, N * C, 0, 0, 0);
 
   // Average pooling
@@ -1862,119 +2074,123 @@ forward_siglip(SigLIPVisionEncoder *enc,
             int token_idx = (py * ppi + px) * C + d;
             sum += (float)buf->x[token_idx];
           }
-        buf->x[out_idx + d] = (_Float16)(sum / (K * K));
+        buf->x[out_idx + d] = (floatx)(sum / (K * K));
       }
     }
   warn_stats("avg_pool", buf->x, tpi * C, 0, 0, 0);
   // buf->x now becomes (tpi, C)
 
   // RMSNorm
-  rmsnorm(buf->x, buf->x, enc->norm, C, vconf->eps);
+  rmsnorm(buf->x, buf->x, enc->norm, C, vconf->eps, true);
   warn_stats("rmsnorm", buf->x, tpi * C, 0, 0, 0);
 
   // Final projection into language-model embedding space
   if (!conf->quant)
   {
-    gemm_fp16(out, enc->proj, buf->x, tpi, conf->embed_dim, C);
+    gemm_fpx(out, 0, enc->proj->fpx, buf->x, 0, tpi, conf->embed_dim, C, true);
   }
   else
   {
-    quantize_act_rows(buf->x_i8, buf->x, tpi, C, buf->x_scales);
-    gemm_int8(
-        out, enc->proj, buf->x_i8, tpi, conf->embed_dim, C, buf->x_scales);
+    quantize_acts(buf->x_i8, buf->x_scales, buf->x, 0, tpi, C, true);
+    gemm_int8(out, 0, enc->proj->i8.q, enc->proj->i8.scales, buf->x_i8, 0,
+        buf->x_scales, tpi, conf->embed_dim, C, true);
   }
   warn_stats("proj", out, tpi * conf->embed_dim, 0, 0, 0);
 }
 
 /* Language model forward (one token) */
 int
-forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos)
+forward_gemma_decode(GemmaModel *model, GemmaBuffer *buf, int token, int pos)
 {
   GemmaConfig *conf = model->config;
 
-  int C   = conf->embed_dim;
-  int NH  = conf->n_heads;
-  int CH  = conf->head_dim;
-  int Cq  = NH * CH;
-  int Ckv = conf->n_kv_heads * CH;
+  int C     = conf->embed_dim;
+  int NH    = conf->n_heads;
+  int NH_kv = conf->n_kv_heads;
+  int CH    = conf->head_dim;
+  int Cq    = NH * CH;
+  int Ckv   = NH_kv * CH;
 
   int CH_half = CH / 2;
 
   if (pos >= buf->cache_len)
   {
-    fprintf(stderr, "\nError: KV Cache is full");
+    fprintf(stderr, "\nerror: KV Cache is full\n");
     return 1;
   }
 
   /* Embedding lookup.
    * The export script already applied 1/sqrt(embed_dim), so the usual
    * Gemma sqrt(embed_dim) scale cancels out to 1.0 here. */
-  _Float16 embed_scale =
+  floatx embed_scale =
       1.0f;  // equivalent to sqrt(embed_dim) * (1/sqrt(embed_dim))
   if (conf->quant)
   {
     // Dequantize
-    embed_scale *= model->embedding->i8.scales[tok];
+    embed_scale *= model->embedding->i8.scales[token];
   }
 
   // x = embedding[tok] * embed_scale
   #pragma omp parallel for
-  for (int i = 0; i < C; i++)
+  for (int d = 0; d < C; d++)
   {
     if (!conf->quant)
     {
-      buf->x[i] = model->embedding->fp16[tok * C + i] * embed_scale;
+      buf->x[d] = model->embedding->fpx[token * C + d] * embed_scale;
     }
     else
     {
-      buf->x[i] = (_Float16)model->embedding->i8.q[tok * C + i] * embed_scale;
+      buf->x[d] = (floatx)model->embedding->i8.q[token * C + d] * embed_scale;
     }
   }
 
   warn_stats("embedding", buf->x, C, 0, pos, 0);
 
   // Precompute cos & sin for all frequencies (used in RoPE)
-  #pragma omp simd
+  #pragma omp parallel for
   for (int d = 0; d < CH_half; d++)
   {
-    float freq = 0.0f;
-    float e    = (float)(-2 * d) / (float)CH;
+    float freq;
+    float e = (float)(-2 * d) / (float)CH;  // exponent
 
     // Rotation angles for sliding window attentions
     freq                         = powf(conf->local_theta, e);
-    buf->csfreqs_slid[d * 2]     = (_Float16)cosf(freq * (float)pos);
-    buf->csfreqs_slid[d * 2 + 1] = (_Float16)sinf(freq * (float)pos);
+    buf->csfreqs_slid[d * 2]     = (floatx)cosf(freq * (float)pos);
+    buf->csfreqs_slid[d * 2 + 1] = (floatx)sinf(freq * (float)pos);
 
     // Rotation angles for full attentions
     freq                         = powf(conf->global_theta, e);
-    buf->csfreqs_full[d * 2]     = (_Float16)cosf(freq * (float)pos);
-    buf->csfreqs_full[d * 2 + 1] = (_Float16)sinf(freq * (float)pos);
+    buf->csfreqs_full[d * 2]     = (floatx)cosf(freq * (float)pos);
+    buf->csfreqs_full[d * 2 + 1] = (floatx)sinf(freq * (float)pos);
   }
 
-  _Float16 att_scale = (_Float16)(1.0f / sqrtf((float)conf->q_scale));
-
+  // Forward all the layers
   for (int l = 0; l < conf->n_layers; l++)
   {
     GemmaDecoderLayer *layer = model->layers[l];
 
-    memcpy(buf->resid, buf->x, C * sizeof(_Float16));
+    memcpy(buf->resid, buf->x, C * sizeof(*buf->x));
 
-    rmsnorm_omp(buf->x, buf->x, layer->n1, C, conf->eps);
+    rmsnorm(buf->x, buf->x, layer->n1, C, conf->eps, true);
     warn_stats("norm1", buf->x, C, l, pos, 8);
 
     // The attention block
     if (!conf->quant)
     {
-      gemv_fp16(buf->xq, layer->wq, buf->x, Cq, C);   // (n_heads, head_dim)
-      gemv_fp16(buf->xk, layer->wk, buf->x, Ckv, C);  // (n_kv_heads, head_dim)
-      gemv_fp16(buf->xv, layer->wv, buf->x, Ckv, C);  // (n_kv_heads, head_dim)
+      gemv_fpx(buf->xq, layer->wq->fpx, buf->x, Cq, C, true);  // (NH, CH)
+      // (NH_kv, CH)
+      gemv_fpx(buf->xk, layer->wk->fpx, buf->x, Ckv, C, true);
+      gemv_fpx(buf->xv, layer->wv->fpx, buf->x, Ckv, C, true);
     }
     else
     {
-      float xscale = (float)quantize_act(buf->x_i8, buf->x, C);
-      gemv_int8(buf->xq, layer->wq, buf->x_i8, Cq, C, xscale);
-      gemv_int8(buf->xk, layer->wk, buf->x_i8, Ckv, C, xscale);
-      gemv_int8(buf->xv, layer->wv, buf->x_i8, Ckv, C, xscale);
+      floatx x_scale = quantize_act(buf->x_i8, buf->x, C, true);
+      gemv_int8(buf->xq, layer->wq->i8.q, layer->wq->i8.scales, buf->x_i8,
+          x_scale, Cq, C, true);
+      gemv_int8(buf->xk, layer->wk->i8.q, layer->wk->i8.scales, buf->x_i8,
+          x_scale, Ckv, C, true);
+      gemv_int8(buf->xv, layer->wv->i8.q, layer->wv->i8.scales, buf->x_i8,
+          x_scale, Ckv, C, true);
     }
 
     if (conf->qk_norm)
@@ -1982,95 +2198,88 @@ forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos)
       // Query RMSNorm
       for (int h = 0; h < NH; h++)
       {
-        _Float16 *xq_head = buf->xq + h * CH;
+        floatx *xq_head = buf->xq + h * CH;
         // Use the non-threading version here since we are running this over
         // every head
-        rmsnorm(xq_head, xq_head, layer->nq, CH, conf->eps);
+        rmsnorm(xq_head, xq_head, layer->nq, CH, conf->eps, false);
       }
       // Key RMSNorm
-      for (int h = 0; h < conf->n_kv_heads; h++)
+      for (int h = 0; h < NH_kv; h++)
       {
-        _Float16 *xk_head = buf->xk + h * CH;
-        rmsnorm(xk_head, xk_head, layer->nk, CH, conf->eps);
+        floatx *xk_head = buf->xk + h * CH;
+        rmsnorm(xk_head, xk_head, layer->nk, CH, conf->eps, false);
       }
     }
 
-    bool      is_local = conf->att_layers[l];
-    _Float16 *freqs_cs = is_local ? buf->csfreqs_slid : buf->csfreqs_full;
+    bool    is_local = conf->att_layers[l];
+    floatx *freqs_cs = is_local ? buf->csfreqs_slid : buf->csfreqs_full;
 
-    // These used to be a single merged loop, but I splitted it into two
-    // separate loops for higher performance
-
-    // Apply RoPE to queries
+    // Apply RoPE to queries & keys
     #pragma omp parallel for
-    for (int h = 0; h < NH; h++)
+    for (int idx = 0; idx < NH + NH_kv; idx++)
     {
-      int       o  = h * CH;  // Offset for current head
-      _Float16 *xq = buf->xq + o;
-      #pragma omp simd
-      for (int i = 0; i < CH_half; i++)
+      floatx *data;
+      if (idx < NH)
       {
-        float cfr = (float)freqs_cs[2 * i];
-        float sfr = (float)freqs_cs[2 * i + 1];
-        float a   = (float)xq[i];            // Index in the first half vector
-        float b   = (float)xq[i + CH_half];  // Index in the second half vector
+        data = buf->xq + idx * CH;  // Apply to queries
+      }
+      else
+      {
+        data = buf->xk + (idx - NH) * CH;  // Apply to keys
+      }
 
-        xq[i]           = (_Float16)(a * cfr - b * sfr);
-        xq[i + CH_half] = (_Float16)(a * sfr + b * cfr);
+      for (int d = 0; d < CH_half; d++)
+      {
+        float cfr = (float)freqs_cs[2 * d];
+        float sfr = (float)freqs_cs[2 * d + 1];
+        float a   = (float)data[d];            // Index in the first half vector
+        float b   = (float)data[d + CH_half];  // ... second half vector
+
+        data[d]           = (floatx)(a * cfr - b * sfr);
+        data[d + CH_half] = (floatx)(a * sfr + b * cfr);
       }
     }
 
-    // Apply RoPE to keys
-    #pragma omp parallel for
-    for (int h = 0; h < conf->n_kv_heads; h++)
+    // (NH_kv, cache_len, CH)
+    floatx *k_cache = buf->kv_cache + l * 2 * buf->cache_len * Ckv;
+    floatx *v_cache = k_cache + buf->cache_len * Ckv;
+
+    // Write to kv_cache
+    for (int h = 0; h < NH_kv; h++)
     {
-      int       o  = h * CH;  // Offset for current head
-      _Float16 *xk = buf->xk + o;
-      #pragma omp simd
-      for (int i = 0; i < CH_half; i++)
-      {
-        float cfr = (float)freqs_cs[2 * i];
-        float sfr = (float)freqs_cs[2 * i + 1];
-        float a   = (float)xk[i];            // Index in the first half vector
-        float b   = (float)xk[i + CH_half];  // Index in the second half vector
-
-        xk[i]           = (_Float16)(a * cfr - b * sfr);
-        xk[i + CH_half] = (_Float16)(a * sfr + b * cfr);
-      }
+      floatx *xk_head = k_cache + h * buf->cache_len * CH + pos * CH;
+      floatx *xv_head = v_cache + h * buf->cache_len * CH + pos * CH;
+      memcpy(xk_head, buf->xk + h * CH, CH * sizeof(*buf->xk));
+      memcpy(xv_head, buf->xv + h * CH, CH * sizeof(*buf->xv));
     }
-
-    int entry_sz = conf->n_kv_heads * CH;
-    int layer_sz = 2 * buf->cache_len * entry_sz;
-
-    // (cache_len, n_kv_heads, head_dim)
-    _Float16 *k_cache = buf->kv_cache + l * layer_sz;
-    _Float16 *v_cache = k_cache + buf->cache_len * entry_sz;
-
-    // Write to key & value cache
-    memcpy(k_cache + pos * entry_sz, buf->xk, entry_sz * sizeof(_Float16));
-    memcpy(v_cache + pos * entry_sz, buf->xv, entry_sz * sizeof(_Float16));
+    memcpy(k_cache + pos * Ckv, buf->xk, Ckv * sizeof(*buf->xk));
+    memcpy(v_cache + pos * Ckv, buf->xv, Ckv * sizeof(*buf->xv));
 
     // Sliding-window (true) or full attention (false)?
     bool local_att = is_local && pos >= conf->slide_len;
-    // Starting position of attention
+    // Starting position of kv_cache
     int spos   = local_att ? (pos + 1 - conf->slide_len) : 0;
     int attlen = pos + 1 - spos;  // Include the current pos
+
+    floatx att_scale = (floatx)(1.0f / sqrtf((float)conf->q_scale));
 
     // Iterate over all the attention heads
     #pragma omp parallel for
     for (int h = 0; h < NH; h++)
     {
-      int       h_kv    = h * conf->n_kv_heads / NH;  // GQA mapping
-      _Float16 *xq_head = buf->xq + h * CH;           // xq[h, :]
-      _Float16 *xk_head =
-          k_cache + spos * entry_sz + h_kv * CH;  // k_cache[spos:, h_kv, :]
-      _Float16 *att_head =
-          buf->att + h * buf->cache_len + spos;  // att[h, spos:]
+      int h_kv = h * NH_kv / NH;  // GQA mapping
+
+      floatx *xq_head = buf->xq + h * CH;  // xq[h, :]
+      // k_cache[h_kv, spos:, :]
+      floatx *xk_head = k_cache + h_kv * buf->cache_len * CH + spos * CH;
+      // att[h, spos:]
+      floatx *att_head = buf->att + h * attlen + spos;
 
       // Compute dot product of the current query across all the keys
       for (int t = 0; t < attlen; t++)
       {
-        att_head[t] = dot(xq_head, xk_head + t * entry_sz, CH) * att_scale;
+        // (xq[h, :] * k_cache[h_kv, spos + t, :]).sum() * att_scale
+        att_head[t] = dot(xq_head, xk_head + t * CH, CH, false) * att_scale;
       }
 
       // Attention score softcapping
@@ -2079,80 +2288,86 @@ forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos)
         for (int t = 0; t < attlen; t++)
         {
           float val   = (float)att_head[t] / conf->att_softcap;
-          att_head[t] = (_Float16)(tanhf(val) * conf->att_softcap);
+          att_head[t] = (floatx)(tanhf(val) * conf->att_softcap);
         }
       }
 
       // Softmax
-      softmax(att_head, att_head, attlen);
+      softmax(att_head, att_head, attlen, false);
 
       // Compute output as weighted sum of values
-      _Float16 *xv_head =
-          v_cache + spos * entry_sz + h_kv * CH;  // v_cache[spos:, h_kv, :]
-      _Float16 *xo_head = buf->xo + h * CH;
-      // xo_head (head_dim,) = att_head (attlen,) @ xv_head (attlen,
-      // head_dim)
+      // v_cache[h_kv, spos:, :]
+      floatx *xv_head = v_cache + h_kv * buf->cache_len * CH + spos * CH;
+      floatx *xo_head = buf->xo + h * CH;
+
+      // xo_head (CH,) = att_head (attlen,) @ xv_head (attlen, CH)
       for (int d = 0; d < CH; d++)
       {
         float sum = 0.0f;
-        #pragma omp simd reduction(+ : sum)
         for (int t = 0; t < attlen; t++)
         {
-          sum += (float)(xv_head + t * entry_sz)[d] * (float)att_head[t];
+          sum += (float)(xv_head + t * CH)[d] * (float)att_head[t];
         }
-        xo_head[d] = sum;
+        xo_head[d] = (floatx)sum;
       }
     }
 
     // Output projection maps xo back to x
-    if (!conf->quant) { gemv_fp16(buf->x, layer->wo, buf->xo, C, Cq); }
+    // x (C,) = xo (CH,) @ wo.T (CH, C)
+    if (!conf->quant)
+    {
+      gemv_fpx(buf->x, layer->wo->fpx, buf->xo, C, Cq, true);
+    }
     else
     {
-      float xoscale = (float)quantize_act(buf->xo_i8, buf->xo, Cq);
-      gemv_int8(buf->x, layer->wo, buf->xo_i8, C, Cq, xoscale);
+      floatx xo_scale = quantize_act(buf->xo_i8, buf->xo, Cq, true);
+      gemv_int8(buf->x, layer->wo->i8.q, layer->wo->i8.scales, buf->xo_i8,
+          xo_scale, C, Cq, true);
     }
-    warn_stats("attn_out", buf->x, C, l, pos, 8);
+    warn_stats("att_out", buf->x, C, l, pos, 8);
 
-    rmsnorm_omp(buf->x, buf->x, layer->n2, C, conf->eps);
+    rmsnorm(buf->x, buf->x, layer->n2, C, conf->eps, true);
     warn_stats("norm2", buf->x, C, l, pos, 8);
 
     // Combine the residual stream
-    _Float16 *restrict x     = buf->x;
-    _Float16 *restrict resid = buf->resid;
-    #pragma omp simd
+    floatx *restrict x     = buf->x;
+    floatx *restrict resid = buf->resid;
     for (int d = 0; d < C; d++)
     {
       /* Sometimes the residual stream accumulates huge values on certain
-       * channels, especially in pretrained/bigger models (Sun et al.
-       * https://arxiv.org/abs/2402.17762) It works fine in fp32 or bf16, but it
-       * can easily overflow fp16 and become inf, causing all the activations
-       * turning into nan after the next RMSNorm, so we need to clamp it */
+       * channels, especially in pretrained/bigger models (Sun et al., 2024,
+       * https://arxiv.org/abs/2402.17762). It works fine in fp32 or bf16, but
+       * it can easily overflow fp16 and become inf, causing all the activations
+       * turning into nan after the next RMSNorm, so we need to clamp it. */
 
       /* NOTE: Actually this should never trigger now since I added activation
        * scalers afterwards (see export.py), the clamp here is more of a
-       * last-resort safety net */
-      buf->x[d] = clamp_fp16(x[d] + resid[d]);
+       * last-resort safety net. */
+
+      buf->x[d] = clamp_fpx(x[d] + resid[d]);
     }
     warn_stats("resid1", buf->x, C, l, pos, 8);
 
-    memcpy(buf->resid, buf->x, C * sizeof(_Float16));
+    memcpy(buf->resid, buf->x, C * sizeof(*buf->x));
 
     if (conf->pre_mlp_norm)
     {
-      rmsnorm_omp(buf->x, buf->x, layer->n3, C, conf->eps);
+      rmsnorm(buf->x, buf->x, layer->n3, C, conf->eps, true);
     }
 
     // MLP feedforward layer (SwiGLU-style)
     if (!conf->quant)
     {
-      gemv_fp16(buf->xg, layer->w2, buf->x, conf->mlp_dim, C);
-      gemv_fp16(buf->xu, layer->w1, buf->x, conf->mlp_dim, C);
+      gemv_fpx(buf->xu, layer->w1->fpx, buf->x, conf->mlp_dim, C, true);
+      gemv_fpx(buf->xg, layer->w2->fpx, buf->x, conf->mlp_dim, C, true);
     }
     else
     {
-      float xscale = (float)quantize_act(buf->x_i8, buf->x, C);
-      gemv_int8(buf->xg, layer->w2, buf->x_i8, conf->mlp_dim, C, xscale);
-      gemv_int8(buf->xu, layer->w1, buf->x_i8, conf->mlp_dim, C, xscale);
+      floatx x_scale = quantize_act(buf->x_i8, buf->x, C, true);
+      gemv_int8(buf->xg, layer->w2->i8.q, layer->w2->i8.scales, buf->x_i8,
+          x_scale, conf->mlp_dim, C, true);
+      gemv_int8(buf->xu, layer->w1->i8.q, layer->w1->i8.scales, buf->x_i8,
+          x_scale, conf->mlp_dim, C, true);
     }
 
     // GELU gate
@@ -2163,37 +2378,586 @@ forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos)
       float x    = (float)buf->xg[d];
       float c    = 0.79788456080287f;  // = sqrt(2 / pi)
       x          = 0.5 * x * (1 + tanhf(c * (x + 0.044715 * x * x * x)));
-      buf->xg[d] = (_Float16)x;
+      buf->xg[d] = (floatx)x;
       buf->xg[d] *= buf->xu[d];  // Fuse xg * xu into xg
     }
 
     if (!conf->quant)
     {
-      gemv_fp16(buf->x, layer->w3, buf->xg, C, conf->mlp_dim);
+      gemv_fpx(buf->x, layer->w3->fpx, buf->xg, C, conf->mlp_dim, true);
     }
     else
     {
-      float xscale = (float)quantize_act(buf->xg_i8, buf->xg, conf->mlp_dim);
-      gemv_int8(buf->x, layer->w3, buf->xg_i8, C, conf->mlp_dim, xscale);
+      floatx xscale = quantize_act(buf->xg_i8, buf->xg, conf->mlp_dim, true);
+      gemv_int8(buf->x, layer->w3->i8.q, layer->w3->i8.scales, buf->xg_i8,
+          xscale, C, conf->mlp_dim, true);
     }
     warn_stats("down_proj", buf->x, C, l, pos, 8);
 
     if (conf->post_mlp_norm)
     {
-      rmsnorm_omp(buf->x, buf->x, layer->n4, C, conf->eps);
+      rmsnorm(buf->x, buf->x, layer->n4, C, conf->eps, true);
       warn_stats("norm4", buf->x, C, l, pos, 8);
     }
 
     // Second residual
     x     = buf->x;
     resid = buf->resid;
-    #pragma omp simd
-    for (int d = 0; d < C; d++) { buf->x[d] = clamp_fp16(x[d] + resid[d]); }
+    for (int d = 0; d < C; d++) { buf->x[d] = clamp_fpx(x[d] + resid[d]); }
     warn_stats("resid2", buf->x, C, l, pos, 8);
   }
 
-  // Final RMSNorm (logits are computed later in the sampling loop)
-  rmsnorm_omp(buf->x, buf->x, model->final_norm, C, conf->eps);
+  // Final RMSNorm
+  rmsnorm(buf->x, buf->x, model->final_norm, C, conf->eps, true);
+
+  // Compute logits (tied embedding)
+  if (!conf->quant)
+  {
+    gemv_fpx(
+        buf->logits, model->embedding->fpx, buf->x, conf->vocab_size, C, true);
+  }
+  else
+  {
+    floatx xscale = quantize_act(buf->x_i8, buf->x, C, true);
+    gemv_int8(buf->logits, model->embedding->i8.q, model->embedding->i8.scales,
+        buf->x_i8, xscale, conf->vocab_size, C, true);
+  }
+  return 0;
+}
+
+/* Language model forward (a chunk of tokens) */
+static int
+forward_gemma_chunk(GemmaModel *model,
+    GemmaBuffer                *buf,
+
+    int *tokens,
+    int  spos,
+    int  T,
+    bool causal,
+    bool compute_logits)
+{
+  if (buf->x_scales == NULL || buf->xo_scales == NULL || buf->xg_scales == NULL)
+  {
+    fprintf(stderr, "\nerror: scale buffers are not allocated\n");
+    return 1;
+  }
+
+  GemmaConfig *conf    = model->config;
+  int          C       = conf->embed_dim;
+  int          NH      = conf->n_heads;
+  int          NH_kv   = conf->n_kv_heads;
+  int          CH      = conf->head_dim;
+  int          Cq      = NH * CH;
+  int          Ckv     = NH_kv * CH;
+  int          CH_half = CH / 2;
+
+  int epos = spos + T - 1;
+
+  if (epos >= buf->cache_len)
+  {
+    fprintf(stderr, "\nerror: KV Cache is full\n");
+    return 1;
+  }
+
+  // Embedding lookup
+  #pragma omp parallel for
+  for (int t = 0; t < T; t++)
+  {
+    int token = tokens[t];
+    int off   = t * C;
+
+    for (int d = 0; d < C; d++)
+    {
+      if (!conf->quant)
+      {
+        buf->x[off + d] = model->embedding->fpx[token * C + d];  // * 1.0f
+      }
+      else
+      {
+        buf->x[off + d] = (floatx)model->embedding->i8.q[token * C + d] *
+                          model->embedding->i8.scales[token];
+      }
+    }
+  }
+
+  warn_stats("embedding", buf->x, T * C, 0, spos, 0);
+
+  // Precompute RoPE angles
+  #pragma omp parallel for
+  for (int t = 0; t < T; t++)
+  {
+    int pos = spos + t;
+    int off = t * CH;
+
+    for (int d = 0; d < CH_half; d++)
+    {
+      float freq;
+      float e = (float)(-2 * d) / (float)CH;
+
+      // Sliding window angles
+      freq                               = powf(conf->local_theta, e);
+      buf->csfreqs_slid[off + d * 2]     = (floatx)cosf(freq * (float)pos);
+      buf->csfreqs_slid[off + d * 2 + 1] = (floatx)sinf(freq * (float)pos);
+
+      // Full attention angles
+      freq                               = powf(conf->global_theta, e);
+      buf->csfreqs_full[off + d * 2]     = (floatx)cosf(freq * (float)pos);
+      buf->csfreqs_full[off + d * 2 + 1] = (floatx)sinf(freq * (float)pos);
+    }
+  }
+
+  floatx att_scale = (floatx)(1.0f / sqrtf((float)conf->q_scale));
+
+  for (int l = 0; l < conf->n_layers; l++)
+  {
+    GemmaDecoderLayer *layer = model->layers[l];
+
+    memcpy(buf->resid, buf->x, T * C * sizeof(*buf->x));
+
+    #pragma omp parallel for
+    for (int t = 0; t < T; t++)
+    {
+      floatx *x_row = buf->x + t * C;
+      rmsnorm(x_row, x_row, layer->n1, C, conf->eps, false);
+    }
+    warn_stats("norm1", buf->x, T * C, l, spos, 8);
+
+    // The attention block
+
+    if (conf->quant)
+    {
+      quantize_acts(buf->x_i8, buf->x_scales, buf->x, 0, T, C, true);
+    }
+
+    // Compute xq & xk & xv
+    #pragma omp parallel for
+    for (int h = 0; h < NH; h++)
+    {
+      floatx *xq_head = buf->xq + h * T * CH;  // (T, CH)
+      if (!conf->quant)
+      {
+        gemm_fpx(xq_head, 0, layer->wq->fpx + h * CH * C, buf->x, 0, T, CH, C,
+            false);
+      }
+      else
+      {
+        gemm_int8(xq_head, 0, layer->wq->i8.q + h * CH * C,
+            layer->wq->i8.scales + h * CH, buf->x_i8, 0, buf->x_scales, T, CH,
+            C, false);
+      }
+      if (h >= NH_kv) continue;
+
+      floatx *xk_head = buf->xk + h * T * CH;
+      floatx *xv_head = buf->xv + h * T * CH;
+
+      if (!conf->quant)
+      {
+        // (T, NH_kv, CH)
+        gemm_fpx(xk_head, 0, layer->wk->fpx + h * CH * C, buf->x, 0, T, CH, C,
+            false);
+        gemm_fpx(xv_head, 0, layer->wv->fpx + h * CH * C, buf->x, 0, T, CH, C,
+            false);
+      }
+      else
+      {
+        gemm_int8(xk_head, 0, layer->wk->i8.q + h * CH * C,
+            layer->wk->i8.scales + h * CH, buf->x_i8, 0, buf->x_scales, T, CH,
+            C, false);
+        gemm_int8(xv_head, 0, layer->wv->i8.q + h * CH * C,
+            layer->wv->i8.scales + h * CH, buf->x_i8, 0, buf->x_scales, T, CH,
+            C, false);
+      }
+    }
+
+    // Optional q & k norm
+    if (conf->qk_norm)
+    {
+      #pragma omp parallel for collapse(2)
+      for (int h = 0; h < NH; h++)
+      {
+        for (int t = 0; t < T; t++)
+        {
+          // Q norm
+          floatx *xq_head = buf->xq + h * T * CH + t * CH;
+          rmsnorm(xq_head, xq_head, layer->nq, CH, conf->eps, false);
+
+          if (h < NH_kv)
+          {
+            // K norm
+            floatx *xk_head = buf->xk + h * T * CH + t * CH;
+            rmsnorm(xk_head, xk_head, layer->nk, CH, conf->eps, false);
+          }
+        }
+      }
+    }
+
+    bool    is_local = conf->att_layers[l];
+    floatx *freqs_cs = is_local ? buf->csfreqs_slid : buf->csfreqs_full;
+
+    // RoPE
+    #pragma omp parallel for collapse(2)
+    for (int h = 0; h < NH + NH_kv; h++)
+      for (int t = 0; t < T; t++)
+      {
+        floatx *data;
+        if (h < NH)
+        {
+          data = buf->xq + h * T * CH + t * CH;  // Apply to queries
+        }
+        else
+        {
+          data = buf->xk + (h - NH) * T * CH + t * CH;  // Apply to keys
+        }
+
+        for (int d = 0; d < CH_half; d++)
+        {
+          float cfr = (float)freqs_cs[2 * d + t * CH];
+          float sfr = (float)freqs_cs[2 * d + 1 + t * CH];
+          float a   = (float)data[d];  // Index in the first half vector
+          float b   = (float)data[d + CH_half];  // ... second half vector
+          float r0  = a * cfr - b * sfr;
+          float r1  = a * sfr + b * cfr;
+
+          // Apply att_scale beforehand in this step, mathematically equivilant,
+          // but avoided scaling the entire T * max_k attention matrix
+          if (h < NH)
+          {
+            r0 *= (float)att_scale;
+            r1 *= (float)att_scale;
+          }
+
+          data[d]           = (floatx)r0;
+          data[d + CH_half] = (floatx)r1;
+        }
+      }
+
+    // (NH_kv, cache_len, CH)
+    floatx *k_cache = buf->kv_cache + l * 2 * buf->cache_len * Ckv;
+    floatx *v_cache = k_cache + buf->cache_len * Ckv;
+
+    // Write to kv_cache
+    for (int h = 0; h < NH_kv; h++)
+    {
+      floatx *xk_head = k_cache + h * buf->cache_len * CH + spos * CH;
+      floatx *xv_head = v_cache + h * buf->cache_len * CH + spos * CH;
+      memcpy(xk_head, buf->xk + h * T * CH, T * CH * sizeof(*buf->xk));
+      memcpy(xv_head, buf->xv + h * T * CH, T * CH * sizeof(*buf->xv));
+    }
+
+    int max_k = epos + 1;
+
+    #pragma omp parallel for
+    for (int h = 0; h < NH; h++)
+    {
+      int h_kv = h * NH_kv / NH;  // GQA mapping
+
+      // (T, max_k)
+      floatx *att_head = buf->att + h * T * max_k;  // att[h, :, :]
+      // (cache_len, CH)
+      floatx *xv_head = v_cache + h_kv * buf->cache_len * CH;
+      floatx *xo_head = buf->xo + h * CH;  // (T, CH), column stride Cq
+
+      /* Blockwise causal masking, the tiling algorithm used in the
+       * FlashAttention paper (Dao et al., 2022,
+       * https://arxiv.org/abs/2205.14135).
+       *
+       * The original algorithm was designed for GPUs to reduce HBM access,
+       * which is not a problem for CPUs, but the idea can also be used on CPUs
+       * to provide better performance for causal masking.
+       *
+       * Naively computing causal attention means either (a) materializing the
+       * full [T, attlen] score matrix and masking out the upper triangle
+       * afterwards (wastes ~half the compute), or (b) looping token by token
+       * with a triangular schedule (correct FLOP count, but ragged inner loop
+       * length basically kills vectorization across threads). So I tile both
+       * the query and key range into blocks and classify each (qb, kb) pair
+       * into five cases:
+       *
+       * kb > qb -> skip, every key in this block lies in the future of queries.
+       * kb < qb -> full GEMM, every key lies in the past of queries.
+       * kb = qb -> full GEMM & mask the upper triangle.
+       * kb < spos -> skip, every key in lies before the sliding window.
+       * kb = spos -> full GEMM & mask the lower triangle.
+       */
+
+      if (causal)  // Only apply tiling if causal=true
+      {
+        for (int q_start = 0; q_start < T; q_start += qk_block_size)
+        {
+          // xq[h, q_start:q_end, :] (q_end - q_start, CH)
+          floatx *qb          = buf->xq + h * T * CH + q_start * CH;
+          int     q_end       = MIN(q_start + qk_block_size, T);
+          int     abs_q_end   = spos + q_end;
+          int     abs_q_start = spos + q_start;
+          if (is_local && abs_q_start >= conf->slide_len)
+          {
+            abs_q_start = abs_q_start + 1 - conf->slide_len;
+          }
+          else { abs_q_start = 0; }
+          int spos_b = abs_q_start / qk_block_size * qk_block_size;
+
+          for (int k_start = spos_b; k_start < abs_q_end;
+               k_start += qk_block_size)
+          {
+            // k_cache[h_kv, k_start:k_end, :] (k_end - k_start, CH)
+            floatx *kb    = k_cache + h_kv * buf->cache_len * CH + k_start * CH;
+            int     k_end = MIN(k_start + qk_block_size, max_k);
+            floatx *att_b = att_head + q_start * max_k + k_start;
+
+            // Typically people don't quantize this
+            gemm_fpx(att_b, max_k, kb, qb, 0, q_end - q_start, k_end - k_start,
+                CH, false);
+
+            // Apply causal mask & sliding window mask
+            for (int qi = q_start; qi < q_end; qi++)
+            {
+              int pos_i  = spos + qi;
+              int spos_i = (is_local && pos_i >= conf->slide_len)
+                               ? (pos_i + 1 - conf->slide_len)
+                               : 0;
+              for (int ki = k_start; ki < k_end; ki++)
+              {
+                if (ki > pos_i || ki < spos_i)
+                {
+                  att_head[qi * max_k + ki] = 0.0f;
+                }
+              }
+            }
+          }
+          // Softmax & softcap for the rows
+          for (int qi = q_start; qi < q_end; qi++)
+          {
+            floatx *att_row = att_head + qi * max_k;
+            int     pos_i   = spos + qi;
+            int     spos_i  = (is_local && pos_i >= conf->slide_len)
+                                  ? (pos_i + 1 - conf->slide_len)
+                                  : 0;
+
+            // Optional tanh softcapping
+            if (conf->att_softcap != 0.0f)
+            {
+              for (int t = spos_i; t <= pos_i; t++)
+              {
+                float val  = (float)att_row[t] / conf->att_softcap;
+                att_row[t] = (floatx)(tanhf(val) * conf->att_softcap);
+              }
+            }
+            // only softmax in the range [spos_i, pos_i]
+            softmax(
+                att_row + spos_i, att_row + spos_i, pos_i - spos_i + 1, false);
+          }
+
+          // xo_block (qb_len, CH) = att_block (qb_len, qb_len)
+          //                       @ v_block   (qb_len, CH)
+          floatx *xo_block  = xo_head + q_start * Cq;
+          floatx *att_block = att_head + q_start * max_k + spos_b;
+          floatx *v_block   = xv_head + spos_b * CH;
+
+          gemm_fpx_nn(xo_block, /*dst_stride=*/Cq, v_block, att_block,
+              /*src_stride=*/max_k, q_end - q_start, CH, abs_q_end - spos_b,
+              false);
+        }
+      }
+      else  // causal=false, take the dense path
+      {
+        // (T, CH)
+        floatx *xq_head = buf->xq + h * T * CH;  // xq[h, :, :]
+        // k_cache[h_kv, :, :] (cache_len, CH)
+        floatx *xk_head = k_cache + h_kv * buf->cache_len * CH;
+        // att_head = xq_head @ xk_head.T
+        gemm_fpx(att_head, max_k, xk_head, xq_head, 0, T, max_k, CH, false);
+
+        for (int qi = 0; qi < T; qi++)
+        {
+          int     pos       = spos + qi;
+          bool    local_att = is_local && pos >= conf->slide_len;
+          int     att_spos  = local_att ? (pos + 1 - conf->slide_len) : 0;
+          floatx *att_row   = att_head + qi * max_k;
+
+          // Sliding window masking & optional tanh softcapping
+          for (int t = 0; t < max_k; t++)
+          {
+            if (local_att && t < att_spos) { att_row[t] = 0.0f; }
+            else if (conf->att_softcap != 0.0f)
+            {
+              float val  = (float)att_row[t] / conf->att_softcap;
+              att_row[t] = (floatx)(tanhf(val) * conf->att_softcap);
+            }
+          }
+          // Softmax
+          softmax(
+              att_row + att_spos, att_row + att_spos, max_k - att_spos, false);
+        }
+        // xo_head (T, CH) = att_head (T, max_k) @ xv_head[:max_k] (max_k, CH)
+        gemm_fpx_nn(xo_head, /*dst_stride=*/Cq, xv_head, att_head,
+            /*src_stride=*/max_k, T, CH, max_k, false);
+      }
+    }
+    // x (T, C) = xo_head (T, CH) @ wo.T (CH, C)
+    if (!conf->quant)
+    {
+      gemm_fpx(buf->x, 0, layer->wo->fpx, buf->xo, Cq, T, C, Cq, true);
+    }
+    else
+    {
+      quantize_acts(buf->xo_i8, buf->xo_scales, buf->xo, Cq, T, Cq, true);
+      gemm_int8(buf->x, 0, layer->wo->i8.q, layer->wo->i8.scales, buf->xo_i8, 0,
+          buf->xo_scales, T, C, Cq, true);
+    }
+    warn_stats("att_out", buf->x, T * C, l, spos, 8);
+
+    #pragma omp parallel for
+    for (int t = 0; t < T; t++)
+    {
+      floatx *x_row = buf->x + t * C;
+      rmsnorm(x_row, x_row, layer->n2, C, conf->eps, false);
+    }
+    warn_stats("norm2", buf->x, T * C, l, spos, 8);
+
+    // Combine the residual stream
+    floatx *restrict x     = buf->x;
+    floatx *restrict resid = buf->resid;
+    #pragma omp parallel for
+    for (int d = 0; d < T * C; d++) { buf->x[d] = clamp_fpx(x[d] + resid[d]); }
+    warn_stats("resid1", buf->x, T * C, l, spos, 8);
+
+    memcpy(buf->resid, buf->x, T * C * sizeof(*buf->x));
+
+    if (conf->pre_mlp_norm)
+    {
+      #pragma omp parallel for
+      for (int t = 0; t < T; t++)
+      {
+        floatx *x_row = buf->x + t * C;
+        rmsnorm(x_row, x_row, layer->n3, C, conf->eps, false);
+      }
+    }
+
+    // MLP
+    if (!conf->quant)
+    {
+      gemm_fpx(
+          buf->xu, 0, layer->w1->fpx, buf->x, 0, T, conf->mlp_dim, C, true);
+      gemm_fpx(
+          buf->xg, 0, layer->w2->fpx, buf->x, 0, T, conf->mlp_dim, C, true);
+    }
+    else
+    {
+      quantize_acts(buf->x_i8, buf->x_scales, buf->x, 0, T, C, true);
+      gemm_int8(buf->xu, 0, layer->w1->i8.q, layer->w1->i8.scales, buf->x_i8, 0,
+          buf->x_scales, T, conf->mlp_dim, C, true);
+      gemm_int8(buf->xg, 0, layer->w2->i8.q, layer->w2->i8.scales, buf->x_i8, 0,
+          buf->x_scales, T, conf->mlp_dim, C, true);
+    }
+
+    // GELU gate
+    #pragma omp parallel for
+    for (int d = 0; d < T * conf->mlp_dim; d++)
+    {
+      // Tanh approximation of GELU
+      float x    = (float)buf->xg[d];
+      float c    = 0.79788456080287f;  // = sqrt(2 / pi)
+      x          = 0.5 * x * (1 + tanhf(c * (x + 0.044715 * x * x * x)));
+      buf->xg[d] = (floatx)x;
+      buf->xg[d] *= buf->xu[d];  // Fuse xg * xu into xg
+    }
+
+    // Down projection
+    if (!conf->quant)
+    {
+      gemm_fpx(
+          buf->x, 0, layer->w3->fpx, buf->xg, 0, T, C, conf->mlp_dim, true);
+    }
+    else
+    {
+      quantize_acts(
+          buf->xg_i8, buf->xg_scales, buf->xg, 0, T, conf->mlp_dim, true);
+      gemm_int8(buf->x, 0, layer->w3->i8.q, layer->w3->i8.scales, buf->xg_i8, 0,
+          buf->xg_scales, T, C, conf->mlp_dim, true);
+    }
+    warn_stats("down_proj", buf->x, T * C, l, spos, 8);
+
+    if (conf->post_mlp_norm)
+    {
+      #pragma omp parallel for
+      for (int t = 0; t < T; t++)
+      {
+        floatx *x_row = buf->x + t * C;
+        rmsnorm(x_row, x_row, layer->n4, C, conf->eps, false);
+      }
+    }
+
+    // Second residual
+    x     = buf->x;
+    resid = buf->resid;
+    #pragma omp parallel for
+    for (int d = 0; d < T * C; d++) { buf->x[d] = clamp_fpx(x[d] + resid[d]); }
+    warn_stats("resid2", buf->x, T * C, l, spos, 8);
+  }
+
+  // Final RMSNorm
+  #pragma omp parallel for
+  for (int t = 0; t < T; t++)
+  {
+    floatx *x_row = buf->x + t * C;
+    rmsnorm(x_row, x_row, model->final_norm, C, conf->eps, false);
+  }
+
+  // Compute logits (tied embedding)
+  if (compute_logits)
+  {
+    floatx *last_x = buf->x + (T - 1) * C;
+    if (!conf->quant)
+    {
+      gemv_fpx(buf->logits, model->embedding->fpx, last_x, conf->vocab_size, C,
+          true);
+    }
+    else
+    {
+      floatx xscale = quantize_act(buf->x_i8, last_x, C, true);
+      gemv_int8(buf->logits, model->embedding->i8.q,
+          model->embedding->i8.scales, buf->x_i8, xscale, conf->vocab_size, C,
+          true);
+    }
+  }
+  return 0;
+}
+
+/* Language model forward (multiple tokens) */
+int
+forward_gemma_prefill(GemmaModel *model,
+    GemmaBuffer                  *buf,
+
+    int *tokens,
+    int  spos,
+    int  chunk_size,
+    bool causal)
+{
+  int T = 0;
+  for (int *t = tokens; *t != EOF; t++) { T++; }
+
+  if (T <= 0)
+  {
+    fprintf(stderr, "\nerror: no tokens to prefill\n");
+    return 1;
+  }
+
+  if (chunk_size <= 0)
+  {
+    fprintf(stderr, "\nerror: invalid chunk_size\n");
+    return 1;
+  }
+
+  for (int off = 0; off < T; off += chunk_size)
+  {
+    int  cur_len       = MIN(chunk_size, T - off);
+    bool is_last_chunk = (off + cur_len == T);
+
+    int rc = forward_gemma_chunk(
+        model, buf, tokens + off, spos + off, cur_len, causal, is_last_chunk);
+    if (rc != 0) return rc;
+  }
+
   return 0;
 }
 
@@ -2201,16 +2965,17 @@ forward_gemma(GemmaModel *model, GemmaBuffer *buf, int tok, int pos)
 /* Sampling helpers                                                   */
 /* ------------------------------------------------------------------ */
 
+/* */
 static int
-argmax(_Float16 *logits, int vocab_size)
+argmax(floatx *logits, int vocab_size)
 {
   // Pick the index with the max value
-  int      max_idx = -1;
-  _Float16 max_val = -(_Float16)INFINITY;
+  int    max_idx = -1;
+  floatx max_val = -(floatx)INFINITY;
   #pragma omp parallel
   {
-    int      local_idx = -1;
-    _Float16 local_val = -(_Float16)INFINITY;
+    int    local_idx = -1;
+    floatx local_val = -(floatx)INFINITY;
     #pragma omp for nowait
     for (int i = 0; i < vocab_size; i++)
     {
@@ -2233,12 +2998,14 @@ argmax(_Float16 *logits, int vocab_size)
   return max_idx;
 }
 
+/* */
 typedef struct
 {
-  _Float16 val;
-  int      idx;
+  floatx val;
+  int    idx;
 } FloatIdx;
 
+/* */
 static inline void
 swap_fi(FloatIdx *a, FloatIdx *b)
 {
@@ -2259,6 +3026,7 @@ qs_rand(void)
   return (uint32_t)qs_rand_state;
 }
 
+/* */
 static int
 partition_desc(FloatIdx *arr, int lo, int hi)
 {
@@ -2266,7 +3034,7 @@ partition_desc(FloatIdx *arr, int lo, int hi)
   int r = (int)lo + (int)qs_rand() % (hi - lo + 1);
   swap_fi(&arr[r], &arr[hi]);
 
-  _Float16 pivot = arr[hi].val;
+  floatx pivot = arr[hi].val;
 
   int i = lo;
   for (int j = lo; j < hi; j++)
@@ -2291,8 +3059,9 @@ quickselect_topk(FloatIdx *arr, int lo, int hi, int k_idx)
   }
 }
 
+/* */
 static void
-apply_topk(_Float16 *logits, FloatIdx *logit_indices, int vocab_size, int k)
+apply_topk(floatx *logits, FloatIdx *logit_indices, int vocab_size, int k)
 {
   if (k <= 0) { k = 1; }
   if (k > vocab_size) { k = vocab_size; }
@@ -2308,7 +3077,7 @@ apply_topk(_Float16 *logits, FloatIdx *logit_indices, int vocab_size, int k)
 
   // Keep the top k channels
   #pragma omp parallel for
-  for (int i = 0; i < vocab_size; i++) { logits[i] = -(_Float16)INFINITY; }
+  for (int i = 0; i < vocab_size; i++) { logits[i] = -(floatx)INFINITY; }
   for (int i = 0; i < k; i++)
   {
     logits[logit_indices[i].idx] = logit_indices[i].val;
@@ -2333,16 +3102,18 @@ sift_down(FloatIdx *arr, int n, int i)
   }
 }
 
+/* */
 static void
 build_heap(FloatIdx *arr, int n)
 {
   for (int i = n / 2 - 1; i >= 0; i--) { sift_down(arr, n, i); }
 }
 
+/* */
 static void
-apply_topp(_Float16 *logits,
-    _Float16        *fpbuf,
-    FloatIdx        *logit_indices,
+apply_topp(floatx *logits,
+    floatx        *fpbuf,
+    FloatIdx      *logit_indices,
 
     int   vocab_size,
     int   k,
@@ -2350,7 +3121,7 @@ apply_topp(_Float16 *logits,
 {
   if (k > vocab_size) { k = vocab_size; }
   // Softmax to get the probs, store in fpbuf
-  softmax_omp(fpbuf, logits, vocab_size);
+  softmax(fpbuf, logits, vocab_size, true);
   int heap_size = (k == 0) ? vocab_size : k;
 
   if (k == 0)
@@ -2364,8 +3135,6 @@ apply_topp(_Float16 *logits,
   }
   else
   {
-    // topk typically uses values less than 100, no need to use omp
-    // here
     for (int i = 0; i < k; i++)
     {
       int idx = logit_indices[i].idx;  // Reuse the candidates from topk
@@ -2375,11 +3144,11 @@ apply_topp(_Float16 *logits,
   build_heap(logit_indices, heap_size);  // O(k)
 
   // fpbuf is now a copy of the original logits
-  memcpy(fpbuf, logits, vocab_size * sizeof(_Float16));
+  memcpy(fpbuf, logits, vocab_size * sizeof(floatx));
 
   // Set logits to -inf
   #pragma omp parallel for
-  for (int i = 0; i < vocab_size; i++) { logits[i] = -(_Float16)INFINITY; }
+  for (int i = 0; i < vocab_size; i++) { logits[i] = -(floatx)INFINITY; }
 
   float cum = 0.0f;  // Cumulative prob
 
@@ -2399,7 +3168,7 @@ apply_topp(_Float16 *logits,
 
 /* Simple repetition penalty */
 void
-apply_rpen(_Float16 *logits, bool *visited, int vocab_size, float rpen)
+apply_rpen(floatx *logits, bool *visited, int vocab_size, float rpen)
 {
   // rpen short for Repetition Penalty
   #pragma omp parallel for
@@ -2407,8 +3176,8 @@ apply_rpen(_Float16 *logits, bool *visited, int vocab_size, float rpen)
   {
     if (!visited[i]) continue;
     float val = (float)logits[i];
-    if (val > 0.0f) { logits[i] = (_Float16)(val / rpen); }
-    else { logits[i] = (_Float16)(val * rpen); }
+    if (val > 0.0f) { logits[i] = (floatx)(val / rpen); }
+    else { logits[i] = (floatx)(val * rpen); }
   }
 }
 
@@ -2423,6 +3192,7 @@ sample(GemmaModel *model,
 
     int  *tokens,
     int   seqlen,
+    int   chunk_size,
     float temperature,
     int   topk,
     float topp,
@@ -2461,8 +3231,15 @@ sample(GemmaModel *model,
 
   // Prefill all the prompt tokens except the last one
   prefill_start = clock();
-  pos           = 0;
-  for (int *t = tokens; *t != EOF && *(t + 1) != EOF; t++)
+  if (forward_gemma_prefill(model, buf, tokens, pos, chunk_size, true) == 1)
+  {
+    goto end;
+  }
+  prefill_end = clock();
+  double prefill_elapsed =
+      (double)(prefill_end - prefill_start) / CLOCKS_PER_SEC;
+
+  for (int *t = tokens; *t != EOF; t++)
   {
     if (g_interrupted)
     {
@@ -2470,18 +3247,11 @@ sample(GemmaModel *model,
       return;
     }
     if (use_rpen) { visited[*t] = true; }
-    if (forward_gemma(model, buf, *t, pos++) == 1)
-    {
-      goto end;
-    }  // forward with the current pos
+    pos++;
   }
-  prefill_end = clock();
-  double prefill_elapsed =
-      (double)(prefill_end - prefill_start) / CLOCKS_PER_SEC;
-  prompt_toks = pos;
-
-  token           = tokens[pos];
-  _Float16 *probs = NULL;
+  prompt_toks   = pos;
+  token         = tokens[pos];
+  floatx *probs = NULL;
 
   // Only allocate probs if needed
   if (temperature != 0.0f) { MALLOC(probs, vs, "probs", goto end;); }
@@ -2500,22 +3270,7 @@ sample(GemmaModel *model,
   for (; pos < seqlen; pos++)
   {
     if (g_interrupted) break;
-
-    if (use_rpen) visited[token] = true;
-    if (forward_gemma(model, buf, token, pos) == 1) { goto end; }
-
-    // Compute logits from the final residual (tied embedding)
-    if (!conf->quant)
-    {
-      gemv_fp16(buf->logits, model->embedding, buf->x, vs, conf->embed_dim);
-    }
-    else
-    {
-      float xscale = (float)quantize_act(buf->x_i8, buf->x, conf->embed_dim);
-      gemv_int8(buf->logits, model->embedding, buf->x_i8, vs, conf->embed_dim,
-          xscale);
-    }
-
+    if (use_rpen) { visited[token] = true; }
     if (!dosample)
     {
       // Argmax sampling
@@ -2529,13 +3284,13 @@ sample(GemmaModel *model,
         for (int d = 0; d < conf->vocab_size; d++)
         {
           float val      = (float)buf->logits[d] / conf->logit_softcap;
-          buf->logits[d] = (_Float16)(tanhf(val) * conf->logit_softcap);
+          buf->logits[d] = (floatx)(tanhf(val) * conf->logit_softcap);
         }
       }
 
       // Apply the temperature
       #pragma omp parallel for
-      for (int d = 0; d < vs; d++) { buf->logits[d] /= (_Float16)temperature; }
+      for (int d = 0; d < vs; d++) { buf->logits[d] /= (floatx)temperature; }
 
       if (use_topk) { apply_topk(buf->logits, logit_indices, vs, topk); }
       if (use_topp)
@@ -2545,7 +3300,7 @@ sample(GemmaModel *model,
       if (use_rpen) { apply_rpen(buf->logits, visited, vs, rpen); }
 
       // Softmax to get the probs
-      softmax_omp(probs, buf->logits, vs);
+      softmax(probs, buf->logits, vs, true);
 
       // Multinomial sample from probs
       float r   = (float)((float)rand() / (RAND_MAX + 1.0));
@@ -2581,7 +3336,7 @@ sample(GemmaModel *model,
         }
         if (use_rpen) { visited[token] = true; }
         // Forward with the next pos
-        if (forward_gemma(model, buf, token, ++pos) == 1)
+        if (forward_gemma_decode(model, buf, token, ++pos) == 1)
         {
           free(ret);
           goto end;
@@ -2595,7 +3350,8 @@ sample(GemmaModel *model,
       token = ret[i];  // The last element
       free(ret);
     }
-    // ret == NULL: do nothing
+    // ret == NULL: compute the next logits
+    if (forward_gemma_decode(model, buf, token, pos) == 1) { goto end; }
   }
 
 end:
@@ -2626,6 +3382,7 @@ end:
 /* High-level generate / chat                                         */
 /* ------------------------------------------------------------------ */
 
+/* */
 static int *
 generate_callback(int token, GemmaTokenizer *tok, bool *quit)
 {
@@ -2636,12 +3393,14 @@ generate_callback(int token, GemmaTokenizer *tok, bool *quit)
   return NULL;
 }
 
+/* */
 int
 generate(GemmaModel *model,
     GemmaBuffer     *buf,
 
     const char *prompt,
     int         seqlen,
+    int         chunk_size,
     float       temperature,
     int         topk,
     float       topp,
@@ -2658,7 +3417,7 @@ generate(GemmaModel *model,
   encode(tok, prompt, tokens + 1, &n_tokens);
   tokens[n_tokens] = EOF;
 
-  sample(model, buf, tokens, seqlen, temperature, topk, topp, rpen,
+  sample(model, buf, tokens, seqlen, chunk_size, temperature, topk, topp, rpen,
       generate_callback);
 
   return 0;
@@ -2674,15 +3433,18 @@ new_turn(GemmaTokenizer *tok, bool bos, bool *quit)
   char user_prompt[65536];
   if (fgets(user_prompt, sizeof(user_prompt), stdin) == NULL)
   {
-    fprintf(stderr, "Failed to read user input\n");
+    if (!g_interrupted)
+    {
+      fprintf(stderr, "\nerror: failed to read user input\n");
+    }
     *quit = true;
   }
   user_prompt[strcspn(user_prompt, "\n")] = '\0';
 
-  /* Template:
-   * [<bos>]<start_of_turn>user\n
-   * {user text}<end_of_turn>\n
-   * <start_of_turn>model\n */
+  /* Template (from https://ai.google.dev/gemma/docs/core/prompt-structure):
+   * <start_of_turn>user\n
+   * What is Cramer's Rule?<end_of_turn>\n
+   * <start_of_turn>model */
 
   int n_tokens = 0;
   int size =
@@ -2708,6 +3470,7 @@ new_turn(GemmaTokenizer *tok, bool bos, bool *quit)
   return tokens;
 }
 
+/* */
 static int *
 chat_callback(int token, GemmaTokenizer *tok, bool *quit)
 {
@@ -2721,11 +3484,13 @@ chat_callback(int token, GemmaTokenizer *tok, bool *quit)
   return NULL;
 }
 
+/* */
 int
 chat(GemmaModel *model,
     GemmaBuffer *buf,
 
     int   seqlen,
+    int   chunk_size,
     float temperature,
     int   topk,
     float topp,
@@ -2734,8 +3499,8 @@ chat(GemmaModel *model,
   bool quit       = false;
   int *first_turn = new_turn(model->tokenizer, true, &quit);
   if (quit) { return 1; }
-  sample(model, buf, first_turn, seqlen, temperature, topk, topp, rpen,
-      chat_callback);
+  sample(model, buf, first_turn, seqlen, chunk_size, temperature, topk, topp,
+      rpen, chat_callback);
   free(first_turn);
   return 0;
 }
@@ -2744,6 +3509,7 @@ chat(GemmaModel *model,
 /* CLI helpers                                                        */
 /* ------------------------------------------------------------------ */
 
+/* */
 static inline bool
 safe_atoui(const char *str, unsigned int *result)
 {
@@ -2768,6 +3534,7 @@ safe_atoui(const char *str, unsigned int *result)
   return true;
 }
 
+/* */
 static inline bool
 safe_atof(const char *str, float *result)
 {
@@ -2792,47 +3559,10 @@ safe_atof(const char *str, float *result)
   return true;
 }
 
-void
-print_usage(void)
-{
-  // clang-format off
-  printf(
-  "Usage:\n"
-  "  ./gemma <modelfile> [options]\n"
-  "\n"
-  "Arguments:\n"
-  "  modelfile              Path to the model file\n"
-  "\n"
-  "Options:\n"
-  "  -l, --seqlen <N>       Set sequence length (default: 16384)\n"
-  "  -k, --topk <N>         Set top-k sampling value (default: 0)\n"
-  "  -s, --seed <N>         Set random seed\n"
-  "                         (default: current time)\n"
-  "  -t, --temperature <F>  Set temperature value, must be >= 0.0\n"
-  "                         (default: 1.0)\n"
-  "  -p, --topp <F>         Set top-p sampling value, must be 0.0 < p <= 1.0\n"
-  "                         (default: 1.0)\n"
-  "  -r, --rpen <F>         Set repetition penalty, must be >= 1.0\n"
-  "                         (default: 1.0)\n"
-  "  -i, --prompt <S>       Set input prompt, ignored if chat mode is enabled\n"
-  "                         (default: \"Once upon a time\")\n"
-  "  -c, --chat             Enable chat mode\n"
-  "  -m, --enable-mm        Enable multi-modal capability, if supported by the model\n"
-  "  -h, --help             Display this help message\n"
-  "\n"
-  "Controls:\n"
-  "  Ctrl+C                 Gracefully interrupt generation and exit\n"
-  "\n"
-  "Examples:\n"
-  "  ./gemma model.bin -l 2048 -t 0.8 -c\n"
-  "  ./gemma model.bin -i \"Hello I'm a language model,\"\\\n"
-  "      --seqlen 4096 --topk 50 --seed 12345\n");
-  // clang-format on
-}
-
 #ifdef _WIN32
 #  include <windows.h>
-// The default console encoding is kinda weird in Windows
+// The default console encoding is kinda weird on Windows
+/* */
 static void
 set_utf8_console(void)
 {
@@ -2840,7 +3570,7 @@ set_utf8_console(void)
   SetConsoleCP(65001);
 }
 
-// Convert Windows command line to UTF-8 argc/argv
+/* Convert Windows command line to UTF-8 argc/argv */
 static char **
 get_utf8_argv(int *argc_out)
 {
@@ -2874,6 +3604,7 @@ get_utf8_argv(int *argc_out)
   return argv;
 }
 
+/* */
 static void
 free_utf8_argv(char **argv, int argc)
 {
@@ -2884,11 +3615,13 @@ free_utf8_argv(char **argv, int argc)
 
 #else
 // No problem with POSIX though
+/* */
 static void
 set_utf8_console(void)
 {
 }
 
+/* */
 static char **
 get_utf8_argv(int *argc_out)
 {
@@ -2896,6 +3629,7 @@ get_utf8_argv(int *argc_out)
   return NULL;
 }
 
+/* */
 static void
 free_utf8_argv(char **argv, int argc)
 {
@@ -2904,12 +3638,13 @@ free_utf8_argv(char **argv, int argc)
 }
 #endif
 
+/* */
 static const char *
 safe_get_arg(int i, int argc, char **argv)
 {
   if (i + 1 >= argc)
   {
-    fprintf(stderr, "Error: Option '%s' requires an argument.\n", argv[i]);
+    fprintf(stderr, "error: option '%s' requires an argument.\n", argv[i]);
     return NULL;
   }
   return argv[i + 1];
@@ -2940,7 +3675,7 @@ print_model_config(GemmaModel *model, int seqlen, bool enable_mm)
   printf("  %-*s: %d\n", width, "mlp_dim", conf->mlp_dim);
   printf("  %-*s: %d\n", width, "q_scale", conf->q_scale);
   printf("  %-*s: %d\n", width, "slide_len", conf->slide_len);
-  printf("  %-*s: %d\n", width, "tpi", conf->tpi);
+  printf("  %-*s: %d\n", width, "image_toks", conf->image_toks);
   printf("  %-*s: %d\n", width, "max_seqlen", conf->max_seqlen);
   printf("  %-*s: %d\n", width, "vocab_size", conf->vocab_size);
 
@@ -2993,12 +3728,12 @@ print_model_config(GemmaModel *model, int seqlen, bool enable_mm)
   // Embedding
   if (!conf->quant)
   {
-    total += conf->embed_dim * conf->vocab_size * sizeof(_Float16);
+    total += conf->embed_dim * conf->vocab_size * sizeof(floatx);
   }
   else
   {
     total += conf->embed_dim * conf->vocab_size * sizeof(int8_t);
-    total += conf->vocab_size * sizeof(_Float16);  // scales
+    total += conf->vocab_size * sizeof(floatx);  // scales
   }
 
   // Weights per layer
@@ -3011,30 +3746,30 @@ print_model_config(GemmaModel *model, int seqlen, bool enable_mm)
 
     int layer_params = C * Cq + C * Ckv + C * Ckv + Cq * C + C * CM * 3;
 
-    if (!conf->quant) { total += layer_params * sizeof(_Float16); }
+    if (!conf->quant) { total += layer_params * sizeof(floatx); }
     else
     {
       total += layer_params * sizeof(int8_t);
-      total += (Cq + Ckv + Ckv + C * 2 + CM * 2) * sizeof(_Float16);  // scales
+      total += (Cq + Ckv + Ckv + C * 2 + CM * 2) * sizeof(floatx);  // scales
     }
 
     // Norm layers
-    total += C * sizeof(_Float16);  // n1
-    total += C * sizeof(_Float16);  // n2
-    if (conf->qk_norm) { total += 2 * conf->head_dim * sizeof(_Float16); }
-    if (conf->pre_mlp_norm) { total += C * sizeof(_Float16); }
-    if (conf->post_mlp_norm) { total += C * sizeof(_Float16); }
+    total += C * sizeof(floatx);  // n1
+    total += C * sizeof(floatx);  // n2
+    if (conf->qk_norm) { total += 2 * conf->head_dim * sizeof(floatx); }
+    if (conf->pre_mlp_norm) { total += C * sizeof(floatx); }
+    if (conf->post_mlp_norm) { total += C * sizeof(floatx); }
   }
 
   // Final norm
-  total += conf->embed_dim * sizeof(_Float16);
+  total += conf->embed_dim * sizeof(floatx);
 
   printf("  %-*s: %.2f GB\n", width, "Weights",
       (float)total / (1024.0 * 1024.0 * 1024.0));
 
   // KV Cache
   int    Ckv            = conf->n_kv_heads * conf->head_dim;
-  size_t kv_cache_bytes = conf->n_layers * 2 * Ckv * sizeof(_Float16);
+  size_t kv_cache_bytes = conf->n_layers * 2 * Ckv * sizeof(floatx);
   printf("  %-*s: %.2f KB\n", width, "KV Cache (tok)",
       (float)kv_cache_bytes / 1024.0);
 
@@ -3063,20 +3798,19 @@ print_model_config(GemmaModel *model, int seqlen, bool enable_mm)
   }
 
   // Main buffers
-  buf_bytes +=
-      conf->n_layers * 2 * seqlen * Ckv * sizeof(_Float16);  // kv_cache
-  buf_bytes += conf->vocab_size * sizeof(_Float16);          // logits
-  buf_bytes += mult * conf->embed_dim * sizeof(_Float16);    // x
-  buf_bytes += mult * conf->embed_dim * sizeof(_Float16);    // resid
-  buf_bytes += mult * Cq * sizeof(_Float16);                 // xq
-  buf_bytes += mult * Ckv * sizeof(_Float16);                // xk
-  buf_bytes += mult * conf->head_dim * sizeof(_Float16);     // csfreqs_slid
-  buf_bytes += mult * conf->head_dim * sizeof(_Float16);     // csfreqs_full
-  buf_bytes += mult * Ckv * sizeof(_Float16);                // xv
-  buf_bytes += mult * Cq * sizeof(_Float16);                 // xo
-  buf_bytes += mult * conf->n_heads * seqlen * sizeof(_Float16);  // att
-  buf_bytes += mult * CM * sizeof(_Float16);                      // xg
-  buf_bytes += mult * CM * sizeof(_Float16);                      // xu
+  buf_bytes += conf->n_layers * 2 * seqlen * Ckv * sizeof(floatx);  // kv_cache
+  buf_bytes += conf->vocab_size * sizeof(floatx);                   // logits
+  buf_bytes += mult * conf->embed_dim * sizeof(floatx);             // x
+  buf_bytes += mult * conf->embed_dim * sizeof(floatx);             // resid
+  buf_bytes += mult * Cq * sizeof(floatx);                          // xq
+  buf_bytes += mult * Ckv * sizeof(floatx);                         // xk
+  buf_bytes += mult * conf->head_dim * sizeof(floatx);          // csfreqs_slid
+  buf_bytes += mult * conf->head_dim * sizeof(floatx);          // csfreqs_full
+  buf_bytes += mult * Ckv * sizeof(floatx);                     // xv
+  buf_bytes += mult * Cq * sizeof(floatx);                      // xo
+  buf_bytes += mult * conf->n_heads * seqlen * sizeof(floatx);  // att
+  buf_bytes += mult * CM * sizeof(floatx);                      // xg
+  buf_bytes += mult * CM * sizeof(floatx);                      // xu
 
   printf("  %-*s: %.2f MB\n", width, "Gemma Buffer",
       (float)buf_bytes / (1024.0 * 1024.0));
@@ -3098,20 +3832,20 @@ print_model_config(GemmaModel *model, int seqlen, bool enable_mm)
     if (conf->quant)
     {
       siglip_bytes += N * C * sizeof(int8_t);        // x_i8
-      siglip_bytes += N * sizeof(_Float16);          // x_scales
+      siglip_bytes += N * sizeof(floatx);            // x_scales
       siglip_bytes += N * mlp_dim * sizeof(int8_t);  // mlp_i8
-      siglip_bytes += N * sizeof(_Float16);          // mlp_scales
+      siglip_bytes += N * sizeof(floatx);            // mlp_scales
     }
 
     // Main buffers
-    siglip_bytes += N * C * sizeof(_Float16);            // x
-    siglip_bytes += N * C * sizeof(_Float16);            // resid
-    siglip_bytes += N * C * sizeof(_Float16);            // xq
-    siglip_bytes += N * C * sizeof(_Float16);            // xk
-    siglip_bytes += N * C * sizeof(_Float16);            // xv
-    siglip_bytes += N * C * sizeof(_Float16);            // att_out
-    siglip_bytes += N * mlp_dim * sizeof(_Float16);      // mlp_hidden
-    siglip_bytes += n_heads * N * N * sizeof(_Float16);  // scores
+    siglip_bytes += N * C * sizeof(floatx);            // x
+    siglip_bytes += N * C * sizeof(floatx);            // resid
+    siglip_bytes += N * C * sizeof(floatx);            // xq
+    siglip_bytes += N * C * sizeof(floatx);            // xk
+    siglip_bytes += N * C * sizeof(floatx);            // xv
+    siglip_bytes += N * C * sizeof(floatx);            // att_out
+    siglip_bytes += N * mlp_dim * sizeof(floatx);      // mlp_hidden
+    siglip_bytes += n_heads * N * N * sizeof(floatx);  // scores
 
     printf("  %-*s: %.2f MB\n", width, "SigLIP Buffer",
         (float)siglip_bytes / (1024.0 * 1024.0));
@@ -3121,10 +3855,54 @@ print_model_config(GemmaModel *model, int seqlen, bool enable_mm)
 #endif
 }
 
+/* */
+void
+print_usage(void)
+{
+  // clang-format off
+  printf(
+  "usage:\n"
+  "  ./gemma <modelfile> [options]\n"
+  "\n"
+  "arguments:\n"
+  "  modelfile              path to the model file\n"
+  "\n"
+  "options:\n"
+  "  -l, --seqlen <N>       set sequence length"
+                            " (default: " TOSTRING(DEFAULT_SEQLEN) ")\n"
+  "  -k, --topk <N>         set top-k sampling value"
+                            " (default: " TOSTRING(DEFAULT_TOPK) ")\n"
+  "  -s, --seed <N>         set random seed"
+                            " (default: current time)\n"
+  "  -u, --chunk <N>        set prefilling chunk size, must be >= 1"
+                            " (default: " TOSTRING(DEFAULT_CHUNK_SIZE) ")\n"
+  "  -t, --temperature <F>  set temperature value, must be >= 0.0"
+                            " (default: " TOSTRING(DEFAULT_TEMPERATURE) ")\n"
+  "  -p, --topp <F>         set top-p sampling value, must be 0.0 < p <= 1.0"
+                            " (default: " TOSTRING(DEFAULT_TOPP) ")\n"
+  "  -r, --rpen <F>         set repetition penalty, must be >= 1.0"
+                            " (default: " TOSTRING(DEFAULT_RPEN) ")\n"
+  "  -i, --prompt <S>       set input prompt, ignored if chat mode is enabled"
+                            " (default: \"" DEFAULT_PROMPT "\")\n"
+  "  -c, --chat             enable chat mode\n"
+  "  -m, --enable-mm        enable multi-modal capability, if supported by the model\n"
+  "  -h, --help, -?         display this help message\n"
+  "\n"
+  "controls:\n"
+  "  Ctrl+C                 gracefully interrupt generation and exit\n"
+  "\n"
+  "examples:\n"
+  "  ./gemma model.bin -l 2048 -t 0.8 -c\n"
+  "  ./gemma model.bin -i \"Hello I'm a language model,\""
+          "--seqlen 4096 --topk 50 --seed 12345\n");
+  // clang-format on
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                               */
 /* ------------------------------------------------------------------ */
 
+/* */
 int
 main(int argc, char **argv)
 {
@@ -3138,7 +3916,7 @@ main(int argc, char **argv)
   if (argc < 2)
   {
     print_usage();
-    printf("\nError: model filename is not provided\n");
+    printf("\nerror: model filename is not provided\n");
     if (utf8_argv != NULL) { free_utf8_argv(utf8_argv, argc); }
     return 1;
   }
@@ -3150,13 +3928,22 @@ main(int argc, char **argv)
     return 0;
   }
 
-  unsigned int seqlen      = 16384;
-  unsigned int topk        = 0;
+  const char *val;
+
+  // Set attention block sizes from environment variables
+  val = getenv("GEMMAC_Q_BLOCK_SIZE");
+  if (val != NULL) { safe_atoui(val, &qk_block_size); }
+  val = getenv("GEMMAC_KV_BLOCK_SIZE");
+  if (val != NULL) { safe_atoui(val, &qk_block_size); }
+
+  unsigned int seqlen      = DEFAULT_SEQLEN;
+  unsigned int topk        = DEFAULT_TOPK;
   unsigned int seed        = (unsigned int)time(NULL);
-  float        temperature = 1.0;
-  float        topp        = 1.0;
-  float        rpen        = 1.0;
-  const char  *prompt      = "Once upon a time";
+  unsigned int chunk_size  = DEFAULT_CHUNK_SIZE;
+  float        temperature = DEFAULT_TEMPERATURE;
+  float        topp        = DEFAULT_TOPP;
+  float        rpen        = DEFAULT_RPEN;
+  const char  *prompt      = DEFAULT_PROMPT;
   bool         chatmode    = false;
   bool         enable_mm   = false;
 
@@ -3167,67 +3954,78 @@ main(int argc, char **argv)
 
     if (strcmp(arg, "-l") == 0 || strcmp(arg, "--seqlen") == 0)
     {
-      const char *val = safe_get_arg(i++, argc, argv);
+      val = safe_get_arg(i++, argc, argv);
       if (!val) { return 1; }
       if (!safe_atoui(val, &seqlen))
       {
-        fprintf(stderr, "Invalid number for --seqlen: %s\n", val);
+        fprintf(stderr, "error: invalid number for --seqlen: %s\n", val);
         return 1;
       }
     }
     else if (strcmp(arg, "-k") == 0 || strcmp(arg, "--topk") == 0)
     {
-      const char *val = safe_get_arg(i++, argc, argv);
+      val = safe_get_arg(i++, argc, argv);
       if (!val) { return 1; }
       if (!safe_atoui(val, &topk))
       {
-        fprintf(stderr, "Invalid number for --topk: %s\n", val);
+        fprintf(stderr, "error: invalid number for --topk: %s\n", val);
         return 1;
       }
     }
     else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--seed") == 0)
     {
-      const char *val = safe_get_arg(i++, argc, argv);
+      val = safe_get_arg(i++, argc, argv);
       if (!val) { return 1; }
       if (!safe_atoui(val, &seed))
       {
-        fprintf(stderr, "Invalid number for --seed: %s\n", val);
+        fprintf(stderr, "error: invalid number for --seed: %s\n", val);
+        return 1;
+      }
+    }
+    else if (strcmp(arg, "-u") == 0 || strcmp(arg, "--chunk") == 0)
+    {
+      val = safe_get_arg(i++, argc, argv);
+      if (!val) { return 1; }
+      if (!safe_atoui(val, &chunk_size))
+      {
+        fprintf(stderr, "error: invalid number for --chunk: %s\n", val);
         return 1;
       }
     }
     else if (strcmp(arg, "-t") == 0 || strcmp(arg, "--temperature") == 0)
     {
-      const char *val = safe_get_arg(i++, argc, argv);
+      val = safe_get_arg(i++, argc, argv);
       if (!val) { return 1; }
       if (!safe_atof(val, &temperature) || temperature < 0.0f)
       {
-        fprintf(stderr, "Invalid temperature: %s (must be >= 0)\n", val);
+        fprintf(stderr, "error: invalid temperature: %s (must be >= 0)\n", val);
         return 1;
       }
     }
     else if (strcmp(arg, "-p") == 0 || strcmp(arg, "--topp") == 0)
     {
-      const char *val = safe_get_arg(i++, argc, argv);
+      val = safe_get_arg(i++, argc, argv);
       if (!val) { return 1; }
       if (!safe_atof(val, &topp) || topp <= 0.0f || topp > 1.0f)
       {
-        fprintf(stderr, "Invalid top-p: %s (must be 0 < p <= 1)\n", val);
+        fprintf(stderr, "error: invalid top-p: %s (must be 0 < p <= 1)\n", val);
         return 1;
       }
     }
     else if (strcmp(arg, "-r") == 0 || strcmp(arg, "--rpen") == 0)
     {
-      const char *val = safe_get_arg(i++, argc, argv);
+      val = safe_get_arg(i++, argc, argv);
       if (!val) { return 1; }
       if (!safe_atof(val, &rpen) || rpen < 1.0f)
       {
-        fprintf(stderr, "Invalid repetition penalty: %s (must be >= 1)\n", val);
+        fprintf(stderr,
+            "error: invalid repetition penalty: %s (must be >= 1)\n", val);
         return 1;
       }
     }
     else if (strcmp(arg, "-i") == 0 || strcmp(arg, "--prompt") == 0)
     {
-      const char *val = safe_get_arg(i++, argc, argv);
+      val = safe_get_arg(i++, argc, argv);
       if (!val) { return 1; }
       prompt = val;
     }
@@ -3239,14 +4037,15 @@ main(int argc, char **argv)
     {
       enable_mm = true;
     }
-    else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0)
+    else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0 ||
+             strcmp(arg, "-?") == 0)
     {
       print_usage();
       return 0;
     }
     else
     {
-      fprintf(stderr, "Unknown option: %s\n", arg);
+      fprintf(stderr, "error: unknown option: %s\n", arg);
       print_usage();
       return 1;
     }
@@ -3265,7 +4064,7 @@ main(int argc, char **argv)
   conf = model->config;
   if (model->vision_enc != NULL) { vconf = model->vision_enc->config; }
 
-  buf = malloc_buffer(conf, vconf, (int)seqlen, enable_mm);
+  buf = malloc_buffer(conf, vconf, (int)seqlen, (int)chunk_size, enable_mm);
   if (buf == NULL) { goto end; }
 
   // malloc buffer for SigLIP
@@ -3278,15 +4077,16 @@ main(int argc, char **argv)
 
   if (chatmode)
   {
-    chat(model, buf, (int)seqlen, temperature, (int)topk, topp, rpen);
+    chat(model, buf, (int)seqlen, (int)chunk_size, temperature, (int)topk, topp,
+        rpen);
   }
   else
   {
-    generate(
-        model, buf, prompt, (int)seqlen, temperature, (int)topk, topp, rpen);
+    generate(model, buf, prompt, (int)seqlen, (int)chunk_size, temperature,
+        (int)topk, topp, rpen);
   }
 
-  if (g_interrupted) { printf("\n\nInterrupted by user\n"); }
+  if (g_interrupted) { printf("\n\ninterrupted by user\n"); }
 
 end:
   free_utf8_argv(utf8_argv, argc);
