@@ -360,11 +360,6 @@ def export_hf(
             if quant:
                 del emb  # type: ignore
 
-        # NOTE: Do NOT multiply emb_weight by act_scale
-        # Embedding is weight-tied with lm_head. Scaling it would scale the logits
-        # and is equivalent to a large temperature change, which destroys sampling.
-        write_emb("embed_tokens.weight", trunc=vocab_len)
-
         def write_linears(*names, prefix=text_prefix, scale_last: float | None = None):
             weights = [get(n, prefix) for n in names]
             if scale_last is not None:
@@ -398,6 +393,11 @@ def export_hf(
                 pbar.update()
 
             del weights, weight_scalers
+
+        # NOTE: Do NOT multiply emb_weight by act_scale
+        # Embedding is weight-tied with lm_head. Scaling it would scale the logits
+        # and is equivalent to a large temperature change, which destroys sampling.
+        write_emb("embed_tokens.weight", trunc=vocab_len)
 
         # Write all the weights across all the layers
         for i in range(config.num_hidden_layers):

@@ -1,2 +1,2 @@
 *.ipynb linguist-documentation=true
-*.ipynb linguist-vendored=true
+*.cpp linguist-documentation=true
