@@ -142,7 +142,7 @@ class Linear(nn.Module):
             x_q = torch.round(x_fp32 / x_scale).clamp(-127, 127).to(torch.int8)
             # torch._int_mm is extremely slow on my CPU, and I can't find a better substitution
             # in the PyTorch ecosystem. You would need to write C++ extensions to really boost this up
-            out = torch._int_mm(x_q, weight)  # type: ignore
+            out = torch._int_mm(x_q, self.weight)  # type: ignore
             out = (out.float() * x_scale * self.weight_scaler.float()).to(self.dtype)
             return out.reshape(*orig_shape[:-1], -1).to(self.dtype)
         else:
@@ -320,17 +320,37 @@ class GemmaDecoderBlock(nn.Module):
         kv_cache: Tensor | None = None,  # (B, 2, n_kv_heads, max_seq_len, head_dim)
     ):
         resid = x
+        print("x:")
+        print(x)
         x = self.norm1.call(x)
+        print("norm1(x):")
+        print(x)
         x = self.attn.call(x, positions, freqs_cis, mask, kv_cache)
+        print("attn(x):")
+        print(x)
         x = self.norm2.call(x)
+        print("norm2.weight.data:")
+        print(self.norm2.weight.data)
+        print("norm2(x):")
+        print(x)
         x = x + resid
+        print("x + resid:")
+        print(x)
         resid = x
         if self.pre_ffwd_norm:
             x = self.norm3.call(x)
+            print("norm3(x):")
+            print(x)
         x = self.ffwd.call(x)
+        print("ffwd(x):")
+        print(x)
         if self.post_ffwd_norm:
             x = self.norm4.call(x)
+            print("norm4(x):")
+            print(x)
         x = x + resid
+        print("x + resid:")
+        print(x)
         return x
         
     call = cast_as(forward, nn.Module.__call__)
@@ -596,6 +616,7 @@ class GemmaModel(nn.Module):
             freqs_cis = self.local_freqs_cis if local_sliding else self.global_freqs_cis
             mask = local_mask if local_sliding else global_mask
             x = layer(x, positions, freqs_cis, mask, get_extra_arg(i))
+            break
 
         x = self.final_norm.call(x)
 

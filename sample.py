@@ -299,9 +299,4 @@ def generate(
 
 
 if __name__ == "__main__":
-    from torch.profiler import profile, ProfilerActivity
-
-    with profile(activities=[ProfilerActivity.CPU]) as prof:
-        chat("./exported/gemma-3-4b-it_q.bin", device="cpu", temperature=0.0)
-        
-    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=20))
+    chat("./exported/gemma-3-4b-it-fp16", device="cpu", temperature=0.0, seq_len=11)

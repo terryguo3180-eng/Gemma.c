@@ -34,4 +34,4 @@ $(TARGET): $(OBJECTS)
 
 clean:
 	$(RM) $(OBJECTS) $(TARGET) $(NULL)
-	$(RMDIR) $(NULL) 2>nul || true
+	$(RMDIR) $(NULL) 2>nul

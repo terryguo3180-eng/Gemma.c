@@ -169,10 +169,14 @@ def export_hf(
     # Detect the checkpoint's actual prefix for the text decoder stack (e.g. "model."
     # for plain Gemma LLMs, or "language_model.model." for Gemma3 VLM checkpoints)
     text_prefix = find_prefix(weights.weight_map, "embed_tokens.weight")
-    # Same for the vision tower
-    vision_prefix = find_prefix(weights.weight_map, "embeddings.patch_embedding.weight")
-    # And multi-modal projector
-    mmproj_prefix = find_prefix(weights.weight_map, "mm_soft_emb_norm.weight")
+
+    if isinstance(hf_model, GemmaVLMs):
+        # Same for the vision tower
+        vision_prefix = find_prefix(weights.weight_map, "embeddings.patch_embedding.weight")
+        # And multi-modal projector
+        mmproj_prefix = find_prefix(weights.weight_map, "mm_soft_emb_norm.weight")
+    else:
+        vision_prefix = mmproj_prefix = ""
 
     def get(local_name: str, prefix=text_prefix) -> torch.Tensor: 
         return weights.get(prefix + local_name).to(dtype)
@@ -324,7 +328,11 @@ def export_hf(
         def write_emb(name, prefix=text_prefix, t=False, trunc=None, scale=None):
             emb_weight = get(name, prefix)
             if trunc:
-                emb_weight = emb_weight[:trunc, :]
+                # .clone() (again) is critial, otherwise emb_weight.untyped_storage()
+                # will return the original storage without slicing, which results in writing
+                # tens of thousands of garbadge rows into the file.
+                # It took me a lifetime to trace this bug.
+                emb_weight = emb_weight[:trunc, :].clone()
             if t:
                 emb_weight = emb_weight.T
             if quant:
@@ -337,6 +345,13 @@ def export_hf(
                 emb_weight = emb.weight.data
             elif scale is not None:
                 emb_weight *= scale
+            # if name == "embed_tokens.weight":
+            #     print()
+            #     print("[export] embedding:")
+            #     print(emb_weight)
+            #     print("[export] embedding shape:")
+            #     print(emb_weight.shape)
+
             write_tensor(emb_weight)
             if quant:
                 write_tensor(emb.weight_scaler.data)  # type: ignore
@@ -369,7 +384,14 @@ def export_hf(
                     weights[i] = w_linear.weight.data.T
                     del w_linear
 
-            for wei, sca in zip(weights, weight_scalers):
+            for name, wei, sca in zip(names, weights, weight_scalers):
+                # if name == "layers.0.self_attn.q_proj.weight":
+                #     print()
+                #     print("[export] q_proj:")
+                #     print(wei)
+                #     print("[export] q_proj shape:")
+                #     print(wei.shape)
+
                 write_tensor(wei)
                 if sca is not None:
                     write_tensor(sca)
@@ -638,9 +660,9 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
         # Build model
         model = GemmaModel(
             config,
-            tokenizer.vocab["<start_of_image>"],
-            tokenizer.vocab["<end_of_image>"],
-            tokenizer.vocab["<image_soft_token>"],
+            tokenizer.vocab.get("<start_of_image>", -1),
+            tokenizer.vocab.get("<end_of_image>", -1),
+            tokenizer.vocab.get("<image_soft_token>", -1),
         )
 
         # Build weights
@@ -648,14 +670,19 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
             nbytes = torch.tensor([], dtype=dtype).element_size() * int(torch.prod(torch.tensor(shape)))
             data = f.read(nbytes)
             storage = torch.UntypedStorage.from_buffer(data, dtype=torch.uint8)
-            return torch.empty(shape, dtype=dtype).set_(storage.view(dtype))  # type: ignore
+            return torch.tensor(storage, dtype=dtype).view(shape)
 
         dtype_q = torch.int8 if quant else dtype
 
         model.embedding.weight.data = read_tensor((vocab_size, embed_dim), dtype_q)
+        # print("[load] embedding:")
+        # print(model.embedding.weight)
+        # print("[load] embedding shape:")
+        # print(model.embedding.weight.shape)
+
         if quant:
             model.embedding.weight_scaler.data = read_tensor((vocab_size,))
-
+    
         if is_multimodal:
             # Insert an extra row for <image_soft_token> to the embedding table
             extra = torch.zeros(1, embed_dim, dtype=model.embedding.weight.dtype)
@@ -675,6 +702,13 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
             layer.attn.q_proj.weight.data = read_tensor((head_dim * n_heads, embed_dim), dtype_q).T
             if quant:
                 layer.attn.q_proj.weight_scaler.data = read_tensor((head_dim * n_heads,))
+
+            # if i == 0:
+            #     print("[load] q_proj:")
+            #     print(layer.attn.q_proj.weight.data.T)
+            #     print("[load] q_proj shape:")
+            #     print(layer.attn.q_proj.weight.data.T.shape)
+
             layer.attn.k_proj.weight.data = read_tensor((head_dim * n_kv_heads, embed_dim), dtype_q).T
             if quant:
                 layer.attn.k_proj.weight_scaler.data = read_tensor((head_dim * n_kv_heads,))
