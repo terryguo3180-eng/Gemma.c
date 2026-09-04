@@ -299,4 +299,4 @@ def generate(
 
 
 if __name__ == "__main__":
-    chat("./exported/gemma-3-4b-it-fp16", device="cpu", temperature=0.0, seq_len=11)
+    chat("./exported/gemma-3-4b-it-fp16_q", device="cpu", temperature=0.0, seq_len=512)
