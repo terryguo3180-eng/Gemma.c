@@ -1,2 +1,3 @@
 InlayHints:
-  ParameterNames: false
+  ParameterNames: No
+  Designators: No
