@@ -33,7 +33,8 @@
  * configuration parameters, tokenizer vocabulary, and BPE merge rules in
  * a single file. The export script handles the conversion from the original
  * PyTorch checkpoint format into this inference-ready format, applying
- * quantization and reordering weights for optimal performance.
+ * quantization and reordering weights for optimal performance (Also fixing
+ * some annoying fp16 issues so I don't have to deal with them in this file).
  *
  * To compile the code, simply run:
  *
@@ -41,14 +42,14 @@
  *
  * Basic usage of the compiled binary is straightforward:
  *
- *   ./gemma model.bin -i "Hello I'm a language model, "
+ *   ./gemma model.bin --prompt "Hello I'm a language model, "
  *
  * This loads the model file, processes the prompt, and completes the prompt.
  * The model automatically handles all tokenization and decoding internally.
  *
  * For interactive multi-turn conversations, use the chat mode:
  *
- *   ./gemma model.bin -c
+ *   ./gemma model.bin --chat
  *
  * In chat mode, the program maintains conversation history across turns,
  * following the Gemma prompt format with <start_of_turn> and <end_of_turn>
@@ -58,7 +59,7 @@
  * Multimodal models can process images by specifying the image path in the
  * prompt using the @image{...} syntax. e.g.:
  *
- *   ./gemma model.bin -i "Looking at @image{photo.jpg}, we can see"
+ *   ./gemma model.bin --prompt "Looking at @image{photo.jpg}, we can see"
  *
  * or you can also use it in chat mode:
  *
@@ -66,19 +67,13 @@
  *
  * The image is loaded, resized to the model's expected input dimensions,
  * processed through the vision encoder, and the resulting soft tokens are
- * injected into the text token sequence.
- *
- * You can also disable the multimodal part using the `-d` / `--disable-mm` to
- * argument reduce some memory usage.
+ * injected into the text token sequence. You can also disable the multimodal
+ * part using the `--disable-mm` argument to reduce some memory usage.
  *
  * Most of the standard inference controls are available through command-line
  * options: sequence length, temperature, top-k and top-p sampling, repetition
- * penalty, and random seed.
- *
- * The code is designed to be memory-efficient, reusing buffers across
- * inference steps to minimize allocation overhead. The KV cache is
- * preallocated based on the maximum sequence length, and all intermediate
- * tensors are stored in reusable buffers.
+ * penalty, and random seed. Use `-?` / `--help` argument to check out all the
+ * usages.
  *
  * For developers looking to understand or extend the code, the
  * implementation is organized into clear functional sections: model loading,
@@ -86,12 +81,13 @@
  * strategies, and the main inference loop. The matrix multiplication kernels
  * are isolated and can be replaced / optimized independently.
  *
- * TerryGuo 09/05/2026
+ * TerryGuo 09/06/2026
  */
 
 #include <assert.h>
 #include <emmintrin.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
@@ -100,6 +96,357 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Global interruption flag
+static volatile sig_atomic_t g_interrupted = 0;
+
+#ifdef _WIN32
+// Some hairy code to handle a bunch of cross-platform utilities
+#  include <io.h>
+#  include <time.h>
+#  include <windows.h>
+
+#  define O_RDONLY     _O_RDONLY
+#  define O_WRONLY     _O_WRONLY
+#  define O_RDWR       _O_RDWR
+#  define O_APPEND     _O_APPEND
+#  define O_CREAT      _O_CREAT
+#  define O_TRUNC      _O_TRUNC
+#  define O_EXCL       _O_EXCL
+#  define O_TEXT       _O_TEXT
+#  define O_BINARY     _O_BINARY
+#  define O_RAW        _O_BINARY
+#  define O_TEMPORARY  _O_TEMPORARY
+#  define O_NOINHERIT  _O_NOINHERIT
+#  define O_SEQUENTIAL _O_SEQUENTIAL
+#  define O_RANDOM     _O_RANDOM
+
+#  define open  _open
+#  define close _close
+
+#  define PROT_NONE  0
+#  define PROT_READ  1
+#  define PROT_WRITE 2
+#  define PROT_EXEC  4
+
+#  define MAP_FILE      0
+#  define MAP_SHARED    1
+#  define MAP_PRIVATE   2
+#  define MAP_TYPE      0xf
+#  define MAP_FIXED     0x10
+#  define MAP_ANONYMOUS 0x20
+#  define MAP_ANON      MAP_ANONYMOUS
+
+#  define MAP_FAILED ((void *)-1)
+
+#  ifndef FILE_MAP_EXECUTE
+#    define FILE_MAP_EXECUTE 0x0020
+#  endif
+
+// mmap support on Windows
+
+/* */
+static uint32_t
+__map_mmap_prot_page(const int prot)
+{
+  uint32_t protect = 0;
+  if (prot == 0) return protect;
+  if ((prot & 4) != 0)
+  {
+    protect = ((prot & 2) != 0) ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_READ;
+  }
+  else
+  {
+    protect = ((prot & 2) != 0) ? PAGE_READWRITE : PAGE_READONLY;
+  }
+  return protect;
+}
+/* */
+static uint32_t
+__map_mmap_prot_file(const int prot)
+{
+  uint32_t desired_acc = 0;
+  if (prot == 0) return desired_acc;
+  if ((prot & 1) != 0) desired_acc |= FILE_MAP_READ;
+  if ((prot & 2) != 0) desired_acc |= FILE_MAP_WRITE;
+  if ((prot & 4) != 0) desired_acc |= FILE_MAP_EXECUTE;
+  return desired_acc;
+}
+/* */
+void *
+mmap(void *addr, size_t len, int prot, int flags, int fildes, int64_t off)
+{
+  HANDLE fm, h;
+  void  *map = (void *)-1;
+
+#  ifdef _MSC_VER
+#    pragma warning(push)
+#    pragma warning(disable : 4293)
+#  endif
+
+  const uint32_t dw_fileoff_low  = (uint32_t)(off & 0xFFFFFFFFL);
+  const uint32_t dw_fileoff_high = (uint32_t)((off >> 32) & 0xFFFFFFFFL);
+  const uint32_t protect         = __map_mmap_prot_page(prot);
+  const uint32_t desired_acc     = __map_mmap_prot_file(prot);
+  const int64_t  maxsize         = off + (int64_t)len;
+  const uint32_t dw_maxsize_low  = (uint32_t)(maxsize & 0xFFFFFFFFL);
+  const uint32_t dw_maxsize_high = (uint32_t)((maxsize >> 32) & 0xFFFFFFFFL);
+
+#  ifdef _MSC_VER
+#    pragma warning(pop)
+#  endif
+
+  errno = 0;
+  if (len == 0
+      // Unsupported flag combinations
+      || (flags & 0x10) != 0
+      // Unsupported protection combinations
+      || prot == 4)
+  {
+    errno = EINVAL;
+    return (void *)-1;
+  }
+  h = ((flags & 0x20) == 0) ? (HANDLE)_get_osfhandle(fildes)
+                            : INVALID_HANDLE_VALUE;
+  if ((flags & 0x20) == 0 && h == INVALID_HANDLE_VALUE)
+  {
+    errno = EBADF;
+    return (void *)-1;
+  }
+  fm = CreateFileMapping(
+      h, NULL, protect, dw_maxsize_high, dw_maxsize_low, NULL);
+  if (fm == NULL)
+  {
+    errno = GetLastError();
+    return (void *)-1;
+  }
+  map = MapViewOfFile(fm, desired_acc, dw_fileoff_high, dw_fileoff_low, len);
+  CloseHandle(fm);
+  if (map == NULL)
+  {
+    errno = GetLastError();
+    return (void *)-1;
+  }
+  return map;
+}
+/* */
+int
+munmap(void *addr, size_t len)
+{
+  if (UnmapViewOfFile(addr)) return 0;
+  errno = GetLastError();
+  return -1;
+}
+/* */
+int
+mprotect(void *addr, size_t len, int prot)
+{
+  uint32_t new_prot = __map_mmap_prot_page(prot);
+  DWORD    old_prot = 0;
+  if (VirtualProtect(addr, len, new_prot, &old_prot)) return 0;
+  errno = GetLastError();
+  return -1;
+}
+/* */
+int
+msync(void *addr, size_t len, int flags)
+{
+  if (FlushViewOfFile(addr, len)) return 0;
+  errno = GetLastError();
+  return -1;
+}
+/* */
+int
+mlock(const void *addr, size_t len)
+{
+  if (VirtualLock((LPVOID)addr, len)) return 0;
+  errno = GetLastError();
+  return -1;
+}
+/* */
+int
+munlock(const void *addr, size_t len)
+{
+  if (VirtualUnlock((LPVOID)addr, len)) return 0;
+  errno = GetLastError();
+  return -1;
+}
+
+// UTF-8 console encoding support on Windows
+
+/* */
+static void
+set_utf8_console(void)
+{
+  SetConsoleOutputCP(65001);
+  SetConsoleCP(65001);
+}
+
+/* Convert Windows command line to UTF-8 argc/argv */
+static char **
+get_utf8_argv(int *argc_out)
+{
+  wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), argc_out);
+  if (!wargv) return NULL;
+
+  char **argv = malloc((*argc_out + 1) * sizeof(char *));
+  if (!argv)
+  {
+    LocalFree(wargv);
+    return NULL;
+  }
+
+  for (int i = 0; i < *argc_out; i++)
+  {
+    int size =
+        WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+    argv[i] = malloc(size);
+    if (!argv[i])
+    {
+      for (int j = 0; j < i; j++)
+      {
+        free(argv[j]);
+      }
+
+      free(argv);
+      LocalFree(wargv);
+      return NULL;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], size, NULL, NULL);
+  }
+  argv[*argc_out] = NULL;
+
+  LocalFree(wargv);
+  return argv;
+}
+
+/* */
+static void
+free_utf8_argv(char **argv, int argc)
+{
+  if (argv == NULL) return;
+  for (int i = 0; i < argc; i++)
+  {
+    free(argv[i]);
+  }
+  free(argv);
+}
+
+// Interruption handling on Windows
+
+#  define SLEEP_SEC(sec) Sleep((sec) * 1000)
+#  define GETPID()       GetCurrentProcessId()
+/* */
+BOOL WINAPI
+console_handler_(DWORD dwCtrlType)
+{
+  switch (dwCtrlType)
+  {
+    case CTRL_C_EVENT:         // Ctrl+C
+    case CTRL_BREAK_EVENT:     // Ctrl+Break
+    case CTRL_CLOSE_EVENT:     // Closed console window
+    case CTRL_LOGOFF_EVENT:    // User logoff
+    case CTRL_SHUTDOWN_EVENT:  // System shutdown
+      g_interrupted = 1;
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+
+#else
+#  undef _POSIX_C_SOURCE
+#  define _POSIX_C_SOURCE 199309L
+#  include <stddef.h>
+#  include <sys/mman.h>
+#  include <time.h>
+#  include <unistd.h>
+
+#  define SLEEP_SEC(sec) sleep(sec)
+#  define GETPID()       getpid()
+
+/* */
+static void
+set_utf8_console(void)
+{
+}
+
+/* */
+static char **
+get_utf8_argv(int *argc_out)
+{
+  (void)argc_out;
+  return NULL;
+}
+
+/* */
+static void
+free_utf8_argv(char **argv, int argc)
+{
+  (void)argv;
+  (void)argc;
+}
+#endif  // _WIN32
+
+/* */
+static void
+signal_handler(int signum)
+{
+  (void)signum;
+  g_interrupted = 1;
+}
+
+/* */
+void
+setup_signal_handler(void)
+{
+#ifdef _WIN32
+  if (!SetConsoleCtrlHandler(console_handler_, TRUE))
+  {
+    // Should almost never happen
+    signal(SIGINT, signal_handler);
+  }
+#else
+  struct sigaction sa;
+  sa.sa_handler = signal_handler;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;
+
+  if (sigaction(SIGINT, &sa, NULL) == -1)
+  {
+    perror("sigaction(SIGINT)");
+  }
+  if (sigaction(SIGTERM, &sa, NULL) == -1)
+  {
+    perror("sigaction(SIGTERM)");
+  }
+#endif  // _WIN32
+}
+
+// Cross-platform wall time
+
+/* */
+static double
+now_sec(void)
+{
+#ifdef _WIN32
+  static LARGE_INTEGER freq;
+  static int           freq_init = 0;
+  LARGE_INTEGER        counter;
+
+  if (!freq_init)
+  {
+    QueryPerformanceFrequency(&freq);
+    freq_init = 1;
+  }
+  QueryPerformanceCounter(&counter);
+  return (double)counter.QuadPart / (double)freq.QuadPart;
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
+}
 
 /* This giant blob is a self-contained, pre-processed implementation of
  * "stb_image" and "stb_image_resize2". :D
@@ -111,7 +458,8 @@
  * directly here. The functions declared `extern` remain visible. (This blob
  * polluted the global namespace quite seriously, but I'm good with that ;-)
  *
- * The blob is treated as a black box, please do not edit it.
+ * The blob is treated as a black box, please do not edit it. Skip this part if
+ * you are reading the code.
  */
 
 // NOLINTBEGIN        // Tell clang-tidy to shutup
@@ -6010,15 +6358,6 @@ ub,int uc,void*ud,int ue,int uf,int ug,fr uh,fu ui,fs uj,ft uk){return(void*)tm
 
 // The actual code starts here :D
 
-#ifdef _WIN32
-#  include <time.h>
-#  include <windows.h>
-#else
-#  undef _POSIX_C_SOURCE
-#  define _POSIX_C_SOURCE 199309L
-#  include <time.h>
-#endif
-
 // Default values for cli
 #define DEFAULT_SEQLEN      16384
 #define DEFAULT_TOPK        0
@@ -6058,27 +6397,20 @@ ub,int uc,void*ud,int ue,int uf,int ug,fr uh,fu ui,fs uj,ft uk){return(void*)tm
 // clang-format off
 #if DTYPE == DTYPE_FP16
 #  define floatx     _Float16
-#  define DTYPE_STR  "float16"
-#  define DTYPE_CODE 1
+#  define DTYPE_MAGIC  "f16"
 #  define FLOATX_MAX (((union {floatx f; uint16_t b; }){.b = 0x00007BFF}).f)
 #elif DTYPE == DTYPE_BF16
 #  define floatx     __bf16
-#  define DTYPE_STR  "bfloat16"
-#  define DTYPE_CODE 2
+#  define DTYPE_MAGIC  "b16"
 #  define FLOATX_MAX (((union {floatx f; uint16_t b; }){.b = 0x00007F7F}).f)
 #elif DTYPE == DTYPE_FP32
 #  define floatx     float
-#  define DTYPE_STR  "float32"
-#  define DTYPE_CODE 3
+#  define DTYPE_MAGIC  "f32"
 #  define FLOATX_MAX (((union {floatx f; uint32_t b; }){.b = 0x7F7FFFFF}).f)
 #else
 #  error "unsupported DTYPE"
 #endif
-
 // clang-format on
-
-// Global interruption flag
-static volatile sig_atomic_t g_interrupted = 0;
 
 #ifdef min
 #  undef min
@@ -6099,95 +6431,6 @@ static inline int
 min(int a, int b)
 {
   return a < b ? a : b;
-}
-
-/* */
-static void
-signal_handler(int signum)
-{
-  (void)signum;
-  g_interrupted = 1;
-}
-
-// Cross-platform interruption handling
-
-#ifdef _WIN32
-#  include <windows.h>
-#  define SLEEP_SEC(sec) Sleep((sec) * 1000)
-#  define GETPID()       GetCurrentProcessId()
-/* */
-BOOL WINAPI
-console_handler_(DWORD dwCtrlType)
-{
-  switch (dwCtrlType)
-  {
-    case CTRL_C_EVENT:         // Ctrl+C
-    case CTRL_BREAK_EVENT:     // Ctrl+Break
-    case CTRL_CLOSE_EVENT:     // Closed console window
-    case CTRL_LOGOFF_EVENT:    // User logoff
-    case CTRL_SHUTDOWN_EVENT:  // System shutdown
-      g_interrupted = 1;
-      return TRUE;
-    default:
-      return FALSE;
-  }
-}
-#else
-#  include <unistd.h>
-#  define SLEEP_SEC(sec) sleep(sec)
-#  define GETPID()       getpid()
-#endif
-
-/* */
-void
-setup_signal_handler(void)
-{
-#ifdef _WIN32
-  if (!SetConsoleCtrlHandler(console_handler_, TRUE))
-  {
-    // Should almost never happen
-    signal(SIGINT, signal_handler);
-  }
-#else
-  struct sigaction sa;
-  sa.sa_handler = signal_handler;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = 0;
-
-  if (sigaction(SIGINT, &sa, NULL) == -1)
-  {
-    perror("sigaction(SIGINT)");
-  }
-  if (sigaction(SIGTERM, &sa, NULL) == -1)
-  {
-    perror("sigaction(SIGTERM)");
-  }
-#endif
-}
-
-// Cross-platform wall time
-
-/* */
-static double
-now_sec(void)
-{
-#ifdef _WIN32
-  static LARGE_INTEGER freq;
-  static int           freq_init = 0;
-  LARGE_INTEGER        counter;
-
-  if (!freq_init)
-  {
-    QueryPerformanceFrequency(&freq);
-    freq_init = 1;
-  }
-  QueryPerformanceCounter(&counter);
-  return (double)counter.QuadPart / (double)freq.QuadPart;
-#else
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-#endif
 }
 
 /* Poor man's memory wrappers, I just really dislike the redundency of writing
@@ -6241,7 +6484,18 @@ now_sec(void)
     var = fgetc(fp);                                          \
     if (var == EOF)                                           \
     {                                                         \
-      fprintf(stderr, "error: File read failed: %s", (name)); \
+      fprintf(stderr, "error: file read failed: %s", (name)); \
+      fail                                                    \
+    }                                                         \
+  }                                                           \
+  while (0)
+
+#define FSEEK(fp, offset, base, name, fail)                   \
+  do                                                          \
+  {                                                           \
+    if (fseek((fp), (offset), (base)) == EOF)                 \
+    {                                                         \
+      fprintf(stderr, "error: file seek failed: %s", (name)); \
       fail                                                    \
     }                                                         \
   }                                                           \
@@ -6313,33 +6567,6 @@ now_sec(void)
   }                                             \
   while (0)
 
-// Linear layer weights: either plain floatx or int8 + per-channel scales
-#define READ_LINEAR(w, fp, m, n, quant, name, fail)                            \
-  do                                                                           \
-  {                                                                            \
-    MALLOC((w), 1, (name), fail);                                              \
-    if (!(quant))                                                              \
-    {                                                                          \
-      (w)->dtype = DTYPE_FPX;                                                  \
-      char rlinear_fpx_name_[128];                                             \
-      snprintf(rlinear_fpx_name_, 128, "%s.fpx", (name));                      \
-      READ_TENSOR(                                                             \
-          (w)->fpx, (size_t)(m) * (size_t)(n), (fp), rlinear_fpx_name_, fail); \
-    }                                                                          \
-    else                                                                       \
-    {                                                                          \
-      (w)->dtype = DTYPE_INT8;                                                 \
-      char rlinear_i8q_name_[128];                                             \
-      char rlinear_i8scales_name_[128];                                        \
-      snprintf(rlinear_i8q_name_, 128, "%s.i8.q", (name));                     \
-      snprintf(rlinear_i8scales_name_, 128, "%s.i8.scales", (name));           \
-      READ_TENSOR((w)->i8.q, (size_t)(m) * (size_t)(n), (fp),                  \
-          rlinear_i8q_name_, fail);                                            \
-      READ_TENSOR((w)->i8.scales, (n), (fp), rlinear_i8scales_name_, fail);    \
-    }                                                                          \
-  }                                                                            \
-  while (0)
-
 /* Peek at how many bytes a sequence of pascal strings will occupy */
 static inline int
 get_strarr_bytes(FILE *fp, int count)
@@ -6385,6 +6612,38 @@ typedef struct
   float eps;         // LayerNorm epsilon
 } VisionConfig;
 
+/* */
+static VisionConfig *
+read_vision_config(FILE *fp)
+{
+  VisionConfig *vcfg;
+
+  const char *vcfg_name = "model.encoder.config";
+  const char *nl_name   = "model.encoder.config.n_layers";
+  const char *nh_name   = "model.encoder.config.n_heads";
+  const char *cm_name   = "model.encoder.config.mlp_dim";
+  const char *c_name    = "model.encoder.config.hidden_dim";
+  const char *is_name   = "model.encoder.config.image_size";
+  const char *ps_name   = "model.encoder.config.patch_size";
+  const char *eps_name  = "model.encoder.config.eps";
+
+  CALLOC(vcfg, 1, vcfg_name, goto fail;);
+
+  FGETC(vcfg->n_layers, fp, nl_name, goto fail;);
+  FGETC(vcfg->n_heads, fp, nh_name, goto fail;);
+  READ_UINT16(vcfg->mlp_dim, fp, cm_name, goto fail;);
+  READ_UINT16(vcfg->hidden_dim, fp, c_name, goto fail;);
+  READ_UINT16(vcfg->image_size, fp, is_name, goto fail;);
+  READ_UINT16(vcfg->patch_size, fp, ps_name, goto fail;);
+  READ_FP32(vcfg->eps, fp, eps_name, goto fail;);
+
+  return vcfg;
+
+fail:
+  free(vcfg);
+  return NULL;
+}
+
 /* Configuration for the main Gemma text encoder */
 typedef struct
 {
@@ -6418,6 +6677,92 @@ free_text_config(TextConfig *cfg)
   if (cfg == NULL) return;
   free(cfg->att_layers);
   free(cfg);
+}
+
+/* */
+static TextConfig *
+read_text_config(FILE *fp)
+{
+  TextConfig *cfg            = NULL;
+  char       *att_layers_buf = NULL;
+
+  const char *cfg_name = "model.decoder.config";
+  const char *nl_name  = "model.decoder.config.n_layers";
+  const char *nh_name  = "model.decoder.config.n_heads";
+  const char *nkv_name = "model.decoder.config.n_kv_heads";
+  const char *ch_name  = "model.decoder.config.head_dim";
+  const char *c_name   = "model.decoder.config.embed_dim";
+  const char *cm_name  = "model.decoder.config.mlp_dim";
+  const char *qs_name  = "model.decoder.config.q_scale";
+  const char *sl_name  = "model.decoder.config.slide_len";
+  const char *it_name  = "model.decoder.config.image_toks";
+  const char *msq_name = "model.decoder.config.max_seqlen";
+  const char *vs_name  = "model.decoder.config.vocab_size";
+  const char *lt_name  = "model.decoder.config.local_theta";
+  const char *gt_name  = "model.decoder.config.global_theta";
+  const char *eps_name = "model.decoder.config.eps";
+  const char *asc_name = "model.decoder.config.att_softcap";
+  const char *lgc_name = "model.decoder.config.logit_softcap";
+  const char *al_name  = "model.decoder.config.att_layers";
+  const char *ext_name = "model.decoder.config.extra_bytes";
+
+  CALLOC(cfg, 1, cfg_name, goto fail;);
+
+  FGETC(cfg->n_layers, fp, nl_name, goto fail;);
+  FGETC(cfg->n_heads, fp, nh_name, goto fail;);
+  FGETC(cfg->n_kv_heads, fp, nkv_name, goto fail;);
+
+  READ_UINT16(cfg->head_dim, fp, ch_name, goto fail;);
+  READ_UINT16(cfg->embed_dim, fp, c_name, goto fail;);
+  READ_UINT16(cfg->mlp_dim, fp, cm_name, goto fail;);
+  READ_UINT16(cfg->q_scale, fp, qs_name, goto fail;);
+  READ_UINT16(cfg->slide_len, fp, sl_name, goto fail;);
+  READ_UINT16(cfg->image_toks, fp, it_name, goto fail;);
+  READ_UINT32(cfg->max_seqlen, fp, msq_name, goto fail;);
+  READ_UINT32(cfg->vocab_size, fp, vs_name, goto fail;);
+
+  READ_FP32(cfg->local_theta, fp, lt_name, goto fail;);
+  READ_FP32(cfg->global_theta, fp, gt_name, goto fail;);
+  READ_FP32(cfg->eps, fp, eps_name, goto fail;);
+  READ_FP32(cfg->att_softcap, fp, asc_name, goto fail;);
+  READ_FP32(cfg->logit_softcap, fp, lgc_name, goto fail;);
+
+  // Packed bit-field of which layers use sliding-window attention
+  // A terrible terrible idea, wish I didn't do this
+  int n_bytes;
+  FGETC(n_bytes, fp, al_name, goto fail;);
+  if (n_bytes * 8 < cfg->n_layers)
+  {
+    fprintf(stderr, "error: insufficient att_layers bytes\n");
+    goto fail;
+  }
+  MALLOC(att_layers_buf, n_bytes, al_name, goto fail;);
+  MALLOC(cfg->att_layers, cfg->n_layers, al_name, goto fail;);
+  FREAD(att_layers_buf, n_bytes, fp, al_name, goto fail;);
+  for (int i = 0; i < cfg->n_layers; i++)
+  {
+    int pos            = i;
+    int byte_idx       = pos / 8;
+    int bit_idx        = 7 - (pos % 8);
+    cfg->att_layers[i] = (att_layers_buf[byte_idx] >> bit_idx) & 1;
+  }
+  free(att_layers_buf);
+  att_layers_buf = NULL;
+
+  // Extra feature flags packed into one byte
+  int extra_flags;
+  FGETC(extra_flags, fp, ext_name, goto fail;);
+  cfg->support_mm   = (extra_flags & 8) == 8;
+  cfg->qk_norm      = (extra_flags & 4) == 4;
+  cfg->pre_mlp_norm = (extra_flags & 2) == 2;
+  cfg->pst_mlp_norm = (extra_flags & 1) == 1;
+
+  return cfg;
+
+fail:
+  free_text_config(cfg);
+  free(att_layers_buf);
+  return NULL;
 }
 
 // Tokenizer implementation
@@ -6474,19 +6819,6 @@ typedef struct
   Merge *ranks;         // sorted merges for BPE
 } GemmaTokenizer;
 
-/* */
-static void
-free_tokenizer(GemmaTokenizer *tok)
-{
-  if (tok == NULL) return;
-  free(tok->vocab_data);
-  free(tok->merge_data);
-  free(tok->vocab);
-  free(tok->vocab_sorted);
-  free(tok->ranks);
-  free(tok);
-}
-
 /* Look up a string in the sorted vocab -> token id (or -1) */
 static int
 get_token_idx(GemmaTokenizer *tok, char *str)
@@ -6511,6 +6843,100 @@ get_merge_rec(GemmaTokenizer *tok, char *str1, char *str2)
   Merge *val = bsearch(
       &key, tok->ranks, tok->n_merges, sizeof(tok->ranks[0]), cmp_merge);
   return val;  // NULL if not found
+}
+
+/* */
+static void
+free_tokenizer(GemmaTokenizer *tok)
+{
+  if (tok == NULL) return;
+  free(tok->vocab_data);
+  free(tok->merge_data);
+  free(tok->vocab);
+  free(tok->vocab_sorted);
+  free(tok->ranks);
+  free(tok);
+}
+
+/* */
+static GemmaTokenizer *
+read_tokenizer(FILE *fp, TextConfig *cfg)
+{
+  GemmaTokenizer *tok;
+  CALLOC(tok, 1, "model.decoder.tokenizer", goto fail;);
+
+  tok->vocab_size = cfg->vocab_size;
+  if (cfg->support_mm)
+  {
+    tok->vocab_size++;
+  }  // ++ for the <image_soft_token>
+  int vocab_data_bytes = get_strarr_bytes(fp, tok->vocab_size);
+  if (vocab_data_bytes == -1) goto fail;
+
+  const char *vd_name = "model.decoder.tokenizer.vocab_data";
+  const char *vc_name = "model.decoder.tokenizer.vocab";
+  const char *vt_name = "model.decoder.tokenizer.vocab_sorted";
+
+  MALLOC(tok->vocab_data, vocab_data_bytes, vd_name, goto fail;);
+  MALLOC(tok->vocab, tok->vocab_size, vc_name, goto fail;);
+  MALLOC(tok->vocab_sorted, tok->vocab_size, vt_name, goto fail;);
+
+  int offset = 0;
+  for (int i = 0; i < tok->vocab_size; i++)
+  {
+    char name[64];
+    snprintf(name, sizeof(name), "%s.%d", vd_name, i);
+    char *str;
+    READ_STR(str, fp, tok->vocab_data, &offset, name, goto fail;);
+    tok->vocab[i]            = str;
+    tok->vocab_sorted[i].idx = i;
+    tok->vocab_sorted[i].val = str;
+  }
+  qsort(tok->vocab_sorted, tok->vocab_size, sizeof(tok->vocab_sorted[0]),
+      cmp_token);
+
+  // Special tokens
+  tok->bos = get_token_idx(tok, "<bos>");
+  tok->eos = get_token_idx(tok, "<eos>");
+  tok->sot = get_token_idx(tok, "<start_of_turn>");
+  tok->eot = get_token_idx(tok, "<end_of_turn>");
+  tok->soi = get_token_idx(tok, "<start_of_image>");
+  tok->eoi = get_token_idx(tok, "<end_of_image>");
+  tok->ist = get_token_idx(tok, "<image_soft_token>");
+
+  const char *nm_name = "model.decoder.tokenizer.n_merges";
+  const char *rk_name = "model.decoder.tokenizer.ranks";
+  const char *md_name = "model.decoder.tokenizer.merge_data";
+
+  // Build merges
+  READ_UINT32(tok->n_merges, fp, nm_name, goto fail;);
+  MALLOC(tok->ranks, tok->n_merges, rk_name, goto fail;);
+
+  int merge_bytes = get_strarr_bytes(fp, tok->n_merges * 2);
+  if (merge_bytes == -1) goto fail;
+  MALLOC(tok->merge_data, merge_bytes, md_name, goto fail;);
+
+  offset = 0;
+  for (int i = 0; i < tok->n_merges; i++)
+  {
+    char name0[64], name1[64];
+    snprintf(name0, sizeof(name0), "%s.%d.0", md_name, i);
+    snprintf(name1, sizeof(name1), "%s.%d.1", md_name, i);
+
+    char *str1, *str2;
+    READ_STR(str1, fp, tok->merge_data, &offset, name0, goto fail;);
+    READ_STR(str2, fp, tok->merge_data, &offset, name1, goto fail;);
+
+    tok->ranks[i].rank = i;
+    tok->ranks[i].str1 = str1;
+    tok->ranks[i].str2 = str2;
+  }
+  qsort(tok->ranks, tok->n_merges, sizeof(tok->ranks[0]), cmp_merge);
+  return tok;
+
+fail:
+  free_tokenizer(tok);
+  return NULL;
 }
 
 /* Minimal byte-pair encoding algorithm implementation */
@@ -6676,6 +7102,67 @@ typedef struct
 } Linear;
 
 /* */
+static inline size_t
+linear_size(int m, int n, bool quant)
+{
+  if (!quant)
+  {
+    return (size_t)m * n * sizeof(floatx);
+  }
+  else
+  {
+    return (size_t)m * n * sizeof(int8_t) + (size_t)n * sizeof(floatx);
+  }
+}
+
+// Linear layer weights: either plain floatx or int8 + per-channel scales
+#define READ_LINEAR(w, fp, m, n, quant, name, fail)                            \
+  do                                                                           \
+  {                                                                            \
+    MALLOC((w), 1, (name), fail);                                              \
+    if (!(quant))                                                              \
+    {                                                                          \
+      (w)->dtype = DTYPE_FPX;                                                  \
+      char rlinear_fpx_name_[128];                                             \
+      snprintf(rlinear_fpx_name_, 128, "%s.fpx", (name));                      \
+      READ_TENSOR(                                                             \
+          (w)->fpx, (size_t)(m) * (size_t)(n), (fp), rlinear_fpx_name_, fail); \
+    }                                                                          \
+    else                                                                       \
+    {                                                                          \
+      (w)->dtype = DTYPE_INT8;                                                 \
+      char rlinear_i8q_name_[128];                                             \
+      char rlinear_i8scales_name_[128];                                        \
+      snprintf(rlinear_i8q_name_, 128, "%s.i8.q", (name));                     \
+      snprintf(rlinear_i8scales_name_, 128, "%s.i8.scales", (name));           \
+      READ_TENSOR((w)->i8.q, (size_t)(m) * (size_t)(n), (fp),                  \
+          rlinear_i8q_name_, fail);                                            \
+      READ_TENSOR((w)->i8.scales, (n), (fp), rlinear_i8scales_name_, fail);    \
+    }                                                                          \
+  }                                                                            \
+  while (0)
+
+/* */
+static inline void
+mmap_linear(Linear *w, uint8_t *base, size_t *off, int m, int n, bool quant)
+{
+  if (!quant)
+  {
+    w->dtype = DTYPE_FPX;
+    w->fpx   = (floatx *)(base + *off);
+    *off += (size_t)m * n * sizeof(floatx);
+  }
+  else
+  {
+    w->dtype = DTYPE_INT8;
+    w->i8.q  = (int8_t *)(base + *off);
+    *off += (size_t)m * n * sizeof(int8_t);
+    w->i8.scales = (floatx *)(base + *off);
+    *off += (size_t)n * sizeof(floatx);
+  }
+}
+
+/* */
 static void
 free_linear(Linear *l)
 {
@@ -6794,6 +7281,320 @@ free_vision_layer(VisionEncoderLayer *layer)
   free(layer);
 }
 
+/* Text decoder container */
+typedef struct
+{
+  TextConfig     *config;
+  GemmaTokenizer *tokenizer;
+  // (vocab_size, embed_dim), shared with lm_head (tied weights)
+  Linear            *embedding;
+  TextDecoderLayer **layers;
+  floatx            *final_norm;  // (embed_dim,)
+} TextDecoder;
+
+/* */
+size_t
+get_text_decoder_size(const TextConfig *cfg, bool quant)
+{
+  size_t size = 0;
+  int    C    = cfg->embed_dim;
+  int    CM   = cfg->mlp_dim;
+  int    Cq   = cfg->n_heads * cfg->head_dim;
+  int    Ckv  = cfg->n_kv_heads * cfg->head_dim;
+  int    vs   = cfg->vocab_size;
+
+  // embedding: linear (C -> vs)
+  size += linear_size(C, vs, quant);
+
+  for (int l = 0; l < cfg->n_layers; l++)
+  {
+    // wq, wk, wv, wo
+    size += linear_size(C, Cq, quant);
+    size += linear_size(C, Ckv, quant);
+    size += linear_size(C, Ckv, quant);
+    size += linear_size(Cq, C, quant);
+
+    // optional nq, nk
+    if (cfg->qk_norm)
+    {
+      size += (size_t)cfg->head_dim * sizeof(floatx);
+      size += (size_t)cfg->head_dim * sizeof(floatx);
+    }
+
+    // w1, w2, w3
+    size += linear_size(C, CM, quant);
+    size += linear_size(C, CM, quant);
+    size += linear_size(CM, C, quant);
+
+    // n1, n2
+    size += (size_t)C * sizeof(floatx);
+    size += (size_t)C * sizeof(floatx);
+
+    // optional n3, n4
+    if (cfg->pre_mlp_norm)
+    {
+      size += (size_t)C * sizeof(floatx);
+    }
+    if (cfg->pst_mlp_norm)
+    {
+      size += (size_t)C * sizeof(floatx);
+    }
+  }
+
+  // final_norm
+  size += (size_t)C * sizeof(floatx);
+
+  return size;
+}
+
+/* */
+void
+free_text_decoder(TextDecoder *dec)
+{
+  if (dec == NULL) return;
+
+  free_tokenizer(dec->tokenizer);
+  free_linear(dec->embedding);
+  if (dec->layers != NULL && dec->config != NULL)
+  {
+    for (int i = 0; i < dec->config->n_layers; i++)
+    {
+      free_text_layer(dec->layers[i]);
+    }
+    free(dec->layers);
+  }
+  free(dec->final_norm);
+  free_text_config(dec->config);
+  free(dec);
+}
+
+/* */
+static TextDecoder *
+read_text_decoder(FILE *fp, TextConfig *cfg, bool quant)
+{
+  TextDecoder *dec;
+  CALLOC(dec, 1, "model.decoder", goto fail;);
+  dec->config = cfg;
+
+  int C   = cfg->embed_dim;
+  int CM  = cfg->mlp_dim;
+  int Cq  = cfg->n_heads * cfg->head_dim;
+  int Ckv = cfg->n_kv_heads * cfg->head_dim;
+  int vs  = cfg->vocab_size;
+
+  const char *emb_name = "model.decoder.embedding";
+  const char *lrs_name = "model.decoder.layers";
+
+  /* The embedding shape is (vocab_size, embed_dim), but it uses per-tensor
+   * quantization rather than per-channel like other weights. Gemma uses tied
+   * weights, which means the final lm_head shares the same weights with the
+   * embedding table, but transposed. So it becomes per-channel quantization in
+   * the final lm_head.
+   */
+
+  READ_LINEAR(dec->embedding, fp, C, vs, quant, emb_name, goto fail;);
+  CALLOC(dec->layers, cfg->n_layers, lrs_name, goto fail;);  // NOLINT
+
+  // Read all the layers
+  for (int l = 0; l < cfg->n_layers; l++)
+  {
+    char layer_name[64];
+    snprintf(layer_name, sizeof(layer_name), "%s.%d", lrs_name, l);
+    TextDecoderLayer *layer = NULL;
+    CALLOC(layer, 1, layer_name, goto fail;);
+
+    char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
+    snprintf(wq_name, sizeof(wq_name), "%s.%d.wq", lrs_name, l);
+    snprintf(wk_name, sizeof(wk_name), "%s.%d.wk", lrs_name, l);
+    snprintf(wv_name, sizeof(wv_name), "%s.%d.wv", lrs_name, l);
+    snprintf(wo_name, sizeof(wo_name), "%s.%d.wo", lrs_name, l);
+
+    // Attention weights
+    READ_LINEAR(layer->wq, fp, C, Cq, quant, wq_name, goto fail;);
+    READ_LINEAR(layer->wk, fp, C, Ckv, quant, wk_name, goto fail;);
+    READ_LINEAR(layer->wv, fp, C, Ckv, quant, wv_name, goto fail;);
+    READ_LINEAR(layer->wo, fp, Cq, C, quant, wo_name, goto fail;);
+
+    if (cfg->qk_norm)
+    {
+      char nq_name[64], nk_name[64];
+      snprintf(nq_name, sizeof(nq_name), "%s.%d.nq", lrs_name, l);
+      snprintf(nk_name, sizeof(nk_name), "%s.%d.nk", lrs_name, l);
+      READ_TENSOR(layer->nq, cfg->head_dim, fp, nq_name, goto fail;);
+      READ_TENSOR(layer->nk, cfg->head_dim, fp, nk_name, goto fail;);
+    }
+    else
+    {
+      layer->nq = NULL;
+      layer->nk = NULL;
+    }
+
+    char w1_name[64], w2_name[64], w3_name[64];
+    snprintf(w1_name, sizeof(w1_name), "%s.%d.w1", lrs_name, l);
+    snprintf(w2_name, sizeof(w2_name), "%s.%d.w2", lrs_name, l);
+    snprintf(w3_name, sizeof(w3_name), "%s.%d.w3", lrs_name, l);
+
+    // Feedforward weights
+    READ_LINEAR(layer->w1, fp, C, CM, quant, w1_name, goto fail;);
+    READ_LINEAR(layer->w2, fp, C, CM, quant, w2_name, goto fail;);
+    READ_LINEAR(layer->w3, fp, CM, C, quant, w3_name, goto fail;);
+
+    char n1_name[64], n2_name[64];
+    snprintf(n1_name, sizeof(n1_name), "%s.%d.n1", lrs_name, l);
+    snprintf(n2_name, sizeof(n2_name), "%s.%d.n2", lrs_name, l);
+
+    // RMSNorm weights
+    READ_TENSOR(layer->n1, C, fp, n1_name, goto fail;);
+    READ_TENSOR(layer->n2, C, fp, n2_name, goto fail;);
+
+    if (cfg->pre_mlp_norm)
+    {
+      char n3_name[64];
+      snprintf(n3_name, sizeof(n3_name), "%s.%d.n3", lrs_name, l);
+      READ_TENSOR(layer->n3, C, fp, n3_name, goto fail;);
+    }
+    else
+    {
+      layer->n3 = NULL;
+    }
+    if (cfg->pst_mlp_norm)
+    {
+      char n4_name[64];
+      snprintf(n4_name, sizeof(n4_name), "%s.%d.n4", lrs_name, l);
+      READ_TENSOR(layer->n4, C, fp, n4_name, goto fail;);
+    }
+    else
+    {
+      layer->n4 = NULL;
+    }
+    dec->layers[l] = layer;
+  }
+  READ_TENSOR(dec->final_norm, C, fp, "model.decoder.final_norm", goto fail;);
+
+  return dec;
+
+fail:
+  free_text_decoder(dec);
+  return NULL;
+}
+
+/* */
+static TextDecoder *
+mmap_text_decoder(void *data, TextConfig *cfg, size_t *offset, bool quant)
+{
+  TextDecoder *dec;
+  CALLOC(dec, 1, "model.decoder", goto fail;);
+  dec->config = cfg;
+
+  uint8_t *base = (uint8_t *)data;
+
+  int C   = cfg->embed_dim;
+  int CM  = cfg->mlp_dim;
+  int Cq  = cfg->n_heads * cfg->head_dim;
+  int Ckv = cfg->n_kv_heads * cfg->head_dim;
+  int vs  = cfg->vocab_size;
+
+  const char *emb_name = "model.decoder.embedding";
+  const char *lrs_name = "model.decoder.layers";
+
+  // Embedding: linear (C -> vs)
+  CALLOC(dec->embedding, 1, emb_name, goto fail;);
+  mmap_linear(dec->embedding, base, offset, C, vs, quant);
+
+  // Layers array
+  CALLOC(dec->layers, cfg->n_layers, lrs_name, goto fail;);  // NOLINT
+
+  for (int l = 0; l < cfg->n_layers; l++)
+  {
+    char layer_name[64];
+    snprintf(layer_name, sizeof(layer_name), "%s.%d", lrs_name, l);
+    TextDecoderLayer *layer = NULL;
+    CALLOC(layer, 1, layer_name, goto fail;);
+
+    // Attention weights
+    char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
+    snprintf(wq_name, sizeof(wq_name), "%s.%d.wq", lrs_name, l);
+    snprintf(wk_name, sizeof(wk_name), "%s.%d.wk", lrs_name, l);
+    snprintf(wv_name, sizeof(wv_name), "%s.%d.wv", lrs_name, l);
+    snprintf(wo_name, sizeof(wo_name), "%s.%d.wo", lrs_name, l);
+
+    CALLOC(layer->wq, 1, wq_name, goto fail;);
+    mmap_linear(layer->wq, base, offset, C, Cq, quant);
+    CALLOC(layer->wk, 1, wk_name, goto fail;);
+    mmap_linear(layer->wk, base, offset, C, Ckv, quant);
+    CALLOC(layer->wv, 1, wv_name, goto fail;);
+    mmap_linear(layer->wv, base, offset, C, Ckv, quant);
+    CALLOC(layer->wo, 1, wo_name, goto fail;);
+    mmap_linear(layer->wo, base, offset, Cq, C, quant);
+
+    // QK normalization (optional)
+    if (cfg->qk_norm)
+    {
+      layer->nq = (floatx *)(base + *offset);
+      *offset += (size_t)cfg->head_dim * sizeof(floatx);
+      layer->nk = (floatx *)(base + *offset);
+      *offset += (size_t)cfg->head_dim * sizeof(floatx);
+    }
+    else
+    {
+      layer->nq = NULL;
+      layer->nk = NULL;
+    }
+
+    // Feedforward weights
+    char w1_name[64], w2_name[64], w3_name[64];
+    snprintf(w1_name, sizeof(w1_name), "%s.%d.w1", lrs_name, l);
+    snprintf(w2_name, sizeof(w2_name), "%s.%d.w2", lrs_name, l);
+    snprintf(w3_name, sizeof(w3_name), "%s.%d.w3", lrs_name, l);
+
+    CALLOC(layer->w1, 1, w1_name, goto fail;);
+    mmap_linear(layer->w1, base, offset, C, CM, quant);
+    CALLOC(layer->w2, 1, w2_name, goto fail;);
+    mmap_linear(layer->w2, base, offset, C, CM, quant);
+    CALLOC(layer->w3, 1, w3_name, goto fail;);
+    mmap_linear(layer->w3, base, offset, CM, C, quant);
+
+    // RMSNorm weights
+    layer->n1 = (floatx *)(base + *offset);
+    *offset += (size_t)C * sizeof(floatx);
+    layer->n2 = (floatx *)(base + *offset);
+    *offset += (size_t)C * sizeof(floatx);
+
+    // Optional pre/post MLP norms
+    if (cfg->pre_mlp_norm)
+    {
+      layer->n3 = (floatx *)(base + *offset);
+      *offset += (size_t)C * sizeof(floatx);
+    }
+    else
+    {
+      layer->n3 = NULL;
+    }
+
+    if (cfg->pst_mlp_norm)
+    {
+      layer->n4 = (floatx *)(base + *offset);
+      *offset += (size_t)C * sizeof(floatx);
+    }
+    else
+    {
+      layer->n4 = NULL;
+    }
+
+    dec->layers[l] = layer;
+  }
+
+  // Final norm
+  dec->final_norm = (floatx *)(base + *offset);
+  *offset += (size_t)C * sizeof(floatx);
+
+  return dec;
+
+fail:
+  free_text_decoder(dec);
+  return NULL;
+}
+
 /* Vision encoder container */
 typedef struct
 {
@@ -6810,6 +7611,71 @@ typedef struct
   floatx *norm;         // (hidden_dim,)
   Linear *proj;         // (hidden_dim, embed_dim).T
 } VisionEncoder;
+
+/* */
+size_t
+get_vision_encoder_size(
+    const VisionConfig *vcfg, const TextConfig *cfg, bool quant)
+{
+  size_t size = 0;
+  int    P    = vcfg->patch_size;
+  int    C    = vcfg->hidden_dim;
+  int    CM   = vcfg->mlp_dim;
+  int    N    = vcfg->image_size / P;
+  N *= N;
+
+  // patch_emb
+  size += (size_t)C * 3 * P * P * sizeof(floatx);
+  // patch_emb_b
+  size += (size_t)C * sizeof(floatx);
+
+  // pos_embedding: linear (C -> N)
+  size += linear_size(C, N, quant);
+
+  // each layer
+  for (int l = 0; l < vcfg->n_layers; l++)
+  {
+    // n1, n1_b
+    size += (size_t)C * sizeof(floatx);
+    size += (size_t)C * sizeof(floatx);
+
+    // wq, wk, wv, wo: linear (C -> C)
+    size += linear_size(C, C, quant);
+    size += linear_size(C, C, quant);
+    size += linear_size(C, C, quant);
+    size += linear_size(C, C, quant);
+
+    // bq, bk, bv, bo
+    size += (size_t)C * sizeof(floatx);
+    size += (size_t)C * sizeof(floatx);
+    size += (size_t)C * sizeof(floatx);
+    size += (size_t)C * sizeof(floatx);
+
+    // n2, n2_b
+    size += (size_t)C * sizeof(floatx);
+    size += (size_t)C * sizeof(floatx);
+
+    // w1: linear (C -> CM), w2: linear (CM -> C)
+    size += linear_size(C, CM, quant);
+    size += linear_size(CM, C, quant);
+
+    // b1 (CM), b2 (C)
+    size += (size_t)CM * sizeof(floatx);
+    size += (size_t)C * sizeof(floatx);
+  }
+
+  // post_norm, post_norm_b
+  size += (size_t)C * sizeof(floatx);
+  size += (size_t)C * sizeof(floatx);
+
+  // norm
+  size += (size_t)C * sizeof(floatx);
+
+  // proj: linear (C -> cfg->embed_dim)
+  size += linear_size(C, cfg->embed_dim, quant);
+
+  return size;
+}
 
 /* */
 void
@@ -6836,36 +7702,235 @@ free_vision_encoder(VisionEncoder *enc)
   free(enc);
 }
 
-/* Text decoder container */
-typedef struct
+/* */
+static VisionEncoder *
+read_vision_encoder(FILE *fp, TextConfig *cfg, VisionConfig *vcfg, bool quant)
 {
-  TextConfig     *config;
-  GemmaTokenizer *tokenizer;
-  // (vocab_size, embed_dim), shared with lm_head (tied weights)
-  Linear            *embedding;
-  TextDecoderLayer **layers;
-  floatx            *final_norm;  // (embed_dim,)
-} TextDecoder;
+  VisionEncoder *enc;
+  CALLOC(enc, 1, "model.encoder", goto fail;);
+  enc->config = vcfg;
+
+  int P  = vcfg->patch_size;
+  int C  = vcfg->hidden_dim;
+  int CM = vcfg->mlp_dim;
+  int N  = vcfg->image_size / P;
+  N *= N;
+
+  const char *pem_name = "model.encoder.patch_emb";
+  const char *peb_name = "model.encoder.patch_emb_b";
+  const char *psm_name = "model.encoder.pos_embedding";
+  const char *lrs_name = "model.encoder.layers";
+  const char *pnm_name = "model.encoder.post_norm";
+  const char *pnb_name = "model.encoder.post_norm_b";
+  const char *nrm_name = "model.encoder.norm";
+  const char *prj_name = "model.encoder.proj";
+
+  READ_TENSOR(enc->patch_emb, C * 3 * P * P, fp, pem_name, goto fail;);
+  READ_TENSOR(enc->patch_emb_b, C, fp, peb_name, goto fail;);
+
+  // Same as here, the real shape is (N, C)
+  READ_LINEAR(enc->pos_embedding, fp, C, N, quant, psm_name, goto fail;);
+  CALLOC(enc->layers, vcfg->n_layers, lrs_name, goto fail;);  // NOLINT
+
+  // Read all the layers of ViT
+  for (int l = 0; l < vcfg->n_layers; l++)
+  {
+    char layer_name[64];
+    snprintf(layer_name, sizeof(layer_name), "%s.%d", lrs_name, l);
+    VisionEncoderLayer *layer = NULL;
+    CALLOC(layer, 1, layer_name, goto fail;);
+
+    // First layernorm
+    char n1_name[64], n1b_name[64];
+    snprintf(n1_name, sizeof(n1_name), "%s.%d.n1", lrs_name, l);
+    snprintf(n1b_name, sizeof(n1b_name), "%s.%d.n1_b", lrs_name, l);
+    READ_TENSOR(layer->n1, C, fp, n1_name, goto fail;);
+    READ_TENSOR(layer->n1_b, C, fp, n1b_name, goto fail;);
+
+    // Attention weights
+    char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
+    snprintf(wq_name, sizeof(wq_name), "%s.%d.wq", lrs_name, l);
+    snprintf(wk_name, sizeof(wk_name), "%s.%d.wk", lrs_name, l);
+    snprintf(wv_name, sizeof(wv_name), "%s.%d.wv", lrs_name, l);
+    snprintf(wo_name, sizeof(wo_name), "%s.%d.wo", lrs_name, l);
+
+    READ_LINEAR(layer->wq, fp, C, C, quant, wq_name, goto fail;);
+    READ_LINEAR(layer->wk, fp, C, C, quant, wk_name, goto fail;);
+    READ_LINEAR(layer->wv, fp, C, C, quant, wv_name, goto fail;);
+    READ_LINEAR(layer->wo, fp, C, C, quant, wo_name, goto fail;);
+
+    // Attention biases
+    char bq_name[64], bk_name[64], bv_name[64], bo_name[64];
+    snprintf(bq_name, sizeof(bq_name), "%s.%d.bq", lrs_name, l);
+    snprintf(bk_name, sizeof(bk_name), "%s.%d.bk", lrs_name, l);
+    snprintf(bv_name, sizeof(bv_name), "%s.%d.bv", lrs_name, l);
+    snprintf(bo_name, sizeof(bo_name), "%s.%d.bo", lrs_name, l);
+
+    READ_TENSOR(layer->bq, C, fp, bq_name, goto fail;);
+    READ_TENSOR(layer->bk, C, fp, bk_name, goto fail;);
+    READ_TENSOR(layer->bv, C, fp, bv_name, goto fail;);
+    READ_TENSOR(layer->bo, C, fp, bo_name, goto fail;);
+
+    // Second layernorm
+    char n2_name[64], n2b_name[64];
+    snprintf(n2_name, sizeof(n2_name), "%s.%d.n2", lrs_name, l);
+    snprintf(n2b_name, sizeof(n2b_name), "%s.%d.n2_b", lrs_name, l);
+
+    READ_TENSOR(layer->n2, C, fp, n2_name, goto fail;);
+    READ_TENSOR(layer->n2_b, C, fp, n2b_name, goto fail;);
+
+    // Feedforward weights
+    char w1_name[64], w2_name[64];
+    snprintf(w1_name, sizeof(w1_name), "%s.%d.w1", lrs_name, l);
+    snprintf(w2_name, sizeof(w2_name), "%s.%d.w2", lrs_name, l);
+    READ_LINEAR(layer->w1, fp, C, CM, quant, w1_name, goto fail;);
+    READ_LINEAR(layer->w2, fp, CM, C, quant, w2_name, goto fail;);
+
+    // Feedforward biases
+    char b1_name[64], b2_name[64];
+    snprintf(b1_name, sizeof(b1_name), "%s.%d.b1", lrs_name, l);
+    snprintf(b2_name, sizeof(b2_name), "%s.%d.b2", lrs_name, l);
+    READ_TENSOR(layer->b1, CM, fp, b1_name, goto fail;);
+    READ_TENSOR(layer->b2, C, fp, b2_name, goto fail;);
+
+    enc->layers[l] = layer;
+  }
+
+  // Post layernorm
+  READ_TENSOR(enc->post_norm, C, fp, pnm_name, goto fail;);
+  READ_TENSOR(enc->post_norm_b, C, fp, pnb_name, goto fail;);
+
+  // Soft embedding RMSNorm
+  READ_TENSOR(enc->norm, C, fp, nrm_name, goto fail;);
+  // Final projection
+  READ_LINEAR(enc->proj, fp, C, cfg->embed_dim, quant, prj_name, goto fail;);
+
+  return enc;
+
+fail:
+  free_vision_encoder(enc);
+  return NULL;
+}
 
 /* */
-void
-free_text_decoder(TextDecoder *dec)
+static VisionEncoder *
+mmap_vision_encoder(
+    void *data, TextConfig *cfg, VisionConfig *vcfg, size_t *offset, bool quant)
 {
-  if (dec == NULL) return;
+  VisionEncoder *enc;
+  CALLOC(enc, 1, "model.encoder", goto fail;);
+  enc->config = vcfg;
 
-  free_tokenizer(dec->tokenizer);
-  free_linear(dec->embedding);
-  if (dec->layers != NULL && dec->config != NULL)
+  uint8_t *base = (uint8_t *)data;
+
+  int P  = vcfg->patch_size;
+  int C  = vcfg->hidden_dim;
+  int CM = vcfg->mlp_dim;
+  int N  = vcfg->image_size / P;
+  N *= N;
+
+  const char *psm_name = "model.encoder.pos_embedding";
+  const char *lrs_name = "model.encoder.layers";
+  const char *prj_name = "model.encoder.proj";
+
+  // patch_emb: C * 3 * P * P floats
+  enc->patch_emb = (floatx *)(base + *offset);
+  *offset += (size_t)C * 3 * P * P * sizeof(floatx);
+
+  // patch_emb_b: C floats
+  enc->patch_emb_b = (floatx *)(base + *offset);
+  *offset += (size_t)C * sizeof(floatx);
+
+  // pos_embedding: linear (C -> N)
+  CALLOC(enc->pos_embedding, 1, psm_name, goto fail;);
+  mmap_linear(enc->pos_embedding, base, offset, C, N, quant);
+
+  // layers array
+  CALLOC(enc->layers, vcfg->n_layers, lrs_name, goto fail;);  // NOLINT
+
+  for (int l = 0; l < vcfg->n_layers; l++)
   {
-    for (int i = 0; i < dec->config->n_layers; i++)
-    {
-      free_text_layer(dec->layers[i]);
-    }
-    free(dec->layers);
+    char layer_name[64];
+    snprintf(layer_name, sizeof(layer_name), "%s.%d", lrs_name, l);
+    VisionEncoderLayer *layer = NULL;
+    CALLOC(layer, 1, layer_name, goto fail;);
+
+    // n1, n1_b
+    layer->n1 = (floatx *)(base + *offset);
+    *offset += (size_t)C * sizeof(floatx);
+    layer->n1_b = (floatx *)(base + *offset);
+    *offset += (size_t)C * sizeof(floatx);
+
+    // attention weights: wq, wk, wv, wo (linear C -> C)
+    char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
+    snprintf(wq_name, sizeof(wq_name), "%s.%d.wq", lrs_name, l);
+    snprintf(wk_name, sizeof(wk_name), "%s.%d.wk", lrs_name, l);
+    snprintf(wv_name, sizeof(wv_name), "%s.%d.wv", lrs_name, l);
+    snprintf(wo_name, sizeof(wo_name), "%s.%d.wo", lrs_name, l);
+
+    CALLOC(layer->wq, 1, wq_name, goto fail;);
+    mmap_linear(layer->wq, base, offset, C, C, quant);
+    CALLOC(layer->wk, 1, wk_name, goto fail;);
+    mmap_linear(layer->wk, base, offset, C, C, quant);
+    CALLOC(layer->wv, 1, wv_name, goto fail;);
+    mmap_linear(layer->wv, base, offset, C, C, quant);
+    CALLOC(layer->wo, 1, wo_name, goto fail;);
+    mmap_linear(layer->wo, base, offset, C, C, quant);
+
+    // attention biases: bq, bk, bv, bo
+    layer->bq = (floatx *)(base + *offset);
+    *offset += (size_t)C * sizeof(floatx);
+    layer->bk = (floatx *)(base + *offset);
+    *offset += (size_t)C * sizeof(floatx);
+    layer->bv = (floatx *)(base + *offset);
+    *offset += (size_t)C * sizeof(floatx);
+    layer->bo = (floatx *)(base + *offset);
+    *offset += (size_t)C * sizeof(floatx);
+
+    // n2, n2_b
+    layer->n2 = (floatx *)(base + *offset);
+    *offset += (size_t)C * sizeof(floatx);
+    layer->n2_b = (floatx *)(base + *offset);
+    *offset += (size_t)C * sizeof(floatx);
+
+    // feedforward weights: w1 (C -> CM), w2 (CM -> C)
+    char w1_name[64], w2_name[64];
+    snprintf(w1_name, sizeof(w1_name), "%s.%d.w1", lrs_name, l);
+    snprintf(w2_name, sizeof(w2_name), "%s.%d.w2", lrs_name, l);
+
+    CALLOC(layer->w1, 1, w1_name, goto fail;);
+    mmap_linear(layer->w1, base, offset, C, CM, quant);
+    CALLOC(layer->w2, 1, w2_name, goto fail;);
+    mmap_linear(layer->w2, base, offset, CM, C, quant);
+
+    // feedforward biases: b1 (CM), b2 (C)
+    layer->b1 = (floatx *)(base + *offset);
+    *offset += (size_t)CM * sizeof(floatx);
+    layer->b2 = (floatx *)(base + *offset);
+    *offset += (size_t)C * sizeof(floatx);
+
+    enc->layers[l] = layer;
   }
-  free(dec->final_norm);
-  free_text_config(dec->config);
-  free(dec);
+
+  // post_norm, post_norm_b
+  enc->post_norm = (floatx *)(base + *offset);
+  *offset += (size_t)C * sizeof(floatx);
+  enc->post_norm_b = (floatx *)(base + *offset);
+  *offset += (size_t)C * sizeof(floatx);
+
+  // norm
+  enc->norm = (floatx *)(base + *offset);
+  *offset += (size_t)C * sizeof(floatx);
+
+  // proj: linear (C -> embed_dim)
+  CALLOC(enc->proj, 1, prj_name, goto fail;);
+  mmap_linear(enc->proj, base, offset, C, cfg->embed_dim, quant);
+
+  return enc;
+
+fail:
+  free_vision_encoder(enc);
+  return NULL;
 }
 
 /* Top-level model container */
@@ -6874,6 +7939,8 @@ typedef struct
   TextDecoder   *decoder;
   VisionEncoder *encoder;
   bool           quant;  // W8A8
+  void          *mmap_data;
+  size_t         mmap_size;
 } GemmaModel;
 
 /* */
@@ -6884,6 +7951,204 @@ free_gemma_model(GemmaModel *model)
   free_vision_encoder(model->encoder);
   free_text_decoder(model->decoder);
   free(model);
+}
+
+/* */
+void
+munmap_gemma_model(GemmaModel *model)
+{
+  munmap(model->mmap_data, model->mmap_size);
+}
+
+/* Check the file header and return a flag that indicates whether the model
+ * is quantized. Return -1 if failed. */
+static int
+check_head(FILE *fp, const char *filename)
+{
+  // Magic header
+  char hdr[8];
+  FREAD(hdr, 8, fp, "header", return -1;);
+  if (memcmp(hdr, "GEMA", 4) != 0)
+  {
+    fprintf(stderr, "error: not a valid gemma model file: %s\n", filename);
+    return -1;
+  }
+  // dtype
+  if (memcmp(hdr + 4, DTYPE_MAGIC, 3) != 0)
+  {
+    fprintf(stderr, "error: unsupported dtype '%c%c%c' in model file\n", hdr[4],
+        hdr[5], hdr[6]);
+    return -1;
+  }
+  // W8A8 flag ('Q' / 'U')
+  if (hdr[7] == 'Q')
+  {
+    return 1;
+  }
+  else if (hdr[7] != 'U')
+  {
+    fprintf(stderr, "error: not a valid gemma model file: %s\n", filename);
+    return -1;
+  }
+
+  return 0;
+}
+
+/* Map the entire text & vision model into virtual memory */
+GemmaModel *
+mmap_gemma_model(const char *filename, bool enable_mm)
+{
+  FILE       *fp    = fopen(filename, "rb");
+  GemmaModel *model = NULL;
+
+  if (fp == NULL)
+  {
+    fprintf(stderr, "error: failed to open file: %s\n", filename);
+    goto fail;
+  }
+  CALLOC(model, 1, "model", goto fail;);
+
+  // Header
+  int quant = check_head(fp, filename);
+  if (quant == -1) goto fail;
+  model->quant = (bool)quant;
+
+  // Text config
+  TextConfig *cfg = read_text_config(fp);
+  if (cfg == NULL) goto fail;
+
+  bool use_mm = cfg->support_mm && enable_mm;
+
+  // Vision config
+  VisionConfig *vcfg = NULL;
+  if (use_mm)
+  {
+    vcfg = read_vision_config(fp);
+    if (vcfg == NULL) goto fail;
+  }
+  else if (cfg->support_mm)
+  {
+    // Skip vision config if user didn't ask for multimodal
+    if (read_vision_config(fp) == NULL) goto fail;
+  }
+
+  // Tokenizer
+  GemmaTokenizer *tok = read_tokenizer(fp, cfg);
+  if (tok == NULL) goto fail;
+
+  size_t offset = ftell(fp);
+  fclose(fp);
+
+  int fd = open(filename, O_RDONLY);  // read-only
+  if (fd == -1)
+  {
+    fprintf(stderr, "error: failed to open file: %s\n", filename);
+    goto fail;
+  }
+
+  // Get the total amount of bytes for the weights
+  size_t mmap_size = offset + get_text_decoder_size(cfg, model->quant);
+  if (use_mm)
+  {
+    mmap_size += get_vision_encoder_size(vcfg, cfg, model->quant);
+  }
+
+  void *data = mmap(NULL, mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (data == MAP_FAILED)
+  {
+    fprintf(stderr, "error: memory mapping failed: %s\n", filename);
+    goto fail;
+  }
+  model->mmap_data = data;
+  model->mmap_size = mmap_size;
+  close(fd);
+
+  // Text decoder
+  TextDecoder *dec = mmap_text_decoder(data, cfg, &offset, model->quant);
+  if (dec == NULL) goto fail;
+  dec->tokenizer = tok;
+  model->decoder = dec;
+
+  // Vision encoder
+  if (use_mm)
+  {
+    VisionEncoder *enc =
+        mmap_vision_encoder(data, cfg, vcfg, &offset, model->quant);
+    if (enc == NULL) goto fail;
+    model->encoder = enc;
+  }
+
+  return model;
+
+fail:
+  if (fp != NULL) fclose(fp);
+  free(model);
+  return NULL;
+}
+
+/* Load the entire text & vision model into RAM */
+GemmaModel *
+read_gemma_model(const char *filename, bool enable_mm)
+{
+  FILE       *fp    = fopen(filename, "rb");
+  GemmaModel *model = NULL;
+
+  if (fp == NULL)
+  {
+    fprintf(stderr, "error: failed to open file: %s\n", filename);
+    goto fail;
+  }
+  CALLOC(model, 1, "model", goto fail;);
+
+  // Header
+  int quant = check_head(fp, filename);
+  if (quant == -1) goto fail;
+  model->quant = (bool)quant;
+
+  // Text config
+  TextConfig *cfg = read_text_config(fp);
+  if (cfg == NULL) goto fail;
+
+  bool use_mm = cfg->support_mm && enable_mm;
+
+  // Vision config
+  VisionConfig *vcfg = NULL;
+  if (use_mm)
+  {
+    vcfg = read_vision_config(fp);
+    if (vcfg == NULL) goto fail;
+  }
+  else if (cfg->support_mm)
+  {
+    // Skip vision config if user didn't ask for multimodal
+    if (read_vision_config(fp) == NULL) goto fail;
+  }
+
+  // Tokenizer
+  GemmaTokenizer *tok = read_tokenizer(fp, cfg);
+  if (tok == NULL) goto fail;
+
+  // Text decoder
+  TextDecoder *dec = read_text_decoder(fp, cfg, model->quant);
+  if (dec == NULL) goto fail;
+  dec->tokenizer = tok;
+  model->decoder = dec;
+
+  // Vision encoder
+  if (use_mm)
+  {
+    VisionEncoder *enc = read_vision_encoder(fp, cfg, vcfg, model->quant);
+    if (enc == NULL) goto fail;
+    model->encoder = enc;
+  }
+
+  fclose(fp);
+  return model;
+
+fail:
+  if (fp != NULL) fclose(fp);
+  free(model);
+  return NULL;
 }
 
 // Runtime buffers (allocated once, reused every step)
@@ -7114,422 +8379,6 @@ fail:
   return NULL;
 }
 
-/* Read the entire text & vision model from the custom binary file format */
-GemmaModel *
-read_model(const char *filename, bool enable_mm)
-{
-  // TODO: Rewrite this using mmap. Didn't know it exists back when I started
-  // this project...
-  FILE           *fp    = NULL;
-  GemmaTokenizer *tok   = NULL;
-  TextConfig     *cfg   = NULL;
-  VisionEncoder  *enc   = NULL;
-  VisionConfig   *vcfg  = NULL;
-  TextDecoder    *dec   = NULL;
-  GemmaModel     *model = NULL;
-
-  char *att_layers_buf = NULL;
-
-  fp = fopen(filename, "rb");
-  if (fp == NULL)
-  {
-    fprintf(stderr, "error: failed to open file: %s\n", filename);
-    goto fail;
-  }
-
-  CALLOC(tok, 1, "model.decoder.tokenizer", goto fail;);
-  CALLOC(cfg, 1, "model.decoder.config", goto fail;);
-  // Build the text model
-  CALLOC(dec, 1, "model.decoder", goto fail;);
-  dec->config    = cfg;
-  dec->tokenizer = tok;
-  // Build the full model
-  CALLOC(model, 1, "model", goto fail;);
-  model->decoder = dec;
-
-  // Read the configs
-  FGETC(cfg->n_layers, fp, "model.decoder.config.n_layers", goto fail;);
-  FGETC(cfg->n_heads, fp, "model.decoder.config.n_heads", goto fail;);
-  FGETC(cfg->n_kv_heads, fp, "model.decoder.config.n_kv_heads", goto fail;);
-
-  READ_UINT16(cfg->head_dim, fp, "model.decoder.config.head_dim", goto fail;);
-  READ_UINT16(cfg->embed_dim, fp, "model.decoder.config.embed_dim", goto fail;);
-  READ_UINT16(cfg->mlp_dim, fp, "model.decoder.config.mlp_dim", goto fail;);
-  READ_UINT16(cfg->q_scale, fp, "model.decoder.config.q_scale", goto fail;);
-  READ_UINT16(cfg->slide_len, fp, "model.decoder.config.slide_len", goto fail;);
-  READ_UINT16(
-      cfg->image_toks, fp, "model.decoder.config.image_toks", goto fail;);
-  READ_UINT32(
-      cfg->max_seqlen, fp, "model.decoder.config.max_seqlen", goto fail;);
-  READ_UINT32(
-      cfg->vocab_size, fp, "model.decoder.config.vocab_size", goto fail;);
-
-  READ_FP32(
-      cfg->local_theta, fp, "model.decoder.config.local_theta", goto fail;);
-  READ_FP32(
-      cfg->global_theta, fp, "model.decoder.config.global_theta", goto fail;);
-  READ_FP32(cfg->eps, fp, "model.decoder.config.eps", goto fail;);
-  READ_FP32(
-      cfg->att_softcap, fp, "model.decoder.config.att_softcap", goto fail;);
-  READ_FP32(
-      cfg->logit_softcap, fp, "model.decoder.config.logit_softcap", goto fail;);
-
-  // Packed bit-field of which layers use sliding-window attention
-  // A terrible terrible idea, wish I didn't do this
-  int n_bytes;
-  FGETC(n_bytes, fp, "model.decoder.config.att_layers", goto fail;);
-  if (n_bytes * 8 < cfg->n_layers)
-  {
-    fprintf(stderr, "error: insufficient att_layers bytes\n");
-    goto fail;
-  }
-  MALLOC(
-      att_layers_buf, n_bytes, "model.decoder.config.att_layers", goto fail;);
-  MALLOC(cfg->att_layers, cfg->n_layers, "model.decoder.config.att_layers",
-         goto fail;);
-  FREAD(att_layers_buf, n_bytes, fp, "model.decoder.config.att_layers",
-        goto fail;);
-  for (int i = 0; i < cfg->n_layers; i++)
-  {
-    int pos            = i;
-    int byte_idx       = pos / 8;
-    int bit_idx        = 7 - (pos % 8);
-    cfg->att_layers[i] = (att_layers_buf[byte_idx] >> bit_idx) & 1;
-  }
-  free(att_layers_buf);
-  att_layers_buf = NULL;
-
-  // Extra feature flags packed into one byte
-  int extra_flags;
-  FGETC(extra_flags, fp, "model.decoder.config.extra_flags", goto fail;);
-  cfg->support_mm   = (extra_flags & 16) == 16;
-  cfg->qk_norm      = (extra_flags & 8) == 8;
-  cfg->pre_mlp_norm = (extra_flags & 4) == 4;
-  cfg->pst_mlp_norm = (extra_flags & 2) == 2;
-  model->quant      = (extra_flags & 1);
-
-  bool use_mm = cfg->support_mm && enable_mm;
-
-  if (use_mm)
-  {
-    // Read vision config
-    CALLOC(enc, 1, "model.encoder", goto fail;);
-    CALLOC(vcfg, 1, "model.encoder.config", goto fail;);
-    FGETC(vcfg->n_layers, fp, "model.encoder.config.n_layers", goto fail;);
-    FGETC(vcfg->n_heads, fp, "model.encoder.config.n_heads", goto fail;);
-    READ_UINT16(vcfg->mlp_dim, fp, "model.encoder.config.mlp_dim", goto fail;);
-    READ_UINT16(
-        vcfg->hidden_dim, fp, "model.encoder.config.hidden_dim", goto fail;);
-    READ_UINT16(
-        vcfg->image_size, fp, "model.encoder.config.image_size", goto fail;);
-    READ_UINT16(
-        vcfg->patch_size, fp, "model.encoder.config.patch_size", goto fail;);
-    READ_FP32(vcfg->eps, fp, "model.encoder.config.eps", goto fail;);
-    enc->config    = vcfg;
-    model->encoder = enc;
-  }
-  else if (cfg->support_mm)
-  {
-    int   t0;
-    float t1;
-    // Skip vision config if user didn't ask for multimodal
-    FGETC(t0, fp, "model.encoder.config.n_layers", goto fail;);
-    FGETC(t0, fp, "model.encoder.config.n_heads", goto fail;);
-    READ_UINT16(t0, fp, "model.encoder.config.mlp_dim", goto fail;);
-    READ_UINT16(t0, fp, "model.encoder.config.hidden_dim", goto fail;);
-    READ_UINT16(t0, fp, "model.encoder.config.image_size", goto fail;);
-    READ_UINT16(t0, fp, "model.encoder.config.patch_size", goto fail;);
-    READ_FP32(t1, fp, "model.encoder.config.eps", goto fail;);
-  }
-
-  // dtype
-  int   offset = 0;
-  char  dtype_buf[10];
-  char *dtype;
-  READ_STR(dtype, fp, dtype_buf, &offset, "dtype", goto fail;);
-  if (strcmp(dtype, DTYPE_STR) != 0)
-  {
-    printf("dtype '%s' not supported\n", dtype);
-    goto fail;
-  }
-
-  // Build vocabulary
-  offset = 0;
-
-  tok->vocab_size = cfg->vocab_size;
-  if (cfg->support_mm)
-  {
-    tok->vocab_size++;
-  }  // ++ for the <image_soft_token>
-  int vocab_data_bytes = get_strarr_bytes(fp, tok->vocab_size);
-  if (vocab_data_bytes == -1) goto fail;
-  MALLOC(tok->vocab_data, vocab_data_bytes,
-         "model.decoder.tokenizer.vocab_data", goto fail;);
-  MALLOC(
-      tok->vocab, tok->vocab_size, "model.decoder.tokenizer.vocab", goto fail;);
-  MALLOC(tok->vocab_sorted, tok->vocab_size,
-         "model.decoder.tokenizer.vocab_sorted", goto fail;);
-  for (int i = 0; i < tok->vocab_size; i++)
-  {
-    char name[64];
-    snprintf(name, sizeof(name), "model.decoder.tokenizer.vocab_data.%d", i);
-    char *str;
-    READ_STR(str, fp, tok->vocab_data, &offset, name, goto fail;);
-    tok->vocab[i]            = str;
-    tok->vocab_sorted[i].idx = i;
-    tok->vocab_sorted[i].val = str;
-  }
-  qsort(tok->vocab_sorted, tok->vocab_size, sizeof(tok->vocab_sorted[0]),
-      cmp_token);
-
-  // Special tokens
-  tok->bos = get_token_idx(tok, "<bos>");
-  tok->eos = get_token_idx(tok, "<eos>");
-  tok->sot = get_token_idx(tok, "<start_of_turn>");
-  tok->eot = get_token_idx(tok, "<end_of_turn>");
-  tok->soi = get_token_idx(tok, "<start_of_image>");
-  tok->eoi = get_token_idx(tok, "<end_of_image>");
-  tok->ist = get_token_idx(tok, "<image_soft_token>");
-
-  // Build merges
-  READ_UINT32(
-      tok->n_merges, fp, "model.decoder.tokenizer.n_merges", goto fail;);
-  MALLOC(
-      tok->ranks, tok->n_merges, "model.decoder.tokenizer.ranks", goto fail;);
-  int merge_bytes = get_strarr_bytes(fp, tok->n_merges * 2);
-  if (merge_bytes == -1) goto fail;
-  MALLOC(tok->merge_data, merge_bytes, "model.decoder.tokenizer.merge_data",
-         goto fail;);
-
-  offset = 0;
-  for (int i = 0; i < tok->n_merges; i++)
-  {
-    char name0[64], name1[64];
-    snprintf(
-        name0, sizeof(name0), "model.decoder.tokenizer.merge_data.%d.0", i);
-    snprintf(
-        name1, sizeof(name1), "model.decoder.tokenizer.merge_data.%d.1", i);
-
-    char *str1, *str2;
-    READ_STR(str1, fp, tok->merge_data, &offset, name0, goto fail;);
-    READ_STR(str2, fp, tok->merge_data, &offset, name1, goto fail;);
-
-    tok->ranks[i].rank = i;
-    tok->ranks[i].str1 = str1;
-    tok->ranks[i].str2 = str2;
-  }
-  qsort(tok->ranks, tok->n_merges, sizeof(tok->ranks[0]), cmp_merge);
-
-  /* The embedding shape is (vocab_size, embed_dim), but it uses per-tensor
-   * quantization rather than per-channel like other weights. Gemma uses tied
-   * weights, which means the final lm_head shares the same weights with the
-   * embedding table, but transposed. So it becomes per-channel quantization in
-   * the final lm_head.
-   */
-  int C = cfg->embed_dim;
-
-  READ_LINEAR(dec->embedding, fp, C, cfg->vocab_size, model->quant,
-              "model.decoder.embedding", goto fail;);
-  CALLOC(dec->layers, cfg->n_layers, "model.decoder.layers",  // NOLINT
-         goto fail;);
-
-  int Cq  = cfg->n_heads * cfg->head_dim;
-  int Ckv = cfg->n_kv_heads * cfg->head_dim;
-
-  // Read all the layers
-  for (int l = 0; l < cfg->n_layers; l++)
-  {
-    char layer_name[64];
-    snprintf(layer_name, sizeof(layer_name), "model.decoder.layers.%d", l);
-    TextDecoderLayer *layer = NULL;
-    CALLOC(layer, 1, layer_name, goto fail;);
-
-    char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
-    snprintf(wq_name, sizeof(wq_name), "model.decoder.layers.%d.wq", l);
-    snprintf(wk_name, sizeof(wk_name), "model.decoder.layers.%d.wk", l);
-    snprintf(wv_name, sizeof(wv_name), "model.decoder.layers.%d.wv", l);
-    snprintf(wo_name, sizeof(wo_name), "model.decoder.layers.%d.wo", l);
-
-    // Attention weights
-    READ_LINEAR(layer->wq, fp, C, Cq, model->quant, wq_name, goto fail;);
-    READ_LINEAR(layer->wk, fp, C, Ckv, model->quant, wk_name, goto fail;);
-    READ_LINEAR(layer->wv, fp, C, Ckv, model->quant, wv_name, goto fail;);
-    READ_LINEAR(layer->wo, fp, Cq, C, model->quant, wo_name, goto fail;);
-
-    if (cfg->qk_norm)
-    {
-      char nq_name[64], nk_name[64];
-      snprintf(nq_name, sizeof(nq_name), "model.decoder.layers.%d.nq", l);
-      snprintf(nk_name, sizeof(nk_name), "model.decoder.layers.%d.nk", l);
-      READ_TENSOR(layer->nq, cfg->head_dim, fp, nq_name, goto fail;);
-      READ_TENSOR(layer->nk, cfg->head_dim, fp, nk_name, goto fail;);
-    }
-    else
-    {
-      layer->nq = NULL;
-      layer->nk = NULL;
-    }
-
-    char w1_name[64], w2_name[64], w3_name[64];
-    snprintf(w1_name, sizeof(w1_name), "model.decoder.layers.%d.w1", l);
-    snprintf(w2_name, sizeof(w2_name), "model.decoder.layers.%d.w2", l);
-    snprintf(w3_name, sizeof(w3_name), "model.decoder.layers.%d.w3", l);
-
-    // Feedforward weights
-    READ_LINEAR(
-        layer->w1, fp, C, cfg->mlp_dim, model->quant, w1_name, goto fail;);
-    READ_LINEAR(
-        layer->w2, fp, C, cfg->mlp_dim, model->quant, w2_name, goto fail;);
-    READ_LINEAR(
-        layer->w3, fp, cfg->mlp_dim, C, model->quant, w3_name, goto fail;);
-
-    char n1_name[64], n2_name[64];
-    snprintf(n1_name, sizeof(n1_name), "model.decoder.layers.%d.n1", l);
-    snprintf(n2_name, sizeof(n2_name), "model.decoder.layers.%d.n2", l);
-
-    // RMSNorm weights
-    READ_TENSOR(layer->n1, C, fp, n1_name, goto fail;);
-    READ_TENSOR(layer->n2, C, fp, n2_name, goto fail;);
-
-    if (cfg->pre_mlp_norm)
-    {
-      char n3_name[64];
-      snprintf(n3_name, sizeof(n3_name), "model.decoder.layers.%d.n3", l);
-      READ_TENSOR(layer->n3, C, fp, n3_name, goto fail;);
-    }
-    else
-    {
-      layer->n3 = NULL;
-    }
-    if (cfg->pst_mlp_norm)
-    {
-      char n4_name[64];
-      snprintf(n4_name, sizeof(n4_name), "model.decoder.layers.%d.n4", l);
-      READ_TENSOR(layer->n4, C, fp, n4_name, goto fail;);
-    }
-    else
-    {
-      layer->n4 = NULL;
-    }
-    dec->layers[l] = layer;
-  }
-  READ_TENSOR(dec->final_norm, C, fp, "model.decoder.final_norm", goto fail;);
-
-  if (use_mm)
-  {
-    int P  = vcfg->patch_size;
-    int VC = vcfg->hidden_dim;
-
-    READ_TENSOR(enc->patch_emb, VC * 3 * P * P, fp, "model.encoder.patch_emb",
-                goto fail;);
-    READ_TENSOR(
-        enc->patch_emb_b, VC, fp, "model.encoder.patch_emb_b", goto fail;);
-    int n_patches = vcfg->image_size / P;
-    n_patches *= n_patches;
-    // Same as here, the real shape is (n_patches, VC)
-    READ_LINEAR(enc->pos_embedding, fp, VC, n_patches, model->quant,
-                "model.encoder.pos_embedding", goto fail;);
-    CALLOC(enc->layers, vcfg->n_layers, "model.encoder.layers",  // NOLINT
-           goto fail;);
-
-    // Read all the layers of ViT
-    for (int l = 0; l < vcfg->n_layers; l++)
-    {
-      char layer_name[64];
-      snprintf(layer_name, sizeof(layer_name), "model.encoder.layers.%d", l);
-      VisionEncoderLayer *layer = NULL;
-      CALLOC(layer, 1, layer_name, goto fail;);
-
-      // First layernorm
-      char n1_name[64], n1b_name[64];
-      snprintf(n1_name, sizeof(n1_name), "model.encoder.layers.%d.n1", l);
-      snprintf(n1b_name, sizeof(n1b_name), "model.encoder.layers.%d.n1_b", l);
-      READ_TENSOR(layer->n1, VC, fp, n1_name, goto fail;);
-      READ_TENSOR(layer->n1_b, VC, fp, n1b_name, goto fail;);
-
-      // Attention weights
-      char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
-      snprintf(wq_name, sizeof(wq_name), "model.encoder.layers.%d.wq", l);
-      snprintf(wk_name, sizeof(wk_name), "model.encoder.layers.%d.wk", l);
-      snprintf(wv_name, sizeof(wv_name), "model.encoder.layers.%d.wv", l);
-      snprintf(wo_name, sizeof(wo_name), "model.encoder.layers.%d.wo", l);
-
-      READ_LINEAR(layer->wq, fp, VC, VC, model->quant, wq_name, goto fail;);
-      READ_LINEAR(layer->wk, fp, VC, VC, model->quant, wk_name, goto fail;);
-      READ_LINEAR(layer->wv, fp, VC, VC, model->quant, wv_name, goto fail;);
-      READ_LINEAR(layer->wo, fp, VC, VC, model->quant, wo_name, goto fail;);
-
-      // Attention biases
-      char bq_name[64], bk_name[64], bv_name[64], bo_name[64];
-      snprintf(bq_name, sizeof(bq_name), "model.encoder.layers.%d.bq", l);
-      snprintf(bk_name, sizeof(bk_name), "model.encoder.layers.%d.bk", l);
-      snprintf(bv_name, sizeof(bv_name), "model.encoder.layers.%d.bv", l);
-      snprintf(bo_name, sizeof(bo_name), "model.encoder.layers.%d.bo", l);
-
-      READ_TENSOR(layer->bq, VC, fp, bq_name, goto fail;);
-      READ_TENSOR(layer->bk, VC, fp, bk_name, goto fail;);
-      READ_TENSOR(layer->bv, VC, fp, bv_name, goto fail;);
-      READ_TENSOR(layer->bo, VC, fp, bo_name, goto fail;);
-
-      // Second layernorm
-      char n2_name[64], n2b_name[64];
-      snprintf(n2_name, sizeof(n2_name), "model.encoder.layers.%d.n2", l);
-      snprintf(n2b_name, sizeof(n2b_name), "model.encoder.layers.%d.n2_b", l);
-
-      READ_TENSOR(layer->n2, VC, fp, n2_name, goto fail;);
-      READ_TENSOR(layer->n2_b, VC, fp, n2b_name, goto fail;);
-
-      // Feedforward weights
-      char w1_name[64], w2_name[64];
-      snprintf(w1_name, sizeof(w1_name), "model.encoder.layers.%d.w1", l);
-      snprintf(w2_name, sizeof(w2_name), "model.encoder.layers.%d.w2", l);
-      READ_LINEAR(
-          layer->w1, fp, VC, vcfg->mlp_dim, model->quant, w1_name, goto fail;);
-      READ_LINEAR(
-          layer->w2, fp, vcfg->mlp_dim, VC, model->quant, w2_name, goto fail;);
-
-      // Feedforward biases
-      char b1_name[64], b2_name[64];
-      snprintf(b1_name, sizeof(b1_name), "model.encoder.layers.%d.b1", l);
-      snprintf(b2_name, sizeof(b2_name), "model.encoder.layers.%d.b2", l);
-      READ_TENSOR(layer->b1, vcfg->mlp_dim, fp, b1_name, goto fail;);
-      READ_TENSOR(layer->b2, VC, fp, b2_name, goto fail;);
-
-      enc->layers[l] = layer;
-    }
-
-    // Post layernorm
-    READ_TENSOR(enc->post_norm, VC, fp, "model.encoder.post_norm", goto fail;);
-    READ_TENSOR(
-        enc->post_norm_b, VC, fp, "model.encoder.post_norm_b", goto fail;);
-
-    // Soft embedding RMSNorm
-    READ_TENSOR(enc->norm, VC, fp, "model.encoder.norm", goto fail;);
-    // Final projection
-    READ_LINEAR(
-        enc->proj, fp, VC, C, model->quant, "model.encoder.proj", goto fail;);
-  }
-
-  fclose(fp);
-  return model;
-
-fail:
-  if (fp != NULL) fclose(fp);
-  free(att_layers_buf);
-  if (model != NULL)
-  {
-    free_gemma_model(model);
-  }
-  else
-  {
-    free_text_decoder(dec);
-    free_vision_encoder(enc);
-    free_text_config(cfg);
-    free_tokenizer(tok);
-  }
-  return NULL;
-}
-
 // Math primitives
 
 // Make sure the clamping is not optimized by compilers
@@ -7561,7 +8410,7 @@ clamp_fpx(floatx v)
 #  pragma float_control(pop)
 #endif
 
-/* Gemma-style RMSNorm: (x * rsqrt(mean(x²) + eps)) * (weight + 1) */
+/* Gemma-style RMSNorm: (x * rsqrt(mean(x^2) + eps)) * (weight + 1) */
 static void
 rmsnorm(floatx   *dst,
     const floatx *src,
@@ -10126,6 +10975,28 @@ typedef struct
   while (0)
 // clang-format on
 
+static bool
+pc_reserve(PromptCursor *pc, int extra)
+{
+  // Leave 1 extra slot of slack for the EOF sentinel RETURN_TEXT_INJECT
+  // writes at pc->tokens_buf[pc->n_tokens]
+  if (pc->n_tokens + extra >= pc->tokens_buf_len)
+  {
+    fprintf(stderr, "\nerror: prompt too long\n");
+    return false;
+  }
+  return true;
+}
+#define PC_RESERVE_OR(pc, extra, ...) \
+  do                                  \
+  {                                   \
+    if (!pc_reserve((pc), (extra)))   \
+    {                                 \
+      __VA_ARGS__;                    \
+    }                                 \
+  }                                   \
+  while (0)
+
 /* Scan pc->text for the next "@image{path}", one step at a time:
  * if an image path was queued last call, load it and inject it
  * if an image was just injected, close it off with <end_of_image>
@@ -10167,20 +11038,25 @@ inject_next_chunk(GemmaTokenizer *tok,
 
   if (pc->was_image)
   {
-    pc->was_image                  = false;
+    pc->was_image = false;
+    PC_RESERVE_OR(
+        pc, 1, return (InjectData){.type = INJECT_NONE, .quit = true});
     pc->tokens_buf[pc->n_tokens++] = tok->eoi;  // <end_of_image>
+    PC_RESERVE_OR(
+        pc, 2, return (InjectData){.type = INJECT_NONE, .quit = true});
     encode(tok, "\n\n", 2, pc->tokens_buf + pc->n_tokens, &pc->n_tokens);
   }
 
   // Use @image{<path>} to insert an image
   const char *prompt    = pc->text;
-  char       *image_cmd = strstr(prompt, "@image{");
+  const char *image_cmd = strstr(prompt, "@image{");
   if (enc == NULL || !enable_mm)
   {
     image_cmd = NULL;
   }
 
-  char *closing = (image_cmd != NULL) ? strchr(image_cmd, (int)'}') : NULL;
+  const char *closing =
+      (image_cmd != NULL) ? strchr(image_cmd, (int)'}') : NULL;
   if (image_cmd == NULL || closing == NULL)
   {
     // No (more) complete "@image{...}" in the remaining text -- nothing
@@ -10206,13 +11082,19 @@ inject_next_chunk(GemmaTokenizer *tok,
     pc->pending_path[path_len] = '\0';
     pc->pending_image          = true;
 
+    PC_RESERVE_OR(
+        pc, 2, return (InjectData){.type = INJECT_NONE, .quit = true});
     encode(tok, "\n\n", 2, pc->tokens_buf + pc->n_tokens, &pc->n_tokens);
+    PC_RESERVE_OR(
+        pc, 1, return (InjectData){.type = INJECT_NONE, .quit = true});
     pc->tokens_buf[pc->n_tokens++] = tok->soi;  // Insert <start_of_image>
     pc->text                       = prompt + epos + 1;
     RETURN_TEXT_INJECT(pc, false, false);
   }
   // Matched a complete image command! Encode & return the text part first,
   // handle the image part in the next iteration
+  PC_RESERVE_OR(
+      pc, spos, return (InjectData){.type = INJECT_NONE, .quit = true});
   encode(tok, prompt, spos, pc->tokens_buf + pc->n_tokens, &pc->n_tokens);
   // No need to insert <start_of_image> here, leave it to the next iteration
   pc->text = prompt + spos;  // Next call directly starts with "@image"
@@ -10234,6 +11116,11 @@ generate_next(GemmaModel *model, bool enable_mm, PromptCursor *pc)
   // append, so just encode whatever plain text remains and finish up
   if (pc->text[0] != '\0')
   {
+    int len = (int)strlen(pc->text);
+    if (!pc_reserve(pc, len))
+    {
+      return (InjectData){.type = INJECT_NONE, .quit = true};
+    }
     encode(tok, pc->text, strlen(pc->text), pc->tokens_buf + pc->n_tokens,
         &pc->n_tokens);
     pc->text += strlen(pc->text);
@@ -10284,7 +11171,7 @@ generate(GemmaModel *model,
 
   printf("%s", prompt);
 
-  int  tokens_buf_len = seqlen + 128;
+  int  tokens_buf_len = seqlen * 50;
   int *tokens_buf;
   MALLOC(tokens_buf, tokens_buf_len, "tokens_buf", return 1;);
 
@@ -10297,6 +11184,11 @@ generate(GemmaModel *model,
       .pending_image  = false,
       .was_image      = false,
   };
+  if (!pc_reserve(&pc, 1))
+  {
+    free(tokens_buf);
+    return 1;
+  }
   pc.tokens_buf[pc.n_tokens++] = tok->bos;
 
   InjectData first = generate_next(model, enable_mm, &pc);
@@ -10379,9 +11271,13 @@ new_turn(ChatState *cs,
 
     if (bos)
     {
+      PC_RESERVE_OR(pc, 1, goto fail);
       pc->tokens_buf[pc->n_tokens++] = tok->bos;
     }
+    PC_RESERVE_OR(pc, 1, goto fail);
     pc->tokens_buf[pc->n_tokens++] = tok->sot;
+    PC_RESERVE_OR(pc, (int)strlen("user\n"), goto fail);
+
     encode(tok, "user\n", strlen("user\n"), pc->tokens_buf + pc->n_tokens,
         &pc->n_tokens);
     printf("Model: ");
@@ -10396,13 +11292,17 @@ new_turn(ChatState *cs,
   // wrap up the turn with the chat template's closing tokens
   if (pc->text[0] != '\0')
   {
-    encode(tok, pc->text, strlen(pc->text), pc->tokens_buf + pc->n_tokens,
-        &pc->n_tokens);
+    int len = (int)strlen(pc->text);
+    PC_RESERVE_OR(pc, len, goto fail);
+    encode(tok, pc->text, len, pc->tokens_buf + pc->n_tokens, &pc->n_tokens);
   }
-  cs->turn_finished              = true;
+  cs->turn_finished = true;
+  PC_RESERVE_OR(pc, 3, goto fail);
   pc->tokens_buf[pc->n_tokens++] = tok->eot;
   pc->tokens_buf[pc->n_tokens++] = get_token_idx(tok, "\n");
   pc->tokens_buf[pc->n_tokens++] = tok->sot;
+  PC_RESERVE_OR(pc, (int)strlen("model\n"), goto fail);
+
   encode(tok, "model\n", strlen("model\n"), pc->tokens_buf + pc->n_tokens,
       &pc->n_tokens);
   RETURN_TEXT_INJECT(pc, true, false);
@@ -10446,7 +11346,7 @@ chat(GemmaModel  *model,
 {
   GemmaTokenizer *tok = model->decoder->tokenizer;
 
-  int  tokens_buf_len = seqlen + 128;
+  int  tokens_buf_len = seqlen * 50;
   int *tokens_buf;
   MALLOC(tokens_buf, tokens_buf_len, "tokens_buf", return 1;);
 
@@ -10528,95 +11428,10 @@ safe_atof(const char *str, float *result)
   return true;
 }
 
-#ifdef _WIN32
-#  include <windows.h>
-// The default console encoding is kinda weird on Windows
-/* */
-static void
-set_utf8_console(void)
-{
-  SetConsoleOutputCP(65001);
-  SetConsoleCP(65001);
-}
-
-/* Convert Windows command line to UTF-8 argc/argv */
-static char **
-get_utf8_argv(int *argc_out)
-{
-  wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), argc_out);
-  if (!wargv) return NULL;
-
-  char **argv = malloc((*argc_out + 1) * sizeof(char *));
-  if (!argv)
-  {
-    LocalFree(wargv);
-    return NULL;
-  }
-
-  for (int i = 0; i < *argc_out; i++)
-  {
-    int size =
-        WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
-    argv[i] = malloc(size);
-    if (!argv[i])
-    {
-      for (int j = 0; j < i; j++)
-      {
-        free(argv[j]);
-      }
-
-      free(argv);
-      LocalFree(wargv);
-      return NULL;
-    }
-    WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, argv[i], size, NULL, NULL);
-  }
-  argv[*argc_out] = NULL;
-
-  LocalFree(wargv);
-  return argv;
-}
-
-/* */
-static void
-free_utf8_argv(char **argv, int argc)
-{
-  if (argv == NULL) return;
-  for (int i = 0; i < argc; i++)
-  {
-    free(argv[i]);
-  }
-  free(argv);
-}
-
-#else
-// No problem with POSIX though
-/* */
-static void
-set_utf8_console(void)
-{
-}
-
-/* */
-static char **
-get_utf8_argv(int *argc_out)
-{
-  (void)argc_out;
-  return NULL;
-}
-
-/* */
-static void
-free_utf8_argv(char **argv, int argc)
-{
-  (void)argv;
-  (void)argc;
-}
-#endif
-
 /* Pretty-print of the loaded model */
 void
-print_model_config(GemmaModel *model, int seqlen, bool enable_mm)
+print_model_config(
+    GemmaModel *model, int seqlen, int chunk_size, bool enable_mm)
 {
   const int       width = 20;
   VisionEncoder  *enc   = model->encoder;
@@ -10625,7 +11440,7 @@ print_model_config(GemmaModel *model, int seqlen, bool enable_mm)
   GemmaTokenizer *tok   = dec->tokenizer;
 
   printf("\n========== Model Configuration ==========\n");
-  printf("Architecture:\n");
+  printf("architecture:\n");
 
   // Integer fields
   printf("  %-*s: %d\n", width, "n_layers", cfg->n_layers);
@@ -10674,7 +11489,7 @@ print_model_config(GemmaModel *model, int seqlen, bool enable_mm)
   printf("  %-*s: %s\n", width, "quant", model->quant ? "true" : "false");
 
   // Tokenizer
-  printf("\nTokenizer:\n");
+  printf("\ntokenizer:\n");
   printf("  %-*s: %d\n", width, "vocab_size", tok->vocab_size);
   printf("  %-*s: %d\n", width, "n_merges", tok->n_merges);
   printf("  %-*s: %d\n", width, "bos", tok->bos);
@@ -10685,141 +11500,101 @@ print_model_config(GemmaModel *model, int seqlen, bool enable_mm)
   printf("  %-*s: %d\n", width, "eoi", tok->eoi);
   printf("  %-*s: %d\n", width, "ist", tok->ist);
 
-  printf("\nMemory Footprint (estimated):\n");
+  printf("\nmemory footprint (estimated):\n");
 
-  size_t total = 0;
+  int   C   = cfg->embed_dim;
+  int   L   = cfg->n_layers;
+  int   CH  = cfg->head_dim;
+  int   NH  = cfg->n_heads;
+  int   Cq  = NH * CH;
+  int   Ckv = cfg->n_kv_heads * CH;
+  int   CM  = cfg->mlp_dim;
+  int   vs  = cfg->vocab_size;
+  float GB  = 1024.0 * 1024.0 * 1024.0;
 
-  int C   = cfg->embed_dim;
-  int CH  = cfg->head_dim;
-  int NH  = cfg->n_heads;
-  int Cq  = NH * CH;
-  int Ckv = cfg->n_kv_heads * CH;
-  int CM  = cfg->mlp_dim;
+  bool use_mm = cfg->support_mm && enable_mm && enc != NULL;
 
-  // Embedding
-  if (!model->quant)
-  {
-    total += C * cfg->vocab_size * sizeof(floatx);
-  }
-  else
-  {
-    total += C * cfg->vocab_size * sizeof(int8_t);
-    total += cfg->vocab_size * sizeof(floatx);  // scales
-  }
+  // Text buffer
+  size_t decB = 0;
 
-  // Weights per layer
-  for (int l = 0; l < cfg->n_layers; l++)
-  {
-    int layer_params = C * Cq + C * Ckv + C * Ckv + Cq * C + C * CM * 3;
-
-    if (!model->quant)
-    {
-      total += layer_params * sizeof(floatx);
-    }
-    else
-    {
-      total += layer_params * sizeof(int8_t);
-      total += (Cq + Ckv + Ckv + C * 2 + CM * 2) * sizeof(floatx);  // scales
-    }
-
-    // Norm layers
-    total += C * sizeof(floatx);  // n1
-    total += C * sizeof(floatx);  // n2
-    if (cfg->qk_norm)
-    {
-      total += 2 * cfg->head_dim * sizeof(floatx);
-    }
-    if (cfg->pre_mlp_norm)
-    {
-      total += C * sizeof(floatx);
-    }
-    if (cfg->pst_mlp_norm)
-    {
-      total += C * sizeof(floatx);
-    }
-  }
-
-  // Final norm
-  total += C * sizeof(floatx);
-
-  printf("  %-*s: %.2f GB\n", width, "Weights",
-      (float)total / (1024.0 * 1024.0 * 1024.0));
-
-  // KV Cache
-  size_t kv_cache_bytes = cfg->n_layers * 2 * Ckv * sizeof(floatx);
-  printf("  %-*s: %.2f KB\n", width, "KV Cache (tok)",
-      (float)kv_cache_bytes / 1024.0);
-
-  // Gemma Buffer
   int           ppi  = 0;
   VisionConfig *vcfg = NULL;
-  if (cfg->support_mm && enable_mm && enc != NULL)
+  if (use_mm)
   {
     vcfg = enc->config;
     ppi  = vcfg->image_size / vcfg->patch_size;
   }
-  int mult = (cfg->support_mm && enable_mm && enc != NULL) ? ppi * ppi : 1;
-
-  size_t dec_bytes = 0;
+  int mult = use_mm ? max(ppi * ppi, chunk_size) : chunk_size;
 
   // Quantized buffers
   if (model->quant)
   {
-    dec_bytes += C * sizeof(int8_t);   // x_i8
-    dec_bytes += Cq * sizeof(int8_t);  // xo_i8
-    dec_bytes += CM * sizeof(int8_t);  // xg_i8
+    decB += C * sizeof(int8_t);   // x_i8
+    decB += Cq * sizeof(int8_t);  // xo_i8
+    decB += CM * sizeof(int8_t);  // xg_i8
   }
 
   // Main buffers
-  dec_bytes += cfg->n_layers * 2 * seqlen * Ckv * sizeof(floatx);  // kv_cache
-  dec_bytes += cfg->vocab_size * sizeof(floatx);                   // logits
-  dec_bytes += mult * C * sizeof(floatx);                          // x
-  dec_bytes += mult * C * sizeof(floatx);                          // resid
-  dec_bytes += mult * Cq * sizeof(floatx);                         // xq
-  dec_bytes += mult * Ckv * sizeof(floatx);                        // xk
-  dec_bytes += mult * CH * sizeof(floatx);           // csfreqs_slid
-  dec_bytes += mult * CH * sizeof(floatx);           // csfreqs_full
-  dec_bytes += mult * Ckv * sizeof(floatx);          // xv
-  dec_bytes += mult * Cq * sizeof(floatx);           // xo
-  dec_bytes += mult * NH * seqlen * sizeof(floatx);  // att
-  dec_bytes += mult * CM * sizeof(floatx);           // xg
-  dec_bytes += mult * CM * sizeof(floatx);           // xu
+  decB += L * 2 * seqlen * Ckv * sizeof(floatx);  // kv_cache
+  decB += vs * sizeof(floatx);                    // logits
+  decB += mult * C * sizeof(floatx);              // x
+  decB += mult * C * sizeof(floatx);              // resid
+  decB += mult * Cq * sizeof(floatx);             // xq
+  decB += mult * Ckv * sizeof(floatx);            // xk
+  decB += mult * CH * sizeof(floatx);             // csfreqs_slid
+  decB += mult * CH * sizeof(floatx);             // csfreqs_full
+  decB += mult * Ckv * sizeof(floatx);            // xv
+  decB += mult * Cq * sizeof(floatx);             // xo
+  decB += mult * NH * seqlen * sizeof(floatx);    // att
+  decB += mult * CM * sizeof(floatx);             // xg
+  decB += mult * CM * sizeof(floatx);             // xu
 
-  printf("  %-*s: %.2f MB\n", width, "Gemma Buffer",
-      (float)dec_bytes / (1024.0 * 1024.0));
+  printf("  %-*s: %.2f GB\n", width, "decoder buffer", (float)decB / GB);
 
-  // SigLIP Buffer (if applicable)
-  if (cfg->support_mm && enable_mm && enc != NULL)
+  // Vision buffer (if applicable)
+  if (use_mm)
   {
+    size_t encB = 0;
+
     int C  = vcfg->hidden_dim;
     int CM = vcfg->mlp_dim;
     int N  = ppi * ppi;
     int NH = vcfg->n_heads;
 
-    size_t enc_bytes = 0;
-
     // Quantized buffers
     if (model->quant)
     {
-      enc_bytes += N * C * sizeof(int8_t);   // x_i8
-      enc_bytes += N * sizeof(floatx);       // x_scales
-      enc_bytes += N * CM * sizeof(int8_t);  // mlp_i8
-      enc_bytes += N * sizeof(floatx);       // mlp_scales
+      encB += N * C * sizeof(int8_t);   // x_i8
+      encB += N * sizeof(floatx);       // x_scales
+      encB += N * CM * sizeof(int8_t);  // mlp_i8
+      encB += N * sizeof(floatx);       // mlp_scales
     }
 
     // Main buffers
-    enc_bytes += N * C * sizeof(floatx);       // x
-    enc_bytes += N * C * sizeof(floatx);       // resid
-    enc_bytes += N * C * sizeof(floatx);       // xq
-    enc_bytes += N * C * sizeof(floatx);       // xk
-    enc_bytes += N * C * sizeof(floatx);       // xv
-    enc_bytes += N * C * sizeof(floatx);       // att_out
-    enc_bytes += N * CM * sizeof(floatx);      // mlp_hidden
-    enc_bytes += NH * N * N * sizeof(floatx);  // scores
+    encB += N * C * sizeof(floatx);       // x
+    encB += N * C * sizeof(floatx);       // resid
+    encB += N * C * sizeof(floatx);       // xq
+    encB += N * C * sizeof(floatx);       // xk
+    encB += N * C * sizeof(floatx);       // xv
+    encB += N * C * sizeof(floatx);       // att_out
+    encB += N * CM * sizeof(floatx);      // mlp_hidden
+    encB += NH * N * N * sizeof(floatx);  // scores
 
-    printf("  %-*s: %.2f MB\n", width, "SigLIP Buffer",
-        (float)enc_bytes / (1024.0 * 1024.0));
+    printf("  %-*s: %.2f GB\n", width, "encoder buffer", (float)encB / GB);
   }
+
+  // Weights
+  if (use_mm)
+  {
+    printf("  %-*s: %.2f GB\n", width, "encoder weights",
+        get_vision_encoder_size(vcfg, cfg, model->quant) / GB);
+  }
+  printf("  %-*s: %.2f GB\n", width, "decoder weights",
+      get_text_decoder_size(cfg, model->quant) / GB);
+
+  // KV Cache
+  printf("  %-*s: %.2f KB\n", width, "kv cache (tok)",
+      (float)cfg->n_layers * 2 * Ckv * sizeof(floatx) / 1024.0);
 
   printf("=========================================\n\n");
 }
@@ -10834,37 +11609,38 @@ print_usage(void)
   "  ./gemma <modelfile> [options]\n"
   "\n"
   "arguments:\n"
-  "  modelfile              path to the model file\n"
+  "  modelfile          path to the model file\n"
   "\n"
   "options:\n"
-  "  -l, --seqlen <N>       set sequence length"
+  "  --seqlen <N>       set sequence length"
                             " (default: " TOSTRING(DEFAULT_SEQLEN) ")\n"
-  "  -k, --topk <N>         set top-k sampling value"
+  "  --topk <N>         set top-k sampling value"
                             " (default: " TOSTRING(DEFAULT_TOPK) ")\n"
-  "  -s, --seed <N>         set random seed"
+  "  --seed <N>         set random seed"
                             " (default: current time)\n"
-  "  -u, --chunk <N>        set prefilling chunk size, must be >= 1"
+  "  --chunk <N>        set prefilling chunk size, must be >= 1"
                             " (default: " TOSTRING(DEFAULT_CHUNK_SIZE) ")\n"
-  "  -t, --temperature <F>  set temperature value, must be >= 0.0"
+  "  --temperature <F>  set temperature value, must be >= 0.0"
                             " (default: " TOSTRING(DEFAULT_TEMPERATURE) ")\n"
-  "  -p, --topp <F>         set top-p sampling value, must be 0.0 < p <= 1.0"
+  "  --topp <F>         set top-p sampling value, must be 0.0 < p <= 1.0"
                             " (default: " TOSTRING(DEFAULT_TOPP) ")\n"
-  "  -r, --rpen <F>         set repetition penalty, must be >= 1.0"
+  "  --rpen <F>         set repetition penalty, must be >= 1.0"
                             " (default: " TOSTRING(DEFAULT_RPEN) ")\n"
-  "  -i, --prompt <S>       set input prompt, ignored if chat mode is enabled"
+  "  --prompt <S>       set input prompt, ignored if chat mode is enabled"
                             " (default: \"" DEFAULT_PROMPT "\")\n"
-  "  -c, --chat             enable chat mode\n"
-  "  -d, --disable-mm       disable multimodal capability\n"
-  "  -v, --verbose          print model info\n"
-  "  -h, --help, -?         display this help message\n"
+  "  --chat             enable chat mode\n"
+  "  --disable-mm       disable multimodal capability\n"
+  "  --disable-mmap     disable mmap (memory mapped file)\n"
+  "  --verbose          print model info\n"
+  "  --help, -?         display this help message\n"
   "\n"
   "controls:\n"
-  "  Ctrl+C                 gracefully interrupt generation and exit\n"
+  "  Ctrl+C             gracefully interrupt generation and exit\n"
   "\n"
   "examples:\n"
-  "  ./gemma model.bin -l 2048 -t 0.8 -c\n"
+  "  ./gemma model.bin -l 2048 -t 0.8 --chat\n"
   "  ./gemma model.bin -i \"Hello I'm a language model,\""
-          "--seqlen 4096 --topk 50 --seed 12345\n");
+          " --seqlen 4096 --topk 50 --seed 12345\n");
   // clang-format on
 }
 
@@ -10898,6 +11674,7 @@ main(int argc, char **argv)
   const char  *prompt      = DEFAULT_PROMPT;
   bool         chatmode    = false;
   bool         enable_mm   = true;
+  bool         enable_mmap = true;
   bool         print_cfg   = false;
 
   GemmaModel   *model = NULL;
@@ -10921,8 +11698,7 @@ main(int argc, char **argv)
   }
 
   char *modelfile = argv[1];
-  if (strcmp(modelfile, "-h") == 0 || strcmp(modelfile, "--help") == 0 ||
-      strcmp(modelfile, "-?") == 0)
+  if (strcmp(modelfile, "--help") == 0 || strcmp(modelfile, "-?") == 0)
   {
     print_usage();
     goto end;
@@ -10935,7 +11711,7 @@ main(int argc, char **argv)
   {
     const char *arg = argv[i];
 
-    if (strcmp(arg, "-l") == 0 || strcmp(arg, "--seqlen") == 0)
+    if (strcmp(arg, "--seqlen") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
       if (!val) goto fail;
@@ -10945,7 +11721,7 @@ main(int argc, char **argv)
         goto fail;
       }
     }
-    else if (strcmp(arg, "-k") == 0 || strcmp(arg, "--topk") == 0)
+    else if (strcmp(arg, "--topk") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
       if (!val) goto fail;
@@ -10955,7 +11731,7 @@ main(int argc, char **argv)
         goto fail;
       }
     }
-    else if (strcmp(arg, "-s") == 0 || strcmp(arg, "--seed") == 0)
+    else if (strcmp(arg, "--seed") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
       if (!val) goto fail;
@@ -10965,7 +11741,7 @@ main(int argc, char **argv)
         goto fail;
       }
     }
-    else if (strcmp(arg, "-u") == 0 || strcmp(arg, "--chunk") == 0)
+    else if (strcmp(arg, "--chunk") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
       if (!val) goto fail;
@@ -10975,7 +11751,7 @@ main(int argc, char **argv)
         goto fail;
       }
     }
-    else if (strcmp(arg, "-t") == 0 || strcmp(arg, "--temperature") == 0)
+    else if (strcmp(arg, "--temperature") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
       if (!val) goto fail;
@@ -10985,7 +11761,7 @@ main(int argc, char **argv)
         goto fail;
       }
     }
-    else if (strcmp(arg, "-p") == 0 || strcmp(arg, "--topp") == 0)
+    else if (strcmp(arg, "--topp") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
       if (!val) goto fail;
@@ -10995,7 +11771,7 @@ main(int argc, char **argv)
         goto fail;
       }
     }
-    else if (strcmp(arg, "-r") == 0 || strcmp(arg, "--rpen") == 0)
+    else if (strcmp(arg, "--rpen") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
       if (!val) goto fail;
@@ -11006,26 +11782,29 @@ main(int argc, char **argv)
         goto fail;
       }
     }
-    else if (strcmp(arg, "-i") == 0 || strcmp(arg, "--prompt") == 0)
+    else if (strcmp(arg, "--prompt") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
       if (!val) goto fail;
       prompt = val;
     }
-    else if (strcmp(arg, "-c") == 0 || strcmp(arg, "--chat") == 0)
+    else if (strcmp(arg, "--chat") == 0)
     {
       chatmode = true;
     }
-    else if (strcmp(arg, "-d") == 0 || strcmp(arg, "--disable-mm") == 0)
+    else if (strcmp(arg, "--disable-mm") == 0)
     {
       enable_mm = false;
     }
-    else if (strcmp(arg, "-v") == 0 || strcmp(arg, "--verbose") == 0)
+    else if (strcmp(arg, "--disable-mmap") == 0)
+    {
+      enable_mmap = false;
+    }
+    else if (strcmp(arg, "--verbose") == 0)
     {
       print_cfg = true;
     }
-    else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0 ||
-             strcmp(arg, "-?") == 0)
+    else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-?") == 0)
     {
       print_usage();
       goto end;
@@ -11040,8 +11819,16 @@ main(int argc, char **argv)
 
   srand(seed);
 
-  // Read model
-  model = read_model(modelfile, enable_mm);
+  // Read / mmap model
+  if (enable_mmap)
+  {
+    model = mmap_gemma_model(modelfile, enable_mm);
+  }
+  else
+  {
+    model = read_gemma_model(modelfile, enable_mm);
+  }
+
   if (model == NULL) goto fail;
 
   // Text config
@@ -11066,7 +11853,7 @@ main(int argc, char **argv)
 
   if (print_cfg)
   {
-    print_model_config(model, (int)seqlen, enable_mm);
+    print_model_config(model, (int)seqlen, (int)chunk_size, enable_mm);
   }
 
   if (chatmode)
@@ -11091,8 +11878,15 @@ end:
   {
     free_text_buffer(buf, model->quant);
     free_vision_buffer(vbuf, model->quant);
+    if (enable_mmap)
+    {
+      munmap_gemma_model(model);
+    }
+    else
+    {
+      free_gemma_model(model);
+    }
   }
-  free_gemma_model(model);
   return 0;
 
 fail:
@@ -11101,7 +11895,14 @@ fail:
   {
     free_text_buffer(buf, model->quant);
     free_vision_buffer(vbuf, model->quant);
+    if (enable_mmap)
+    {
+      munmap_gemma_model(model);
+    }
+    else
+    {
+      free_gemma_model(model);
+    }
   }
-  free_gemma_model(model);
   return 1;
 }

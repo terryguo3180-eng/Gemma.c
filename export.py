@@ -14,6 +14,15 @@ from model import (
 )
 from tokenizer import GemmaTokenizer
 
+fp32_magic = 0x47454d41663332  # GEMAf32
+fp16_magic = 0x47454d41663136  # GEMAf16
+bf16_magic = 0x47454d41623136  # GEMAb16
+
+dtype_map: dict[torch.dtype, int] = {
+    torch.float32: fp32_magic,
+    torch.float16: fp16_magic,
+    torch.bfloat16: bf16_magic,
+}
 
 def export_hf(
     model_path: str,
@@ -205,6 +214,13 @@ def export_hf(
     tokens_per_image = hf_model.config.mm_tokens_per_image if is_multimodal else 0
 
     with open(export_path, "wb") as f:
+        # Write dtype magic
+        f.write(dtype_map[dtype].to_bytes(7, "big"))
+        if quant:
+            f.write(b"Q")
+        else:
+            f.write(b"U")
+
         # Dump the model config
         f.write(struct.pack("> ccc HHHHHH II fffff", *(
             bytes([config.num_hidden_layers]),
@@ -247,11 +263,10 @@ def export_hf(
 
         # Additional flags
         extra_flags = (
-            (int(is_multimodal) << 4) |
-            (int(has_qk_norm) << 3) |
-            (int(has_pre_post_ffwd_norm) << 2) |
+            (int(is_multimodal) << 3) |
+            (int(has_qk_norm) << 2) |
             (int(has_pre_post_ffwd_norm) << 1) |
-            int(quant)
+            (int(has_pre_post_ffwd_norm))
         )
         f.write(extra_flags.to_bytes())
 
@@ -277,9 +292,6 @@ def export_hf(
             str_bytes = s.encode("utf-8")
             f.write(len(str_bytes).to_bytes())
             f.write(str_bytes)
-
-        # Write dtype
-        write_str(str(dtype).removeprefix("torch."))
 
         # Dump the tokenizer (vocab & merges)
         vocab: dict[str, int] = hf_tokenizer._vocab
@@ -315,7 +327,8 @@ def export_hf(
             total += 3  # siglip patch embedding (weight & bias) & position embedding
             if quant:
                 total += 2  # Quantization scalers for embeddings
-            total += vconfig.num_hidden_layers * 16  # q & k & v & o & fc1 & fc2 & two layernorms (weight & bias)
+            # q & k & v & o & fc1 & fc2 & two layernorms (weight & bias)
+            total += vconfig.num_hidden_layers * 16
             if quant:
                 total += vconfig.num_hidden_layers * 6  # Quantization scalers
             total += 2  # mm proj norm & mm proj weight
@@ -345,12 +358,6 @@ def export_hf(
                 emb_weight = emb.weight.data
             elif scale is not None:
                 emb_weight *= scale
-            # if name == "embed_tokens.weight":
-            #     print()
-            #     print("[export] embedding:")
-            #     print(emb_weight)
-            #     print("[export] embedding shape:")
-            #     print(emb_weight.shape)
 
             write_tensor(emb_weight)
             if quant:
@@ -379,14 +386,7 @@ def export_hf(
                     weights[i] = w_linear.weight.data.T
                     del w_linear
 
-            for name, wei, sca in zip(names, weights, weight_scalers):
-                # if name == "layers.0.self_attn.q_proj.weight":
-                #     print()
-                #     print("[export] q_proj:")
-                #     print(wei)
-                #     print("[export] q_proj shape:")
-                #     print(wei.shape)
-
+            for wei, sca in zip(weights, weight_scalers):
                 write_tensor(wei)
                 if sca is not None:
                     write_tensor(sca)
@@ -397,6 +397,8 @@ def export_hf(
         # NOTE: Do NOT multiply emb_weight by act_scale
         # Embedding is weight-tied with lm_head. Scaling it would scale the logits
         # and is equivalent to a large temperature change, which destroys sampling.
+        # The embedding scaling is done in gemma.c, which combined with the original
+        # sqrt(embed_dim) scale, happened to cancel out.
         write_emb("embed_tokens.weight", trunc=vocab_len)
 
         # Write all the weights across all the layers
@@ -562,6 +564,17 @@ def export_hf(
 
 def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
     with open(path, "rb") as f:
+        if f.read(4) != b"GEMA":
+            exit("error: not a valid gemma model file")
+
+        dtype = {
+            b"f32": torch.float32,
+            b"f16": torch.float16,
+            b"b16": torch.bfloat16,
+        }[f.read(2)]
+
+        quant = f.read(1) == b"Q"
+
         # Build config
         fmt = "> ccc HHHHHH II fffff"; (
             n_layers, n_heads, n_kv_heads,
@@ -589,11 +602,10 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
         
         # Additional flags
         extra_flags = f.read(1)[0]
-        is_multimodal = extra_flags & 16 == 16
-        use_qk_norm = extra_flags & 8 == 8
-        pre_ffwd_norm = extra_flags & 4 == 4
-        post_ffwd_norm = extra_flags & 2 == 2
-        quant = extra_flags & 1 == 1
+        is_multimodal = extra_flags & 8 == 8
+        use_qk_norm = extra_flags & 4 == 4
+        pre_ffwd_norm = extra_flags & 2 == 2
+        post_ffwd_norm = extra_flags & 1 == 1
 
         if is_multimodal:
             # Just for comparative verification. It is incredibly slow to run the 4B vision
@@ -618,10 +630,6 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
         else:
             vision_config = None
             v_image_size = 0
-
-        # dtype
-        dtype_str = read_str()
-        dtype = getattr(torch, dtype_str)
 
         # Model config
         config = GemmaConfig(
@@ -675,10 +683,6 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
         dtype_q = torch.int8 if quant else dtype
 
         model.embedding.weight.data = read_tensor((vocab_size, embed_dim), dtype_q)
-        # print("[load] embedding:")
-        # print(model.embedding.weight)
-        # print("[load] embedding shape:")
-        # print(model.embedding.weight.shape)
 
         if quant:
             model.embedding.weight_scaler.data = read_tensor((vocab_size,))
@@ -702,12 +706,6 @@ def load_bin(path: str) -> tuple[GemmaModel, GemmaTokenizer]:
             layer.attn.q_proj.weight.data = read_tensor((head_dim * n_heads, embed_dim), dtype_q).T
             if quant:
                 layer.attn.q_proj.weight_scaler.data = read_tensor((head_dim * n_heads,))
-
-            # if i == 0:
-            #     print("[load] q_proj:")
-            #     print(layer.attn.q_proj.weight.data.T)
-            #     print("[load] q_proj shape:")
-            #     print(layer.attn.q_proj.weight.data.T.shape)
 
             layer.attn.k_proj.weight.data = read_tensor((head_dim * n_kv_heads, embed_dim), dtype_q).T
             if quant:
@@ -834,13 +832,9 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
-    
-    dtype_map = {
+    export_hf(args.modelfile, args.output, {
         "float16": torch.float16,
         "float32": torch.float32,
         "bfloat16": torch.bfloat16,
-    }
-    dtype = dtype_map[args.dtype]
-    
-    export_hf(args.modelfile, args.output, dtype, args.quantize, args.cache_path)
+    }[args.dtype], args.quantize, args.cache_path)
     print(f"Successfully exported to {args.output}")
