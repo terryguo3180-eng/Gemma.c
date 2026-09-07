@@ -1,3 +1,27 @@
+"""Converter between Hugging Face Gemma checkpoints and the custom binary
+format used by this project.
+
+The export path handles the messy realities of pulling large models out of
+the transformers ecosystem, including sharded safetensors loading with bounded
+memory usage, float16 activation scaling to keep intermediate values from
+overflowing, optional quantization, and support for both the text-only and
+multimodal Gemma variants. The loader reconstructs the model from that binary
+format, reading weights back in the exact layout they were written and
+rebuilding the tokenizer vocabulary alongside the model itself.
+
+Usage examples:
+
+python export.py google/gemma-2-2b -o gemma2-2b.bin
+python export.py google/gemma-3-4b-it -o gemma3-4b-it.bin -d bfloat16 -q
+python export.py ./local-gemma-checkpoint -o model.bin -c ~/.cache/huggingface
+
+The first positional argument can be either a Hugging Face repo id or a path
+to a local directory containing the config, tokenizer, and safetensors files.
+The -d flag selects the weight precision (float16 by default), -q enables 8-bit
+quantization, and -c lets you point the Hugging Face cache somewhere other than
+the default location if disk space is tight.
+"""
+
 import math
 import struct
 
