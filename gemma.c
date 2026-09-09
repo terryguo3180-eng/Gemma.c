@@ -39,6 +39,12 @@
  *   gcc -Ofast -march=native -mtune=native -fopenmp gemma.c -lm -o gemma
  *   ```
  *
+ * If you are using clang, make sure to use `-O3` instead of `-Ofast`:
+ *
+ *   ```bash
+ *   clang -O3 -march=native -mtune=native -fopenmp gemma.c -lm -o gemma
+ *   ```
+ *
  * The code also supports multiple dtypes, default is set to float16. To
  * specify a different dtype, append -DDTYPE=... to the compilation command.
  * Available dtypes:
@@ -121,6 +127,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
 // A bunch of hairy cross-platform code, unrelated to the inference engine
 #ifdef _WIN32
@@ -225,6 +233,8 @@ __map_mmap_prot_file(const int prot)
 void *
 mmap(void *addr, size_t len, int prot, int flags, int fildes, int64_t off)
 {
+  (void)addr;
+
   HANDLE fm, h;
   void  *map = MAP_FAILED;
 
@@ -282,6 +292,8 @@ mmap(void *addr, size_t len, int prot, int flags, int fildes, int64_t off)
 int
 munmap(void *addr, size_t len)
 {
+  (void)len;
+
   if (UnmapViewOfFile(addr)) return 0;
   errno = GetLastError();
   return -1;
@@ -300,6 +312,8 @@ mprotect(void *addr, size_t len, int prot)
 int
 msync(void *addr, size_t len, int flags)
 {
+  (void)flags;
+
   if (FlushViewOfFile(addr, len)) return 0;
   errno = GetLastError();
   return -1;
@@ -544,6 +558,14 @@ now_sec(void)
 // NOLINTBEGIN  // Tell clang-tidy to shutup
 // Tell clang-format to ignore this blob
 // clang-format off
+// Ignore all the warnings inside this blob
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdangling-else"
+#pragma GCC diagnostic ignored "-Wmisleading-indentation"
+#pragma GCC diagnostic ignored "-Wunknown-pragmas"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-variable"
 
 enum{STBI_default=0,STBI_grey=1,STBI_grey_alpha=2,STBI_rgb=3,STBI_rgb_alpha=4};
 typedef unsigned char A;typedef unsigned short B;typedef struct{int(*A)(void*,//
@@ -3161,6 +3183,7 @@ STBIR_TYPE_FLOAT,STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern void*///////////
 stbir_resize(const void*Gw,int Gx,int Gy,int Gz,void*G0,int G1,int G2,int G3,Bs
 G4,Bv G5,Bt G6,Bu G7){return(void*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,G5,G6,G7);}////
 
+#pragma GCC diagnostic pop
 // clang-format on
 // NOLINTEND
 
@@ -3688,7 +3711,7 @@ static GemmaTokenizer *
 read_tokenizer(FILE *fp, TextConfig *cfg, bool support_mm)
 {
   GemmaTokenizer *tok;
-  CALLOC(tok, 1, "model.decoder.tokenizer", goto fail;);
+  CALLOC(tok, 1, "model.tokenizer", goto fail;);
 
   tok->vocab_size = cfg->vocab_size;
   if (support_mm)
@@ -3698,9 +3721,9 @@ read_tokenizer(FILE *fp, TextConfig *cfg, bool support_mm)
   int vocab_data_bytes = get_strarr_bytes(fp, tok->vocab_size);
   if (vocab_data_bytes == -1) goto fail;
 
-  const char *vd_name = "model.decoder.tokenizer.vocab_data";
-  const char *vc_name = "model.decoder.tokenizer.vocab";
-  const char *vt_name = "model.decoder.tokenizer.vocab_sorted";
+  const char *vd_name = "model.tokenizer.vocab_data";
+  const char *vc_name = "model.tokenizer.vocab";
+  const char *vt_name = "model.tokenizer.vocab_sorted";
 
   MALLOC(tok->vocab_data, vocab_data_bytes, vd_name, goto fail;);
   MALLOC(tok->vocab, tok->vocab_size, vc_name, goto fail;);
@@ -3730,9 +3753,9 @@ read_tokenizer(FILE *fp, TextConfig *cfg, bool support_mm)
   tok->eoi = get_token_idx(tok, "<end_of_image>");
   tok->ist = get_token_idx(tok, "<image_soft_token>");
 
-  const char *nm_name = "model.decoder.tokenizer.n_merges";
-  const char *rk_name = "model.decoder.tokenizer.ranks";
-  const char *md_name = "model.decoder.tokenizer.merge_data";
+  const char *nm_name = "model.tokenizer.n_merges";
+  const char *rk_name = "model.tokenizer.ranks";
+  const char *md_name = "model.tokenizer.merge_data";
 
   // Build merges
   READ_UINT32(tok->n_merges, fp, nm_name, goto fail;);
@@ -4155,8 +4178,7 @@ free_vision_layer_wrapper(VisionEncoderLayer *layer)
 /* Text decoder container */
 typedef struct
 {
-  TextConfig     *config;
-  GemmaTokenizer *tokenizer;
+  TextConfig *config;
   // (vocab_size, embed_dim), shared with lm_head (tied weights)
   Linear            *embedding;
   TextDecoderLayer **layers;
@@ -4224,7 +4246,6 @@ free_text_decoder(TextDecoder *dec)
 {
   if (dec == NULL) return;
 
-  free_tokenizer(dec->tokenizer);
   free_linear(dec->embedding);
   if (dec->layers != NULL && dec->config != NULL)
   {
@@ -4245,7 +4266,6 @@ free_text_decoder_wrapper(TextDecoder *dec)
 {
   if (dec == NULL) return;
 
-  free_tokenizer(dec->tokenizer);
   free(dec->embedding);
   if (dec->layers != NULL && dec->config != NULL)
   {
@@ -4848,12 +4868,13 @@ fail:
 /* Top-level model container */
 typedef struct
 {
-  TextDecoder   *decoder;
-  VisionEncoder *encoder;
-  bool           quant;  // W8A8
-  bool           support_mm;
-  void          *mmap_data;
-  size_t         mmap_size;
+  TextDecoder    *decoder;
+  VisionEncoder  *encoder;
+  GemmaTokenizer *tokenizer;
+  bool            quant;  // W8A8
+  bool            support_mm;
+  void           *mmap_data;
+  size_t          mmap_size;
 } GemmaModel;
 
 /* */
@@ -4954,6 +4975,7 @@ mmap_gemma_model(const char *filename, bool enable_mm)
   // Tokenizer
   GemmaTokenizer *tok = read_tokenizer(fp, cfg, model->support_mm);
   if (tok == NULL) goto fail;
+  model->tokenizer = tok;
 
   size_t offset = ftell(fp);
   fclose(fp);
@@ -4985,7 +5007,6 @@ mmap_gemma_model(const char *filename, bool enable_mm)
   // Text decoder
   TextDecoder *dec = mmap_text_decoder(data, cfg, &offset, model->quant);
   if (dec == NULL) goto fail;
-  dec->tokenizer = tok;
   model->decoder = dec;
 
   // Vision encoder
@@ -5046,11 +5067,11 @@ read_gemma_model(const char *filename, bool enable_mm)
   // Tokenizer
   GemmaTokenizer *tok = read_tokenizer(fp, cfg, model->support_mm);
   if (tok == NULL) goto fail;
+  model->tokenizer = tok;
 
   // Text decoder
   TextDecoder *dec = read_text_decoder(fp, cfg, model->quant);
   if (dec == NULL) goto fail;
-  dec->tokenizer = tok;
   model->decoder = dec;
 
   // Vision encoder
@@ -6006,7 +6027,7 @@ gemm_int8(
 static void
 softmax(floatx *dst, const floatx *src, int dim)
 {
-  floatx max = -(floatx)INFINITY;
+  floatx max = -FLOATX_MAX;
   for (int i = 0; i < dim; i++)
   {
     if (src[i] > max)
@@ -7344,70 +7365,43 @@ forward_gemma_prefill(
   TextDecoder *dec = model->decoder;
   int          C   = dec->config->embed_dim;
 
-  if (T <= PREFILL_FALLBACK_THRESHOLD)
+  // Prefill by chunks
+  for (int off = 0; off < T; off += chunk_size)
   {
-    // Decode every token
-    for (int i = 0; i < T; i++)
-    {
-      int token = tokens[i];
+    int  cur_len       = min(chunk_size, T - off);
+    bool is_last_chunk = (off + cur_len == T);
 
-      floatx embed_scale = 1.0f;
-      if (model->quant)
+    // Embedding lookup
+    for (int t = 0; t < cur_len; t++)
+    {
+      int token   = tokens[off + t];
+      int emb_off = t * C;
+
+      if (rpen_visited != NULL)
       {
-        embed_scale *= dec->embedding->i8.scales[token];
+        rpen_visited[token] = true;
       }
 
-      #pragma omp parallel for
       for (int d = 0; d < C; d++)
       {
         if (!model->quant)
-          buf->x[d] = dec->embedding->fpx[token * C + d] * embed_scale;
-        else
-          buf->x[d] = (floatx)dec->embedding->i8.q[token * C + d] * embed_scale;
-      }
-
-      bool need_logits = (i == T - 1) && compute_logits;
-
-      if (forward_text_decode(dec, buf, *pos + i, model->quant, need_logits) !=
-          0)
-        return 1;
-    }
-  }
-  else
-  {
-    // Prefill by chunks
-    for (int off = 0; off < T; off += chunk_size)
-    {
-      int  cur_len       = min(chunk_size, T - off);
-      bool is_last_chunk = (off + cur_len == T);
-
-      // Embedding lookup
-      for (int t = 0; t < cur_len; t++)
-      {
-        int token   = tokens[off + t];
-        int emb_off = t * C;
-
-        for (int d = 0; d < C; d++)
         {
-          if (!model->quant)
-          {
-            buf->x[emb_off + d] = dec->embedding->fpx[token * C + d];  // * 1.0f
-          }
-          else
-          {
-            buf->x[emb_off + d] = (floatx)dec->embedding->i8.q[token * C + d] *
-                                  dec->embedding->i8.scales[token];
-          }
+          buf->x[emb_off + d] = dec->embedding->fpx[token * C + d];  // * 1.0f
+        }
+        else
+        {
+          buf->x[emb_off + d] = (floatx)dec->embedding->i8.q[token * C + d] *
+                                dec->embedding->i8.scales[token];
         }
       }
-
-      int rc = forward_text_chunk(
-        dec, buf, *pos + off, cur_len, true, model->quant,
-        is_last_chunk && compute_logits
-      );
-
-      if (rc != 0) return rc;
     }
+
+    int rc = forward_text_chunk(
+      dec, buf, *pos + off, cur_len, true, model->quant,
+      is_last_chunk && compute_logits
+    );
+
+    if (rc != 0) return rc;
   }
 
   *pos += T;
@@ -7456,11 +7450,11 @@ argmax(floatx *logits, int vocab_size)
 {
   // Pick the index with the max value
   int    max_idx = -1;
-  floatx max_val = -(floatx)INFINITY;
+  floatx max_val = -FLOATX_MAX;
   #pragma omp parallel
   {
     int    local_idx = -1;
-    floatx local_val = -(floatx)INFINITY;
+    floatx local_val = -FLOATX_MAX;
     #pragma omp for nowait
     for (int i = 0; i < vocab_size; i++)
     {
@@ -7580,7 +7574,7 @@ apply_topk(floatx *logits, FloatIdx *logit_indices, int vocab_size, int k)
   #pragma omp parallel for
   for (int i = 0; i < vocab_size; i++)
   {
-    logits[i] = -(floatx)INFINITY;
+    logits[i] = -FLOATX_MAX;
   }
   for (int i = 0; i < k; i++)
   {
@@ -7669,7 +7663,7 @@ apply_topp(
   #pragma omp parallel for
   for (int i = 0; i < vocab_size; i++)
   {
-    logits[i] = -(floatx)INFINITY;
+    logits[i] = -FLOATX_MAX;
   }
 
   float cum = 0.0f;  // Cumulative prob
@@ -7855,7 +7849,7 @@ sample(
 
   // `<bos>` is always the very first token of the sequence
   {
-    int bos_tok = model->decoder->tokenizer->bos;
+    int bos_tok = model->tokenizer->bos;
     if (forward_gemma_prefill(
           model, buf, &bos_tok, 1, &pos, chunk_size, visited, false
         ) == 1)
@@ -8062,6 +8056,7 @@ typedef struct
 bool
 image_should_ignore(GemmaModel *model, bool use_mm)
 {
+  (void)model;
   return !use_mm;
 }
 
@@ -8070,7 +8065,7 @@ InjectData
 image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
 {
   VisionEncoder  *enc = model->encoder;
-  GemmaTokenizer *tok = model->decoder->tokenizer;
+  GemmaTokenizer *tok = model->tokenizer;
 
   int spos, epos;
 
@@ -8094,7 +8089,7 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
       // Inject image
       int  img_size   = (enc && use_mm) ? enc->config->image_size : 0;
       char path[4096] = {0};
-      if (ctx->cmd_ctx.arg_len >= sizeof(path))
+      if ((size_t)ctx->cmd_ctx.arg_len >= sizeof(path))
       {
         fprintf(stderr, "\nerror: image path too long\n");
         return (InjectData){.type = INJECT_QUIT};
@@ -8214,7 +8209,7 @@ scan_next_event(const char *text)
 InjectData
 inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
 {
-  GemmaTokenizer *tok = model->decoder->tokenizer;
+  GemmaTokenizer *tok = model->tokenizer;
 
   int spos, epos;
 
@@ -8222,83 +8217,84 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
   {
     while (ctx->text_len > 0)
     {
-      case 0:
-        ctx->event = scan_next_event(ctx->text);
+    case 0:
+      ctx->event = scan_next_event(ctx->text);
 
-        if (ctx->event.type == SCAN_DONE) break;
-        if (ctx->event.type == SCAN_TEXT)
-        {
-          spos = ctx->tokens_len;
-          encode(
-            tok, ctx->event.text, ctx->event.text_len, ctx->tokens_buf, spos,
-            &ctx->tokens_len
-          );
-          epos = ctx->tokens_len;
+      if (ctx->event.type == SCAN_DONE) break;
+      if (ctx->event.type == SCAN_TEXT)
+      {
+        spos = ctx->tokens_len;
+        encode(
+          tok, ctx->event.text, ctx->event.text_len, ctx->tokens_buf, spos,
+          &ctx->tokens_len
+        );
+        epos = ctx->tokens_len;
 
-          ctx->state = 1;
-          return (InjectData){
-            .type     = INJECT_TEXT,
-            .tokens   = ctx->tokens_buf + spos,
-            .n_tokens = epos - spos,
-          };
-
-          case 1:
-            ctx->text_len -= ctx->event.remaining - ctx->text;
-            ctx->text  = ctx->event.remaining;
-            ctx->state = 0;
-            continue;
-        }
-
-        char *raw     = ctx->event.cmd.raw;
-        int   raw_len = ctx->event.cmd.raw_len;
-
-        if (ctx->event.cmd.type.should_ignore(model, use_mm))
-        {
-          // Ignore the command
-          spos = ctx->tokens_len;
-          encode(tok, raw, raw_len, ctx->tokens_buf, spos, &ctx->tokens_len);
-          epos = ctx->tokens_len;
-
-          ctx->state = 2;
-          return (InjectData){
-            .type     = INJECT_TEXT,
-            .tokens   = ctx->tokens_buf + spos,
-            .n_tokens = epos - spos,
-          };
-
-          case 2:
-            ctx->text_len -= ctx->event.remaining - ctx->text;
-            ctx->text = ctx->event.remaining;
-            continue;
-        }
-
-        ctx->cmd_ctx = (CommandContext){
-          .state   = 0,
-          .arg     = ctx->event.cmd.arg,
-          .arg_len = ctx->event.cmd.arg_len,
+        ctx->state = 1;
+        return (InjectData){
+          .type     = INJECT_TEXT,
+          .tokens   = ctx->tokens_buf + spos,
+          .n_tokens = epos - spos,
         };
 
-        InjectData r;
-        for (;;)
-        {
-          r = ctx->event.cmd.type.inject_next(model, ctx, use_mm);
-          if (r.type != INJECT_DONE)
-          {
-            ctx->state = 3;
-            return r;
-            case 3:;
-          }
-          else
-          {
-            ctx->state = 4;  // done
-            break;
-          }
-        }
+    case 1:
+        ctx->text_len -= ctx->event.remaining - ctx->text;
+        ctx->text  = ctx->event.remaining;
+        ctx->state = 0;
+        continue;
+      }
 
+      char *raw     = ctx->event.cmd.raw;
+      int   raw_len = ctx->event.cmd.raw_len;
+
+      if (ctx->event.cmd.type.should_ignore(model, use_mm))
+      {
+        spos = ctx->tokens_len;
+        encode(tok, raw, raw_len, ctx->tokens_buf, spos, &ctx->tokens_len);
+        epos = ctx->tokens_len;
+
+        ctx->state = 2;
+        return (InjectData){
+          .type     = INJECT_TEXT,
+          .tokens   = ctx->tokens_buf + spos,
+          .n_tokens = epos - spos,
+        };
+
+    case 2:
         ctx->text_len -= ctx->event.remaining - ctx->text;
         ctx->text = ctx->event.remaining;
+        continue;
+      }
+
+      ctx->cmd_ctx = (CommandContext){
+        .state   = 0,
+        .arg     = ctx->event.cmd.arg,
+        .arg_len = ctx->event.cmd.arg_len,
+      };
+
+      InjectData r;
+      for (;;)
+      {
+        r = ctx->event.cmd.type.inject_next(model, ctx, use_mm);
+        if (r.type != INJECT_DONE)
+        {
+          ctx->state = 3;
+          return r;
+    case 3:
+          ;
+        }
+        else
+        {
+          ctx->state = 4;  // done
+          break;
+        }
+      }
+
+      ctx->text_len -= ctx->event.remaining - ctx->text;
+      ctx->text = ctx->event.remaining;
     }
 
+    __attribute__((fallthrough));
     default:
       ctx->state = GENERATOR_EXIT;
       return (InjectData){.type = INJECT_DONE};
@@ -8309,7 +8305,7 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
 InjectData
 generate_inject_callback(int token, GemmaModel *model, bool use_mm, void *ctx)
 {
-  GemmaTokenizer *tok = model->decoder->tokenizer;
+  GemmaTokenizer *tok = model->tokenizer;
   if (token == EOF)
   {
     // Request for prefilling
@@ -8344,8 +8340,6 @@ generate(
   bool          enable_mm
 )
 {
-  GemmaTokenizer *tok = model->decoder->tokenizer;
-
   printf("%s", prompt);
 
   int *tokens_buf;
@@ -8378,7 +8372,7 @@ new_turn(GemmaModel *model, bool use_mm, ChatContext *ctx)
    * What is Cramer's Rule?<end_of_turn>\n
    * <start_of_turn>model */
 
-  GemmaTokenizer *tok  = model->decoder->tokenizer;
+  GemmaTokenizer *tok  = model->tokenizer;
   InjectContext  *jctx = ctx->jctx;
 
   int        spos, epos;
@@ -8444,7 +8438,8 @@ new_turn(GemmaModel *model, bool use_mm, ChatContext *ctx)
           ctx->state = 2;
           return r;
 
-          case 2:;
+    case 2:
+          ;
         }
         else
         {
@@ -8495,8 +8490,7 @@ new_turn(GemmaModel *model, bool use_mm, ChatContext *ctx)
 static InjectData
 chat_inject_callback(int token, GemmaModel *model, bool use_mm, void *ctx)
 {
-  TextDecoder    *dec = model->decoder;
-  GemmaTokenizer *tok = dec->tokenizer;
+  GemmaTokenizer *tok = model->tokenizer;
   ChatContext    *cc  = (ChatContext *)ctx;
 
   if (token == tok->eos || token == tok->eot)
@@ -8532,8 +8526,6 @@ chat(
   bool          use_mm
 )
 {
-  GemmaTokenizer *tok = model->decoder->tokenizer;
-
   int  *tokens_buf = NULL;
   char *line_buf   = NULL;
 
@@ -8559,18 +8551,10 @@ chat(
     &ctx, chat_inject_callback
   );
 
-  int r;
-end:
-  r = 0;
-  goto cleanup;
 fail:
-  r = 1;
-  goto cleanup;
-
-cleanup:
   free(tokens_buf);
   free(line_buf);
-  return r;
+  return 1;
 }
 
 // CLI
@@ -8631,11 +8615,12 @@ print_model_config(
   GemmaModel *model, int seqlen, int chunk_size, bool enable_mm
 )
 {
-  const int       width = 20;
-  VisionEncoder  *enc   = model->encoder;
-  TextDecoder    *dec   = model->decoder;
-  TextConfig     *cfg   = dec->config;
-  GemmaTokenizer *tok   = dec->tokenizer;
+  const int       width  = 20;
+  bool            use_mm = model->support_mm && enable_mm;
+  VisionEncoder  *enc    = model->encoder;
+  TextDecoder    *dec    = model->decoder;
+  GemmaTokenizer *tok    = model->tokenizer;
+  TextConfig     *cfg    = dec->config;
 
   printf("\n========== model configuration ==========\n");
   printf("architecture:\n");
@@ -8681,6 +8666,22 @@ print_model_config(
   printf("  %-*s: %d\n", width, "pre_mlp_norm", cfg->pre_mlp_norm);
   printf("  %-*s: %d\n", width, "pst_mlp_norm", cfg->pst_mlp_norm);
 
+  // Vision encoder architecture (if available and enabled)
+  if (use_mm)
+  {
+    VisionConfig *vcfg = enc->config;
+    printf("\nvision:\n");
+    printf("  %-*s: %d\n", width, "n_layers", vcfg->n_layers);
+    printf("  %-*s: %d\n", width, "image_size", vcfg->image_size);
+    printf("  %-*s: %d\n", width, "patch_size", vcfg->patch_size);
+    printf("  %-*s: %d\n", width, "hidden_dim", vcfg->hidden_dim);
+    printf("  %-*s: %d\n", width, "n_heads", vcfg->n_heads);
+    printf("  %-*s: %d\n", width, "mlp_dim", vcfg->mlp_dim);
+    printf("  %-*s: %.6f\n", width, "eps", vcfg->eps);
+  }
+
+  // Runtime flags
+  printf("\nruntime:\n");
   printf("  %-*s: %d\n", width, "quant", model->quant);
   printf("  %-*s: %d\n", width, "support_mm", model->support_mm);
 
@@ -8708,8 +8709,6 @@ print_model_config(
   int   vs  = cfg->vocab_size;
   float GB  = 1024.0 * 1024.0 * 1024.0;
 
-  bool use_mm = model->support_mm && enable_mm;
-
   // Text buffer
   size_t decB = 0;
 
@@ -8732,18 +8731,18 @@ print_model_config(
 
   // Main buffers
   decB += L * 2 * seqlen * Ckv * sizeof(floatx);  // kv_cache
-  decB += vs * sizeof(floatx);                    // logits
-  decB += mult * C * sizeof(floatx);              // x
-  decB += mult * C * sizeof(floatx);              // resid
-  decB += mult * Cq * sizeof(floatx);             // xq
+  decB += vs   * sizeof(floatx);                  // logits
+  decB += mult * C   * sizeof(floatx);            // x
+  decB += mult * C   * sizeof(floatx);            // resid
+  decB += mult * Cq  * sizeof(floatx);            // xq
   decB += mult * Ckv * sizeof(floatx);            // xk
-  decB += mult * CH * sizeof(floatx);             // csfreqs_slid
-  decB += mult * CH * sizeof(floatx);             // csfreqs_full
+  decB += mult * CH  * sizeof(floatx);            // csfreqs_slid
+  decB += mult * CH  * sizeof(floatx);            // csfreqs_full
   decB += mult * Ckv * sizeof(floatx);            // xv
-  decB += mult * Cq * sizeof(floatx);             // xo
-  decB += mult * NH * seqlen * sizeof(floatx);    // att
-  decB += mult * CM * sizeof(floatx);             // xg
-  decB += mult * CM * sizeof(floatx);             // xu
+  decB += mult * Cq  * sizeof(floatx);            // xo
+  decB += mult * NH  * seqlen * sizeof(floatx);   // att
+  decB += mult * CM  * sizeof(floatx);            // xg
+  decB += mult * CM  * sizeof(floatx);            // xu
 
   printf("  %-*s: %.2f GB\n", width, "decoder buffer", (float)decB / GB);
 
@@ -8767,14 +8766,14 @@ print_model_config(
     }
 
     // Main buffers
-    encB += N * C * sizeof(floatx);       // x
-    encB += N * C * sizeof(floatx);       // resid
-    encB += N * C * sizeof(floatx);       // xq
-    encB += N * C * sizeof(floatx);       // xk
-    encB += N * C * sizeof(floatx);       // xv
-    encB += N * C * sizeof(floatx);       // att_out
-    encB += N * CM * sizeof(floatx);      // mlp_hidden
-    encB += N * N * NH * sizeof(floatx);  // scores
+    encB += N * C  * sizeof(floatx);       // x
+    encB += N * C  * sizeof(floatx);       // resid
+    encB += N * C  * sizeof(floatx);       // xq
+    encB += N * C  * sizeof(floatx);       // xk
+    encB += N * C  * sizeof(floatx);       // xv
+    encB += N * C  * sizeof(floatx);       // att_out
+    encB += N * CM * sizeof(floatx);       // mlp_hidden
+    encB += N * N  * NH * sizeof(floatx);  // scores
 
     printf("  %-*s: %.2f GB\n", width, "encoder buffer", (float)encB / GB);
   }
