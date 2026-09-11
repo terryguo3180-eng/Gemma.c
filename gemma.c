@@ -99,6 +99,13 @@
  * <end_of_image> templates). You can also disable the multimodal part using
  * the `--disable-mm` argument to reduce some memory usage.
  *
+ * For images with large aspect ratio, use @image_pas{...} to enable the "pan
+ * and scan" utility:
+ *
+ *   ```
+ *   > How do you feel about the bottom part of this image @image_pas{long.png}?
+ *   ```
+ *
  * Most of the standard inference controls are available through command-line
  * options: sequence length, temperature, top-k and top-p sampling, repetition
  * penalty, and random seed. Use `-?` / `--help` argument to check out all the
@@ -341,6 +348,7 @@ munlock(const void *addr, size_t len)
 static void
 set_utf8_console(void)
 {
+  // Set encoding to UTF-8
   SetConsoleOutputCP(65001);
   SetConsoleCP(65001);
 }
@@ -3213,9 +3221,14 @@ G4,Bv G5,Bt G6,Bu G7){return(void*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,G5,G6,G7);}////
 #define QK_BLOCK_SIZE 64
 
 // Prompt used in pan & scan
-// https://github.com/google/gemma_pytorch/blob/main/gemma/gemma3_preprocessor.py)
+// google/gemma_pytorch/blob/main/gemma/gemma3_preprocessor.py
 #define CROPPED_IMAGE_PREFIX "here is the original image"
 #define CROPPED_IMAGE_FILTER "and here are some crops to help you see better"
+
+// Default parameters used in pan & scan
+// google/gemma_pytorch/blob/main/gemma/siglip_vision/pan_and_scan.py
+#define MIN_CROP_SIZE 256
+#define MAX_NUM_CROPS 4
 
 // Macros for different dtypes
 // TODO: dispatch dtype at runtime using the `#include __FILE__` trick
@@ -3789,15 +3802,14 @@ fail:
 }
 
 /* Minimal byte-pair encoding algorithm implementation */
-int *
+void
 encode(
   GemmaTokenizer *tok,
   const char     *text,
   int             len,
   int            *tokens,
   int             spos,
-  int            *n_tokens
-)
+  int            *n_tokens)
 {
   unsigned char *ustr = (unsigned char *)text;
 
@@ -3912,7 +3924,6 @@ encode(
   }
 
   *n_tokens += tok_i;
-  return tokens;
 }
 
 /* */
@@ -4526,8 +4537,7 @@ typedef struct
 /* */
 size_t
 get_vision_encoder_size(
-  const VisionConfig *vcfg, const TextConfig *cfg, bool quant
-)
+  const VisionConfig *vcfg, const TextConfig *cfg, bool quant)
 {
   size_t size = 0;
   int    P    = vcfg->patch_size;
@@ -4746,8 +4756,7 @@ fail:
 /* */
 static VisionEncoder *
 mmap_vision_encoder(
-  void *data, TextConfig *cfg, VisionConfig *vcfg, size_t *offset, bool quant
-)
+  void *data, TextConfig *cfg, VisionConfig *vcfg, size_t *offset, bool quant)
 {
   VisionEncoder *enc;
   CALLOC(enc, 1, "model.encoder", goto fail;);
@@ -4882,6 +4891,7 @@ void
 free_gemma_model(GemmaModel *model)
 {
   if (model == NULL) return;
+  free_tokenizer(model->tokenizer);
   free_vision_encoder(model->encoder);
   free_text_decoder(model->decoder);
   free(model);
@@ -4892,6 +4902,7 @@ void
 munmap_gemma_model(GemmaModel *model)
 {
   if (model == NULL) return;
+  free_tokenizer(model->tokenizer);
   munmap(model->mmap_data, model->mmap_size);
   free_vision_encoder_wrapper(model->encoder);
   free_text_decoder_wrapper(model->decoder);
@@ -5261,8 +5272,7 @@ malloc_text_buffer(
   int           cache_len,
   int           chunk_size,
   bool          use_mm,
-  bool          quant
-)
+  bool          quant)
 {
   TextBuffer *buf = NULL;
   CALLOC(buf, 1, "buf", goto fail;);  // Init to all NULL
@@ -5354,8 +5364,7 @@ clamp_fpx(floatx v)
 /* Gemma-style RMSNorm: (x * rsqrt(mean(x^2) + eps)) * (weight + 1) */
 static void
 rmsnorm(
-  floatx *dst, const floatx *src, const floatx *weight, int dim, float eps
-)
+  floatx *dst, const floatx *src, const floatx *weight, int dim, float eps)
 {
   float sqsum = 0.0f;
   #pragma omp simd reduction(+ : sqsum)
@@ -5379,8 +5388,7 @@ layernorm(
   const floatx *weight,
   const floatx *bias,
   int           dim,
-  float         eps
-)
+  float         eps)
 {
   float mean = 0.0f;
   #pragma omp simd reduction(+ : mean)
@@ -5454,8 +5462,7 @@ quantize_acts(
   int                    src_stride,
   int                    m,
   int                    n,
-  bool                   omp
-)
+  bool                   omp)
 {
   if (src_stride == 0)
   {
@@ -5480,8 +5487,7 @@ quantize_acts(
 /* */
 static inline floatx
 gemv_fpx_row(
-  const floatx *restrict vec, const floatx *restrict mat, int n, int i
-)
+  const floatx *restrict vec, const floatx *restrict mat, int n, int i)
 {
   float sum = 0;
   #pragma omp simd reduction(+ : sum)
@@ -5501,8 +5507,7 @@ gemv_fpx(
   const floatx *restrict vec,
   int                    m,
   int                    n,
-  bool                   omp
-)
+  bool                   omp)
 {
   if (omp)
   {
@@ -5527,8 +5532,7 @@ gemv_int8_row(
   const int8_t *restrict mat,
   const floatx *restrict mat_scales,
   int                    n,
-  int                    i
-)
+  int                    i)
 {
   int32_t sum = 0;
   #pragma omp simd reduction(+ : sum)
@@ -5551,8 +5555,7 @@ gemv_int8(
   floatx                 vec_scale,
   int                    m,
   int                    n,
-  bool                   omp
-)
+  bool                   omp)
 {
   if (omp)
   {
@@ -5579,8 +5582,7 @@ gemv_fpx_nn(
   const floatx *restrict mat,
   int                    mat_stride,
   int                    n,
-  int                    m
-)
+  int                    m)
 {
   if (mat_stride == 0) mat_stride = m;
 
@@ -5607,63 +5609,140 @@ gemv_fpx_nn(
   }
 }
 
-/* Compute one MRxNR tile of dst = src @ mat.T, dot-product form.
- * `mat`/`src` rows are read with their natural strides; the tile itself
- * is dense (GEMM_NT_MR x GEMM_NT_NR), never partial. */
+/* Copy `rows` rows (stride `row_stride`, length k each) of `src` into a
+ * contiguous, already-upcast-to-float buffer laid out as `packed[l*rows + r]`,
+ * so the micro-kernel can read all `rows` values for a fixed `l` with one
+ * contiguous load instead of `rows` separate strided reads. */
+static inline void
+pack_panel(
+  float *restrict        packed,
+  const floatx *restrict src,
+  int                    row_stride,
+  int                    rows,
+  int                    k)
+{
+  for (int r = 0; r < rows; r++)
+  {
+    const floatx *row = src + r * row_stride;
+    #pragma omp simd
+    for (int l = 0; l < k; l++)
+    {
+      packed[l * rows + r] = (float)row[l];
+    }
+  }
+}
+
+/* Pack every R-row panel of a (total_rows x k) matrix, back to back, into one
+ * contiguous buffer. Parallelized because for large prefill chunks this alone
+ * touches every element of `mat` once. */
+static void
+pack_all(
+  float *restrict        packed_full,
+  const floatx *restrict mat,
+  int                    stride,
+  int                    total_rows,
+  int                    R,
+  int                    k,
+  bool                   omp)
+{
+  if (omp)
+  {
+    #pragma omp parallel for
+    for (int base = 0; base < total_rows; base += R)
+    {
+      pack_panel(
+        packed_full + (size_t)base * k, mat + (size_t)base * stride, stride, R,
+        k
+      );
+    }
+  }
+  else
+  {
+    for (int base = 0; base < total_rows; base += R)
+    {
+      pack_panel(
+        packed_full + (size_t)base * k, mat + (size_t)base * stride, stride, R,
+        k
+      );
+    }
+  }
+}
+
+/* Compute one 8x8 tile of dst = src @ mat.T from PACKED, contiguous
+ * MR/NR-major panels (see pack_panel/pack_all). The 64 FMAs are spelled out by
+ * hand rather than as a nested i/j loop. GCC vectorizes the nested-loop form
+ * just fine, but Clang's optimizer can only produces good code once the
+ * accumulation is fully unrolled with compile-time-constant indices :'D. So I
+ * just hardcoded for GEMM_NT_MR == GEMM_NT_NR == 8. */
 static inline void
 gemm_fpx_kernel(
-  floatx *restrict       dst,
-  int                    dst_stride,
-  const floatx *restrict mat,
-  int                    mat_stride,
-  const floatx *restrict src,
-  int                    src_stride,
-  int                    k
-)
+  floatx *restrict      dst,
+  int                   dst_stride,
+  const float *restrict Bp,
+  const float *restrict Ap,
+  int                   k)
 {
-  float acc[GEMM_NT_MR][GEMM_NT_NR] = {{0}};
-
-  const floatx *s[GEMM_NT_MR];
-  const floatx *w[GEMM_NT_NR];
-
-  for (int i = 0; i < GEMM_NT_MR; i++)
-  {
-    s[i] = src + i * src_stride;
-  }
-  for (int j = 0; j < GEMM_NT_NR; j++)
-  {
-    w[j] = mat + j * mat_stride;
-  }
+  float acc[64] = {0};
 
   for (int l = 0; l < k; l++)
   {
-    float a[GEMM_NT_MR];
-    float b[GEMM_NT_NR];
-    for (int i = 0; i < GEMM_NT_MR; i++)
-    {
-      a[i] = (float)s[i][l];
-    }
-    for (int j = 0; j < GEMM_NT_NR; j++)
-    {
-      b[j] = (float)w[j][l];
-    }
+    float a0 = Ap[l * 8 + 0];
+    float a1 = Ap[l * 8 + 1];
+    float a2 = Ap[l * 8 + 2];
+    float a3 = Ap[l * 8 + 3];
+    float a4 = Ap[l * 8 + 4];
+    float a5 = Ap[l * 8 + 5];
+    float a6 = Ap[l * 8 + 6];
+    float a7 = Ap[l * 8 + 7];
+    float b0 = Bp[l * 8 + 0];
+    float b1 = Bp[l * 8 + 1];
+    float b2 = Bp[l * 8 + 2];
+    float b3 = Bp[l * 8 + 3];
+    float b4 = Bp[l * 8 + 4];
+    float b5 = Bp[l * 8 + 5];
+    float b6 = Bp[l * 8 + 6];
+    float b7 = Bp[l * 8 + 7];
 
-    for (int i = 0; i < GEMM_NT_MR; i++)
-      for (int j = 0; j < GEMM_NT_NR; j++)
-      {
-        acc[i][j] += a[i] * b[j];
-      }
+    acc[ 0] += a0*b0; acc[ 1] += a0*b1;
+    acc[ 2] += a0*b2; acc[ 3] += a0*b3;
+    acc[ 4] += a0*b4; acc[ 5] += a0*b5;
+    acc[ 6] += a0*b6; acc[ 7] += a0*b7;
+    acc[ 8] += a1*b0; acc[ 9] += a1*b1;
+    acc[10] += a1*b2; acc[11] += a1*b3;
+    acc[12] += a1*b4; acc[13] += a1*b5;
+    acc[14] += a1*b6; acc[15] += a1*b7;
+    acc[16] += a2*b0; acc[17] += a2*b1;
+    acc[18] += a2*b2; acc[19] += a2*b3;
+    acc[20] += a2*b4; acc[21] += a2*b5;
+    acc[22] += a2*b6; acc[23] += a2*b7;
+    acc[24] += a3*b0; acc[25] += a3*b1;
+    acc[26] += a3*b2; acc[27] += a3*b3;
+    acc[28] += a3*b4; acc[29] += a3*b5;
+    acc[30] += a3*b6; acc[31] += a3*b7;
+    acc[32] += a4*b0; acc[33] += a4*b1;
+    acc[34] += a4*b2; acc[35] += a4*b3;
+    acc[36] += a4*b4; acc[37] += a4*b5;
+    acc[38] += a4*b6; acc[39] += a4*b7;
+    acc[40] += a5*b0; acc[41] += a5*b1;
+    acc[42] += a5*b2; acc[43] += a5*b3;
+    acc[44] += a5*b4; acc[45] += a5*b5;
+    acc[46] += a5*b6; acc[47] += a5*b7;
+    acc[48] += a6*b0; acc[49] += a6*b1;
+    acc[50] += a6*b2; acc[51] += a6*b3;
+    acc[52] += a6*b4; acc[53] += a6*b5;
+    acc[54] += a6*b6; acc[55] += a6*b7;
+    acc[56] += a7*b0; acc[57] += a7*b1;
+    acc[58] += a7*b2; acc[59] += a7*b3;
+    acc[60] += a7*b4; acc[61] += a7*b5;
+    acc[62] += a7*b6; acc[63] += a7*b7;
   }
 
-  for (int i = 0; i < GEMM_NT_MR; i++)
-    for (int j = 0; j < GEMM_NT_NR; j++)
-    {
-      dst[i * dst_stride + j] = (floatx)acc[i][j];
-    }
+  for (int i = 0; i < 8; i++)
+    for (int j = 0; j < 8; j++)
+      dst[i * dst_stride + j] = (floatx)acc[i * 8 + j];
 }
 
-/* Scalar fallback for the m%4 / n%4 remainder tiles (and for m or n < 4
- * outright, e.g. tiny prefill chunks). Same math as the original loop. */
+/* Scalar fallback for the remainder tiles. */
 static inline void
 gemm_fpx_scalar(
   floatx *restrict       dst,
@@ -5674,8 +5753,7 @@ gemm_fpx_scalar(
   int                    src_stride,
   int                    m,
   int                    n,
-  int                    k
-)
+  int                    k)
 {
   for (int i = 0; i < m; i++)
     for (int j = 0; j < n; j++)
@@ -5688,6 +5766,24 @@ gemm_fpx_scalar(
         sum += (float)src_row[l] * (float)w_row[l];
       dst[i * dst_stride + j] = (floatx)sum;
     }
+}
+
+// _Thread_local is critical here since these will be used in openmp threads
+static _Thread_local float *gemm_fpx_pack_scratch     = NULL;
+static _Thread_local size_t gemm_fpx_pack_scratch_cap = 0;   // in floats
+
+/* */
+static float *
+gemm_pack_scratch_get(size_t needed_floats)
+{
+  if (needed_floats > gemm_fpx_pack_scratch_cap)
+  {
+    float *tmp = realloc(gemm_fpx_pack_scratch, needed_floats * sizeof(float));
+    if (tmp == NULL) return NULL;
+    gemm_fpx_pack_scratch     = tmp;
+    gemm_fpx_pack_scratch_cap = needed_floats;
+  }
+  return gemm_fpx_pack_scratch;
 }
 
 /* fpx matrix-matrix multiply (NT)
@@ -5703,8 +5799,7 @@ gemm_fpx(
   int                    m,
   int                    n,
   int                    k,
-  bool                   omp
-)
+  bool                   omp)
 {
   if (dst_stride == 0) dst_stride = n;
   if (mat_stride == 0) mat_stride = k;
@@ -5713,31 +5808,44 @@ gemm_fpx(
   int m_full = (m / GEMM_NT_MR) * GEMM_NT_MR;
   int n_full = (n / GEMM_NT_NR) * GEMM_NT_NR;
 
-  if (omp)
+  if (m_full > 0 && n_full > 0)
   {
-    /* Loop order is jb (column panel of `mat`) outer, ib (row block of
-     * `src`) inner: every tile computed while jb is fixed shares the same
-     * 4 rows of `mat`, which is what actually needs to stay resident. */
-    #pragma omp parallel for collapse(2)
-    for (int jb = 0; jb < n_full; jb += GEMM_NT_NR)
-      for (int ib = 0; ib < m_full; ib += GEMM_NT_MR)
-      {
-        gemm_fpx_kernel(
-          dst + ib * dst_stride + jb, dst_stride, mat + jb * mat_stride,
-          mat_stride, src + ib * src_stride, src_stride, k
-        );
-      }
-  }
-  else
-  {
-    for (int jb = 0; jb < n_full; jb += GEMM_NT_NR)
-      for (int ib = 0; ib < m_full; ib += GEMM_NT_MR)
-      {
-        gemm_fpx_kernel(
-          dst + ib * dst_stride + jb, dst_stride, mat + jb * mat_stride,
-          mat_stride, src + ib * src_stride, src_stride, k
-        );
-      }
+    size_t needed = (size_t)(m_full + n_full) * k;
+    float *scratch = gemm_pack_scratch_get(needed);
+    if (scratch == NULL)
+    {
+      fprintf(stderr, "error: gemm packing scratch allocation failed\n");
+      return;
+    }
+    float *Ap_full = scratch;
+    float *Bp_full = scratch + (size_t)m_full * k;
+
+    pack_all(Ap_full, src, src_stride, m_full, GEMM_NT_MR, k, omp);
+    pack_all(Bp_full, mat, mat_stride, n_full, GEMM_NT_NR, k, omp);
+
+    if (omp)
+    {
+      #pragma omp parallel for collapse(2)
+      for (int jb = 0; jb < n_full; jb += GEMM_NT_NR)
+        for (int ib = 0; ib < m_full; ib += GEMM_NT_MR)
+        {
+          gemm_fpx_kernel(
+            dst + ib * dst_stride + jb, dst_stride, Bp_full + (size_t)jb * k,
+            Ap_full + (size_t)ib * k, k
+          );
+        }
+    }
+    else
+    {
+      for (int jb = 0; jb < n_full; jb += GEMM_NT_NR)
+        for (int ib = 0; ib < m_full; ib += GEMM_NT_MR)
+        {
+          gemm_fpx_kernel(
+            dst + ib * dst_stride + jb, dst_stride, Bp_full + (size_t)jb * k,
+            Ap_full + (size_t)ib * k, k
+          );
+        }
+    }
   }
 
   // Remainder: leftover rows (full width) + leftover columns (remaining
@@ -5749,7 +5857,7 @@ gemm_fpx(
       src + m_full * src_stride, src_stride, m - m_full, n, k
     );
   }
-  if (n_full < n)
+  if (n_full < n && m_full > 0)
   {
     gemm_fpx_scalar(
       dst + n_full, dst_stride, mat + n_full * mat_stride, mat_stride, src,
@@ -5772,8 +5880,7 @@ gemm_fpx_nn_kernel(
   int                    src_stride,
   int                    mr,
   int                    n,
-  int                    k
-)
+  int                    k)
 {
   float acc[GEMM_NN_MR][n];
   float row[n];
@@ -5823,8 +5930,7 @@ gemm_fpx_nn(
   int                    m,
   int                    n,
   int                    k,
-  bool                   omp
-)
+  bool                   omp)
 {
   if (dst_stride == 0) dst_stride = n;
   if (mat_stride == 0) mat_stride = n;
@@ -5864,59 +5970,150 @@ gemm_fpx_nn(
   }
 }
 
+static _Thread_local int8_t *gemm_i8_pack_scratch     = NULL;
+static _Thread_local size_t  gemm_i8_pack_scratch_cap = 0;
+
 /* */
-static inline void
-gemm_int8_kernel(
-  floatx *restrict       dst,
-  int                    dst_stride,
-  const int8_t *restrict mat,
-  int                    mat_stride,
-  const floatx *restrict mat_scales,
-  const int8_t *restrict src,
-  int                    src_stride,
-  const floatx *restrict src_scales,
-  int                    k
-)
+static int8_t *
+gemm_i8_pack_scratch_get(size_t needed_bytes)
 {
-  int32_t acc[GEMM_I8_MR][GEMM_I8_NR] = {{0}};
-
-  const int8_t *s[GEMM_I8_MR];
-  const int8_t *w[GEMM_I8_NR];
-  for (int i = 0; i < GEMM_I8_MR; i++)
-    s[i] = src + i * src_stride;
-  for (int j = 0; j < GEMM_I8_NR; j++)
-    w[j] = mat + j * mat_stride;
-
-  for (int l = 0; l < k; l++)
+  if (needed_bytes > gemm_i8_pack_scratch_cap)
   {
-    int32_t a[GEMM_I8_MR];
-    int32_t b[GEMM_I8_NR];
-    for (int i = 0; i < GEMM_I8_MR; i++)
-      a[i] = s[i][l];
-    for (int j = 0; j < GEMM_I8_NR; j++)
-      b[j] = w[j][l];
-
-    for (int i = 0; i < GEMM_I8_MR; i++)
-    {
-      for (int j = 0; j < GEMM_I8_NR; j++)
-      {
-        acc[i][j] += a[i] * b[j];
-      }
-    }
+    int8_t *tmp = realloc(gemm_i8_pack_scratch, needed_bytes);
+    if (tmp == NULL) return NULL;
+    gemm_i8_pack_scratch     = tmp;
+    gemm_i8_pack_scratch_cap = needed_bytes;
   }
+  return gemm_i8_pack_scratch;
+}
 
-  for (int i = 0; i < GEMM_I8_MR; i++)
+/* Same idea as pack_panel/pack_all for fpx, but source/dest are int8_t, no
+ * upcast needed, this is a pure gather-to-contiguous transpose. */
+static inline void
+pack_panel_i8(
+  int8_t *restrict       packed,
+  const int8_t *restrict src,
+  int                    row_stride,
+  int                    rows,
+  int                    k)
+{
+  for (int r = 0; r < rows; r++)
   {
-    float fscale = (float)src_scales[i];
-    for (int j = 0; j < GEMM_I8_NR; j++)
+    const int8_t *row = src + r * row_stride;
+    #pragma omp simd
+    for (int l = 0; l < k; l++)
     {
-      float val = (float)acc[i][j] * fscale * (float)mat_scales[j];
-      dst[i * dst_stride + j] = (floatx)val;
+      packed[l * rows + r] = row[l];
     }
   }
 }
 
-/* Scalar fallback for the m%4 / n%4 remainder tiles. */
+/* */
+static void
+pack_all_i8(
+  int8_t *restrict       packed_full,
+  const int8_t *restrict mat,
+  int                    stride,
+  int                    total_rows,
+  int                    R,
+  int                    k,
+  bool                   omp)
+{
+  if (omp)
+  {
+    #pragma omp parallel for
+    for (int base = 0; base < total_rows; base += R)
+    {
+      pack_panel_i8(
+        packed_full + (size_t)base * k, mat + (size_t)base * stride, stride, R, k
+      );
+    }
+  }
+  else
+  {
+    for (int base = 0; base < total_rows; base += R)
+    {
+      pack_panel_i8(
+        packed_full + (size_t)base * k, mat + (size_t)base * stride, stride, R, k
+      );
+    }
+  }
+}
+
+/* Hardcoded for GEMM_I8_MR == GEMM_I8_NR == 8 */
+static inline void
+gemm_int8_kernel(
+  floatx *restrict dst, int dst_stride, const int8_t *restrict Bp,
+  const floatx *restrict mat_scales, const int8_t *restrict Ap,
+  const floatx *restrict src_scales, int k
+)
+{
+  int32_t acc[64] = {0};
+
+  for (int l = 0; l < k; l++)
+  {
+    int32_t a0 = Ap[l*8+0];
+    int32_t a1 = Ap[l*8+1];
+    int32_t a2 = Ap[l*8+2];
+    int32_t a3 = Ap[l*8+3];
+    int32_t a4 = Ap[l*8+4];
+    int32_t a5 = Ap[l*8+5];
+    int32_t a6 = Ap[l*8+6];
+    int32_t a7 = Ap[l*8+7];
+    int32_t b0 = Bp[l*8+0];
+    int32_t b1 = Bp[l*8+1];
+    int32_t b2 = Bp[l*8+2];
+    int32_t b3 = Bp[l*8+3];
+    int32_t b4 = Bp[l*8+4];
+    int32_t b5 = Bp[l*8+5];
+    int32_t b6 = Bp[l*8+6];
+    int32_t b7 = Bp[l*8+7];
+
+    acc[ 0] += a0*b0; acc[ 1] += a0*b1;
+    acc[ 2] += a0*b2; acc[ 3] += a0*b3;
+    acc[ 4] += a0*b4; acc[ 5] += a0*b5;
+    acc[ 6] += a0*b6; acc[ 7] += a0*b7;
+    acc[ 8] += a1*b0; acc[ 9] += a1*b1;
+    acc[10] += a1*b2; acc[11] += a1*b3;
+    acc[12] += a1*b4; acc[13] += a1*b5;
+    acc[14] += a1*b6; acc[15] += a1*b7;
+    acc[16] += a2*b0; acc[17] += a2*b1;
+    acc[18] += a2*b2; acc[19] += a2*b3;
+    acc[20] += a2*b4; acc[21] += a2*b5;
+    acc[22] += a2*b6; acc[23] += a2*b7;
+    acc[24] += a3*b0; acc[25] += a3*b1;
+    acc[26] += a3*b2; acc[27] += a3*b3;
+    acc[28] += a3*b4; acc[29] += a3*b5;
+    acc[30] += a3*b6; acc[31] += a3*b7;
+    acc[32] += a4*b0; acc[33] += a4*b1;
+    acc[34] += a4*b2; acc[35] += a4*b3;
+    acc[36] += a4*b4; acc[37] += a4*b5;
+    acc[38] += a4*b6; acc[39] += a4*b7;
+    acc[40] += a5*b0; acc[41] += a5*b1;
+    acc[42] += a5*b2; acc[43] += a5*b3;
+    acc[44] += a5*b4; acc[45] += a5*b5;
+    acc[46] += a5*b6; acc[47] += a5*b7;
+    acc[48] += a6*b0; acc[49] += a6*b1;
+    acc[50] += a6*b2; acc[51] += a6*b3;
+    acc[52] += a6*b4; acc[53] += a6*b5;
+    acc[54] += a6*b6; acc[55] += a6*b7;
+    acc[56] += a7*b0; acc[57] += a7*b1;
+    acc[58] += a7*b2; acc[59] += a7*b3;
+    acc[60] += a7*b4; acc[61] += a7*b5;
+    acc[62] += a7*b6; acc[63] += a7*b7;
+  }
+
+  for (int i = 0; i < 8; i++)
+  {
+    float fscale = (float)src_scales[i];
+    for (int j = 0; j < 8; j++)
+    {
+      dst[i * dst_stride + j] = (floatx)((float)acc[i*8+j] * fscale * (float)mat_scales[j]);
+    }
+  }
+}
+
+/* Scalar fallback for the remainder tiles. */
 static inline void
 gemm_int8_scalar(
   floatx *restrict       dst,
@@ -5929,8 +6126,7 @@ gemm_int8_scalar(
   const floatx *restrict src_scales,
   int                    m,
   int                    n,
-  int                    k
-)
+  int                    k)
 {
   for (int i = 0; i < m; i++)
   {
@@ -5951,6 +6147,7 @@ gemm_int8_scalar(
   }
 }
 
+
 /* int8 matrix-matrix multiply (NT) + dequant
  *
  *   (int8 src (m, k) * fpx src_scales (m,))
@@ -5968,8 +6165,7 @@ gemm_int8(
   int                    m,
   int                    n,
   int                    k,
-  bool                   omp
-)
+  bool                   omp)
 {
   if (dst_stride == 0) dst_stride = n;
   if (mat_stride == 0) mat_stride = k;
@@ -5978,30 +6174,43 @@ gemm_int8(
   int m_full = (m / GEMM_I8_MR) * GEMM_I8_MR;
   int n_full = (n / GEMM_I8_NR) * GEMM_I8_NR;
 
-  if (omp)
+  if (m_full > 0 && n_full > 0)
   {
-    #pragma omp parallel for collapse(2)
-    for (int jb = 0; jb < n_full; jb += GEMM_I8_NR)
-      for (int ib = 0; ib < m_full; ib += GEMM_I8_MR)
-      {
-        gemm_int8_kernel(
-          dst + ib * dst_stride + jb, dst_stride, mat + jb * mat_stride,
-          mat_stride, mat_scales + jb, src + ib * src_stride, src_stride,
-          src_scales + ib, k
-        );
-      }
-  }
-  else
-  {
-    for (int jb = 0; jb < n_full; jb += GEMM_I8_NR)
-      for (int ib = 0; ib < m_full; ib += GEMM_I8_MR)
-      {
-        gemm_int8_kernel(
-          dst + ib * dst_stride + jb, dst_stride, mat + jb * mat_stride,
-          mat_stride, mat_scales + jb, src + ib * src_stride, src_stride,
-          src_scales + ib, k
-        );
-      }
+    int8_t *scratch = gemm_i8_pack_scratch_get((size_t)(m_full + n_full) * k);
+    if (scratch == NULL)
+    {
+      fprintf(stderr, "error: gemm_int8 packing scratch allocation failed\n");
+      return;
+    }
+    int8_t *Ap_full = scratch;
+    int8_t *Bp_full = scratch + (size_t)m_full * k;
+
+    pack_all_i8(Ap_full, src, src_stride, m_full, GEMM_I8_MR, k, omp);
+    pack_all_i8(Bp_full, mat, mat_stride, n_full, GEMM_I8_NR, k, omp);
+
+    if (omp)
+    {
+      #pragma omp parallel for collapse(2)
+      for (int jb = 0; jb < n_full; jb += GEMM_I8_NR)
+        for (int ib = 0; ib < m_full; ib += GEMM_I8_MR)
+        {
+          gemm_int8_kernel(
+            dst + ib * dst_stride + jb, dst_stride, Bp_full + (size_t)jb * k,
+            mat_scales + jb, Ap_full + (size_t)ib * k, src_scales + ib, k
+          );
+        }
+    }
+    else
+    {
+      for (int jb = 0; jb < n_full; jb += GEMM_I8_NR)
+        for (int ib = 0; ib < m_full; ib += GEMM_I8_MR)
+        {
+          gemm_int8_kernel(
+            dst + ib * dst_stride + jb, dst_stride, Bp_full + (size_t)jb * k,
+            mat_scales + jb, Ap_full + (size_t)ib * k, src_scales + ib, k
+          );
+        }
+    }
   }
 
   // Remainder: leftover rows (full width) + leftover columns (remaining
@@ -6057,25 +6266,26 @@ prepare_image(const char *path, int image_size)
 {
   // Load the image
   int            rows, cols, channels;
-  unsigned char *img = stbi_load(path, &cols, &rows, &channels, 3);
-  if (img == NULL)
+  unsigned char *raw = stbi_load(path, &cols, &rows, &channels, 3);
+  if (raw == NULL)
   {
     return NULL;
   }
 
   // Resize the image
-  unsigned char *rsz = (unsigned char *)stbir_resize(
-    img, cols, rows, 0, NULL, image_size, image_size, 0, STBIR_RGB,
-    STBIR_TYPE_UINT8, STBIR_EDGE_CLAMP, STBIR_FILTER_CATMULLROM
+  unsigned char *rsz = stbir_resize(
+    raw, cols, rows, 0,
+    NULL, image_size, image_size, 0,
+    STBIR_RGB, STBIR_TYPE_UINT8, STBIR_EDGE_CLAMP, STBIR_FILTER_CATMULLROM
   );
-  stbi_image_free(img);
+  stbi_image_free(raw);
   if (rsz == NULL)
   {
     return NULL;
   }
 
   floatx *out;
-  MALLOC(out, image_size * image_size * 3, path, {
+  MALLOC(out, image_size * image_size * 3, "image_buf", {
     free(rsz);
     return NULL;
   });
@@ -6089,6 +6299,124 @@ prepare_image(const char *path, int image_size)
   return out;
 }
 
+/* */
+floatx *
+prepare_image_pas(
+  const char *path,
+  int         image_size,
+  int         min_crop_size,
+  int         max_crops,
+  int        *n_crops)
+{ 
+  int             rows, cols, channels;
+  unsigned char  *raw = NULL;
+  unsigned char  *rsz = NULL;
+  floatx         *out = NULL;
+
+  size_t epi = (size_t)image_size * image_size * 3;  // Elements per image
+
+  *n_crops = 0;
+
+  // Load the full image
+  raw = stbi_load(path, &cols, &rows, &channels, 3);
+  if (raw == NULL) goto fail;
+
+  // Compute the number of crops (W / H)
+  int wn_crops = 1;
+  int hn_crops = 1;
+  if (cols >= rows)
+  {
+    if ((float)cols / rows >= 1.5)
+    {
+      wn_crops = (int)floor((double)cols / rows + 0.5);
+      int cap  = (int)floor((double)cols / min_crop_size);
+      wn_crops = min(max(min(cap, wn_crops), 2), max_crops);
+    }
+  }
+  else
+  {
+    if ((float)rows / cols >= 1.5)
+    {
+      hn_crops = (int)floor((double)rows / cols + 0.5);
+      int cap  = (int)floor((double)rows / min_crop_size);
+      hn_crops = min(max(min(cap, hn_crops), 2), max_crops);
+    }
+  }
+
+  // Size of each crop
+  int cw = (cols + wn_crops - 1) / wn_crops;
+  int ch = (rows + hn_crops - 1) / hn_crops;
+
+  // Fallback to full size if too small
+  if (cw < min_crop_size || ch < min_crop_size)
+  {
+    wn_crops = hn_crops = 0;
+  }
+
+  *n_crops = wn_crops * hn_crops;
+
+  // Allocate resize buffer
+  MALLOC(rsz, (size_t)(*n_crops + 1) * epi, "pas_resize", goto fail;);
+  // Allocate out container
+  CALLOC(out, (size_t)(*n_crops + 1) * epi, "pas_crops", goto fail;);
+
+  // The first entry represents the full image (resized)
+  unsigned char *rsz_r = stbir_resize(
+    raw, cols, rows, cols * 3,
+    rsz, image_size, image_size, 0,
+    STBIR_RGB, STBIR_TYPE_UINT8, STBIR_EDGE_CLAMP, STBIR_FILTER_CATMULLROM
+  );
+  if (rsz_r == NULL) goto fail;
+  for (size_t i = 0; i < epi; i++)
+  {
+    out[i] = (rsz[i] / 255.0f - 0.5f) / 0.5f;
+  }
+
+  for (int i = 0; i < hn_crops; i++)
+    for (int j = 0; j < wn_crops; j++)
+    {
+      int idx = i * wn_crops + j + 1;  // +1 to skip over the first entry
+
+      int px = j * cw;
+      int py = i * ch;
+      int pw = cw;
+      int ph = ch;
+
+      pw = min(pw, cols - px);
+      ph = min(ph, rows - py);
+      
+      // Resize crop
+      unsigned char *rsz_crop = rsz + (size_t)idx * epi;
+      unsigned char *raw_crop = raw + ((size_t)py * cols + px) * 3;
+
+      rsz_r = stbir_resize(
+        raw_crop, pw, ph, cols * 3,
+        rsz_crop, image_size, image_size, 0,
+        STBIR_RGB, STBIR_TYPE_UINT8, STBIR_EDGE_CLAMP, STBIR_FILTER_CATMULLROM
+      );
+      if (rsz_r == NULL) goto fail;
+
+      // Normalize into out
+      floatx *dst = out + (size_t)idx * epi;
+      for (size_t k = 0; k < epi; k++)
+      {
+        dst[k] = (rsz_crop[k] / 255.0f - 0.5f) / 0.5f;
+      }
+    }
+
+  (*n_crops)++;
+  stbi_image_free(raw);
+  free(rsz);
+  return out;
+
+fail:
+  stbi_image_free(raw);
+  free(rsz);
+  free(out);
+  *n_crops = 0;
+  return NULL;
+}
+
 // Forward passes
 
 /* Vision forward pass (SigLIP)
@@ -6100,8 +6428,7 @@ forward_vision(
   TextBuffer    *buf,
   VisionBuffer  *vbuf,
   const floatx  *img,
-  bool           quant
-)
+  bool           quant)
 {
   VisionConfig *vcfg = enc->config;
 
@@ -6447,8 +6774,7 @@ forward_vision(
 /* Language model forward (one token) */
 int
 forward_text_decode(
-  TextDecoder *dec, TextBuffer *buf, int pos, bool quant, bool compute_logits
-)
+  TextDecoder *dec, TextBuffer *buf, int pos, bool quant, bool compute_logits)
 {
   TextConfig *cfg = dec->config;
 
@@ -6790,8 +7116,7 @@ forward_text_chunk(
   int          T,
   bool         mask,
   bool         quant,
-  bool         compute_logits
-)
+  bool         compute_logits)
 {
   TextConfig *cfg = dec->config;
 
@@ -7359,8 +7684,7 @@ forward_gemma_prefill(
   int        *pos,
   int         chunk_size,
   bool       *rpen_visited,
-  bool        compute_logits
-)
+  bool        compute_logits)
 {
   TextDecoder *dec = model->decoder;
   int          C   = dec->config->embed_dim;
@@ -7416,8 +7740,7 @@ forward_gemma_image(
   VisionBuffer *vbuf,
   const floatx *image,
   int          *pos,
-  bool          compute_logits
-)
+  bool          compute_logits)
 {
   VisionEncoder *enc = model->encoder;
   if (enc == NULL)
@@ -7626,8 +7949,7 @@ apply_topp(
   FloatIdx *logit_indices,
   int       vocab_size,
   int       k,
-  float     p
-)
+  float     p)
 {
   if (k > vocab_size)
   {
@@ -7703,6 +8025,7 @@ apply_rpen(floatx *logits, bool *visited, int vocab_size, float rpen)
   }
 }
 
+/* */
 typedef enum
 {
   INJECT_NONE,
@@ -7712,6 +8035,7 @@ typedef enum
   INJECT_DONE,
 } InjectDataType;
 
+/* */
 typedef struct
 {
   InjectDataType type;
@@ -7737,8 +8061,7 @@ sample_from_logits(
   float     temperature,
   int       topk,
   float     topp,
-  float     rpen
-)
+  float     rpen)
 {
   bool dosample = temperature != 0 && topk != 1;
 
@@ -7809,8 +8132,7 @@ sample(
   void         *inject_ctx,
   InjectData (*inject_callback)(
     int token, GemmaModel *model, bool use_mm, void *ctx
-  )
-)
+  ))
 {
   TextConfig *cfg = model->decoder->config;
   int         vs  = cfg->vocab_size;
@@ -7906,7 +8228,6 @@ sample(
         {
           goto end;
         }
-        free(injected.image);
       }
 
       prefill_end = now_sec();
@@ -7976,8 +8297,15 @@ end:
 typedef struct
 {
   int         state;
+  floatx     *img;
   const char *arg;
   int         arg_len;
+
+  // Used in pan & scan
+  char    path[4096];
+  floatx *crops;
+  int     n_crops;
+  int     crop_i;
 } CommandContext;
 
 /* */
@@ -7990,6 +8318,7 @@ typedef struct
   enum
   {
     COMMAND_IMAGE = 0,
+    COMMAND_IMAGE_PAS,
     COMMAND_TOTAL,
   } id;
   bool (*should_ignore)(GemmaModel *model, bool use_mm);
@@ -8064,21 +8393,32 @@ image_should_ignore(GemmaModel *model, bool use_mm)
 InjectData
 image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
 {
-  VisionEncoder  *enc = model->encoder;
-  GemmaTokenizer *tok = model->tokenizer;
+  /* Template:
+   * \n\n<start_of_image>[image soft tokens]<end_of_image>\n\n */
+
+  VisionEncoder  *enc     = model->encoder;
+  GemmaTokenizer *tok     = model->tokenizer;
+  CommandContext *cmd_ctx = &ctx->cmd_ctx;
 
   int spos, epos;
 
-  switch (ctx->cmd_ctx.state)
+  /* A classic Duff-style hack that fakes a generator/coroutine using an
+   * explicit state machine, each call resumes at the `case` matching the
+   * current state, does one step, and returns an `InjectData` value as a sort
+   * of pseudo-`yield`. The caller loops until it receives INJECT_DONE (or
+   * INJECT_QUIT on error). The `state` field is effectively a saved program
+   * counter that lets the sequence survive across multiple invocations. */
+
+  switch (cmd_ctx->state)
   {
     case 0:
       // Inject header ("\n\n<start_of_image>")
       spos = ctx->tokens_len;
       encode(tok, "\n\n", 2, ctx->tokens_buf, spos, &ctx->tokens_len);
       ctx->tokens_buf[ctx->tokens_len++] = tok->soi;
-      epos                               = ctx->tokens_len;
+      epos = ctx->tokens_len;
 
-      ctx->cmd_ctx.state = 1;
+      cmd_ctx->state = 1;
       return (InjectData){
         .type     = INJECT_TEXT,
         .tokens   = ctx->tokens_buf + spos,
@@ -8087,32 +8427,37 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
 
     case 1:
       // Inject image
-      int  img_size   = (enc && use_mm) ? enc->config->image_size : 0;
+      ;  // "label followed by a declaration is a C23 extension"
+      int  img_sz     = (enc && use_mm) ? enc->config->image_size : 0;
       char path[4096] = {0};
-      if ((size_t)ctx->cmd_ctx.arg_len >= sizeof(path))
+      if ((size_t)cmd_ctx->arg_len >= sizeof(path))
       {
         fprintf(stderr, "\nerror: image path too long\n");
+        cmd_ctx->state = GENERATOR_EXIT;
         return (InjectData){.type = INJECT_QUIT};
       }
-      memcpy(path, ctx->cmd_ctx.arg, ctx->cmd_ctx.arg_len);
-      floatx *img = prepare_image(path, img_size);
-      if (img == NULL)
+      memcpy(path, cmd_ctx->arg, cmd_ctx->arg_len);
+      cmd_ctx->img = prepare_image(path, img_sz);
+      if (cmd_ctx->img == NULL)
       {
-        fprintf(stderr, "\nerror: failed to load image: '%s'\n", path);
+        fprintf(stderr, "\nerror: failed to prepare image: '%s'\n", path);
+        cmd_ctx->state = GENERATOR_EXIT;
         return (InjectData){.type = INJECT_QUIT};
       }
 
-      ctx->cmd_ctx.state = 2;
-      return (InjectData){.type = INJECT_IMAG, .image = img};
+      cmd_ctx->state = 2;
+      return (InjectData){.type = INJECT_IMAG, .image = cmd_ctx->img};
 
     case 2:
       // Inject trailer ("<end_of_image>\n\n")
-      spos                               = ctx->tokens_len;
+      spos = ctx->tokens_len;
       ctx->tokens_buf[ctx->tokens_len++] = tok->eoi;
-      encode(tok, "\n\n", 2, ctx->tokens_buf, spos, &ctx->tokens_len);
+      encode(
+        tok, "\n\n", 2, ctx->tokens_buf, ctx->tokens_len, &ctx->tokens_len
+      );
       epos = ctx->tokens_len;
 
-      ctx->cmd_ctx.state = 3;
+      cmd_ctx->state = 3;
       return (InjectData){
         .type     = INJECT_TEXT,
         .tokens   = ctx->tokens_buf + spos,
@@ -8120,7 +8465,176 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
       };
 
     default:
-      ctx->cmd_ctx.state = GENERATOR_EXIT;
+      free(cmd_ctx->img);
+      cmd_ctx->state = GENERATOR_EXIT;
+      return (InjectData){.type = INJECT_DONE};
+  }
+}
+
+/* */
+bool
+image_pas_should_ignore(GemmaModel *model, bool use_mm)
+{
+  (void)model;
+  return !use_mm;
+}
+
+/* */
+InjectData
+image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
+{
+  // A funny workaround for long images, crop the full image and send the crops
+  // to the model
+
+  /* Template:
+   * here is the original image
+   * \n\n<start_of_image>
+   * [full image soft tokens]
+   * <end_of_image>\n\n
+   * and here are some crops to help you see better
+   * \n\n<start_of_image>
+   * [crop 1 soft tokens]
+   * <end_of_image>\n\n
+   * \n\n<start_of_image>
+   * [crop 2 soft tokens]
+   * <end_of_image>\n\n
+   * ...
+   */
+
+  VisionEncoder  *enc     = model->encoder;
+  GemmaTokenizer *tok     = model->tokenizer;
+  CommandContext *cmd_ctx = &ctx->cmd_ctx;
+
+  int spos, epos;
+  int img_sz = (enc && use_mm) ? enc->config->image_size : 0;
+
+  switch (cmd_ctx->state)
+  {
+    case 0:
+      // Inject prefix prompt
+      spos = ctx->tokens_len;
+      encode(
+        tok, CROPPED_IMAGE_PREFIX, strlen(CROPPED_IMAGE_PREFIX),
+        ctx->tokens_buf, spos, &ctx->tokens_len
+      );
+      // Inject image header ("\n\n<start_of_image>")
+      encode(
+        tok, "\n\n", 2, ctx->tokens_buf, ctx->tokens_len, &ctx->tokens_len
+      );
+      ctx->tokens_buf[ctx->tokens_len++] = tok->soi;
+      epos = ctx->tokens_len;
+
+      cmd_ctx->state = 1;
+      return (InjectData){
+        .type     = INJECT_TEXT,
+        .tokens   = ctx->tokens_buf + spos,
+        .n_tokens = epos - spos,
+      };
+    
+    case 1:
+      if ((size_t)cmd_ctx->arg_len >= sizeof(cmd_ctx->path))
+      {
+        fprintf(stderr, "\nerror: image path too long\n");
+        cmd_ctx->state = GENERATOR_EXIT;
+        return (InjectData){.type = INJECT_QUIT};
+      }
+      memcpy(cmd_ctx->path, cmd_ctx->arg, cmd_ctx->arg_len);
+      cmd_ctx->path[cmd_ctx->arg_len] = '\0';
+
+      // Save the image to cmd_ctx->crops
+      cmd_ctx->crops = prepare_image_pas(
+        cmd_ctx->path, img_sz, MIN_CROP_SIZE, MAX_NUM_CROPS, &cmd_ctx->n_crops
+      );
+      if (cmd_ctx->crops == NULL)
+      {
+        fprintf(stderr, "\nerror: failed to prepare image: '%s'\n", cmd_ctx->path);
+        cmd_ctx->state = GENERATOR_EXIT;
+        return (InjectData){.type = INJECT_QUIT};
+      }
+
+      cmd_ctx->state = 2;
+      /* Inject the full image.
+       * Passing in cmd_ctx->crops is safe here since `sample()` will only take
+       * the first `image_size * image_size * 3` elements. */
+      return (InjectData){.type = INJECT_IMAG, .image = cmd_ctx->crops};
+    
+    case 2:
+      // Inject crop prompt ("and here are some crops to help you see better")
+      spos = ctx->tokens_len;
+      encode(
+        tok, CROPPED_IMAGE_FILTER, strlen(CROPPED_IMAGE_FILTER),
+        ctx->tokens_buf, spos, &ctx->tokens_len
+      );
+      // Inject image header of the first crop
+      encode(
+        tok, "\n\n", 2, ctx->tokens_buf, ctx->tokens_len, &ctx->tokens_len
+      );
+      ctx->tokens_buf[ctx->tokens_len++] = tok->soi;
+      epos = ctx->tokens_len;
+
+      cmd_ctx->state = 3;
+      return (InjectData){
+        .type     = INJECT_TEXT,
+        .tokens   = ctx->tokens_buf + spos,
+        .n_tokens = epos - spos,
+      };
+    
+    case 3:
+      // Inject all the crops
+      for (
+        cmd_ctx->crop_i = 0;
+        cmd_ctx->crop_i < cmd_ctx->n_crops;
+        cmd_ctx->crop_i++)
+      {
+        if (cmd_ctx->crop_i != 0)
+        {
+          // Inject crop header
+          spos = ctx->tokens_len;
+          encode(tok, "\n\n", 2, ctx->tokens_buf, spos, &ctx->tokens_len);
+          ctx->tokens_buf[ctx->tokens_len++] = tok->soi;
+          epos = ctx->tokens_len;
+
+          cmd_ctx->state = 4;
+          return (InjectData){
+            .type     = INJECT_TEXT,
+            .tokens   = ctx->tokens_buf + spos,
+            .n_tokens = epos - spos,
+          };
+        }
+    
+    case 4:
+        // Inject image crop
+        cmd_ctx->state = 5;
+        return (InjectData){
+          .type  = INJECT_IMAG,
+          .image = cmd_ctx->crops +
+                   (size_t)cmd_ctx->crop_i * img_sz * img_sz * 3,
+        };
+    
+    case 5:
+        // Inject crop trailer
+        spos = ctx->tokens_len;
+        ctx->tokens_buf[ctx->tokens_len++] = tok->eoi;
+        encode(
+          tok, "\n\n", 2, ctx->tokens_buf, ctx->tokens_len, &ctx->tokens_len
+        );
+        epos = ctx->tokens_len;
+
+        cmd_ctx->state = 6;
+        return (InjectData){
+          .type     = INJECT_TEXT,
+          .tokens   = ctx->tokens_buf + spos,
+          .n_tokens = epos - spos,
+        };
+    
+    case 6:
+        ;
+      }
+
+    __attribute__((fallthrough));
+    default:
+      free(cmd_ctx->crops);
+      cmd_ctx->state = GENERATOR_EXIT;
       return (InjectData){.type = INJECT_DONE};
   }
 }
@@ -8132,6 +8646,12 @@ CommandType command_types[COMMAND_TOTAL] = {
     .id            = COMMAND_IMAGE,
     .should_ignore = image_should_ignore,
     .inject_next   = image_inject_next,
+  },
+  (CommandType){
+    .name          = "image_pas",
+    .id            = COMMAND_IMAGE_PAS,
+    .should_ignore = image_pas_should_ignore,
+    .inject_next   = image_pas_inject_next,
   },
 };
 
@@ -8337,8 +8857,7 @@ generate(
   int           topk,
   float         topp,
   float         rpen,
-  bool          enable_mm
-)
+  bool          enable_mm)
 {
   printf("%s", prompt);
 
@@ -8482,6 +9001,7 @@ new_turn(GemmaModel *model, bool use_mm, ChatContext *ctx)
       return (InjectData){.type = INJECT_DONE};
 
     fail:
+      ctx->state = GENERATOR_EXIT;
       return (InjectData){.type = INJECT_QUIT};
   }
 }
@@ -8523,8 +9043,7 @@ chat(
   int           topk,
   float         topp,
   float         rpen,
-  bool          use_mm
-)
+  bool          use_mm)
 {
   int  *tokens_buf = NULL;
   char *line_buf   = NULL;
@@ -8612,8 +9131,7 @@ safe_atof(const char *str, float *result)
 /* Pretty-print of the loaded model */
 void
 print_model_config(
-  GemmaModel *model, int seqlen, int chunk_size, bool enable_mm
-)
+  GemmaModel *model, int seqlen, int chunk_size, bool enable_mm)
 {
   const int       width  = 20;
   bool            use_mm = model->support_mm && enable_mm;
