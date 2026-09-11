@@ -33,8 +33,7 @@
  * Model files are a custom binary format produced by the accompanying
  * `export.py`, which converts a HuggingFace Gemma checkpoint (weights,
  * config, tokenizer vocab + BPE merges) into this inference-ready layout,
- * applying the activation rescaling described above and, optionally, W8A8
- * quantization.
+ * applying the activation rescaling (>:O) and optional W8A8 quantization.
  *
  * Build it:
  *
