@@ -5,7 +5,7 @@ Gemma 1, 2 and 3 implemented in a single file of pure C.
 This is a from-scratch inference engine for Google's Gemma family of
 language models: Gemma 1, 2 and 3, text-only and multimodal (SigLIP vision
 tower included), in one .c file, no third-party dependencies, builds with
-a single gcc/clang invocation. It is not a wrapper around llama.cpp or
+a single gcc/clang/msvc invocation. It is not a wrapper around llama.cpp or
 ggml, the transformer, the attention masks, the RoPE tables, the int8
 kernels, the BPE tokenizer, and the image decoder / resizer are all
 self-included here. I did this mostly to actually understand how Gemma
@@ -33,7 +33,8 @@ same idea applied to Llama.
 - float32 / float16 / bfloat16 weights, picked at compile time
 - A from-scratch BPE tokenizer, with vocab + merges embedded directly into
   the exported `.bin` file
-- Runs on Linux, macOS, and Windows (MinGW/MSYS2), with either gcc or clang
+- Runs on Linux, macOS, and Windows (MinGW/MSYS2), with either gcc, clang or
+  msvc
 
 ## Project layout
 
@@ -90,7 +91,7 @@ python export.py google/gemma-3-4b-it \
 make
 ```
  
-`make` auto-detects whether you're on gcc or clang and picks safe flags for
+`make` auto-detects whether you're on gcc/clang/msvc and picks safe flags for
 each (this actually matters here). Override the compiler or dtype from the
 command line if you need to:
  

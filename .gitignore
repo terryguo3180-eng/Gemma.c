@@ -7,4 +7,5 @@ Models/
 Papaers/
 *.bin
 *.o
+*.obj
 *.exe
