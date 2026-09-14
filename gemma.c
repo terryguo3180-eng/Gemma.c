@@ -132,17 +132,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef _MSC_VER
+#if !defined(_MSC_VER)
+// Tell clang to shut up
 #  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER)
 #  include <malloc.h>
+#  define RESTRICT      __restrict
 #  define _Thread_local __declspec(thread)
+#else
+#  define RESTRICT restrict
 #endif
 
 // A bunch of hairy cross-platform code, unrelated to the inference engine
-#ifdef _WIN32
+#if defined(_WIN32)
 #  include <io.h>
 #  include <time.h>
 #  include <windows.h>
@@ -150,12 +154,14 @@
 // Global interruption flag
 static volatile LONG g_interrupted = 0;
 
+/* */
 static inline void
 set_interrupted(void)
 {
   InterlockedExchange(&g_interrupted, 1);
 }
 
+/* */
 static inline int
 is_interrupted(void)
 {
@@ -164,30 +170,13 @@ is_interrupted(void)
 
 // mmap support on Windows
 
-#  define O_RDONLY     _O_RDONLY
-#  define O_WRONLY     _O_WRONLY
-#  define O_RDWR       _O_RDWR
-#  define O_APPEND     _O_APPEND
-#  define O_CREAT      _O_CREAT
-#  define O_TRUNC      _O_TRUNC
-#  define O_EXCL       _O_EXCL
-#  define O_TEXT       _O_TEXT
-#  define O_BINARY     _O_BINARY
-#  define O_RAW        _O_BINARY
-#  define O_TEMPORARY  _O_TEMPORARY
-#  define O_NOINHERIT  _O_NOINHERIT
-#  define O_SEQUENTIAL _O_SEQUENTIAL
-#  define O_RANDOM     _O_RANDOM
-
-#  define open   _open
-#  define close  _close
-#  define strdup _strdup
-
-#  define PROT_NONE  0
-#  define PROT_READ  1
-#  define PROT_WRITE 2
-#  define PROT_EXEC  4
-
+#  define open          _open
+#  define close         _close
+#  define strdup        _strdup
+#  define PROT_NONE     0
+#  define PROT_READ     1
+#  define PROT_WRITE    2
+#  define PROT_EXEC     4
 #  define MAP_FILE      0
 #  define MAP_SHARED    1
 #  define MAP_PRIVATE   2
@@ -195,8 +184,21 @@ is_interrupted(void)
 #  define MAP_FIXED     0x10
 #  define MAP_ANONYMOUS 0x20
 #  define MAP_FAILED    ((void *)-1)
-
-#  ifndef FILE_MAP_EXECUTE
+#  define O_RDONLY      _O_RDONLY
+#  define O_WRONLY      _O_WRONLY
+#  define O_RDWR        _O_RDWR
+#  define O_APPEND      _O_APPEND
+#  define O_CREAT       _O_CREAT
+#  define O_TRUNC       _O_TRUNC
+#  define O_EXCL        _O_EXCL
+#  define O_TEXT        _O_TEXT
+#  define O_BINARY      _O_BINARY
+#  define O_RAW         _O_BINARY
+#  define O_TEMPORARY   _O_TEMPORARY
+#  define O_NOINHERIT   _O_NOINHERIT
+#  define O_SEQUENTIAL  _O_SEQUENTIAL
+#  define O_RANDOM      _O_RANDOM
+#  if !defined(FILE_MAP_EXECUTE)
 #    define FILE_MAP_EXECUTE 0x0020
 #  endif
 
@@ -217,6 +219,7 @@ __map_mmap_prot_page(const int prot)
   }
   return protect;
 }
+
 /* */
 static uint32_t
 __map_mmap_prot_file(const int prot)
@@ -240,6 +243,7 @@ __map_mmap_prot_file(const int prot)
   }
   return desired_acc;
 }
+
 /* */
 void *
 mmap(void *addr, size_t len, int prot, int flags, int fildes, int64_t off)
@@ -249,7 +253,7 @@ mmap(void *addr, size_t len, int prot, int flags, int fildes, int64_t off)
   HANDLE fm, h;
   void  *map = MAP_FAILED;
 
-#  ifdef _MSC_VER
+#  if defined(_MSC_VER)
 #    pragma warning(push)
 #    pragma warning(disable : 4293)
 #  endif
@@ -262,7 +266,7 @@ mmap(void *addr, size_t len, int prot, int flags, int fildes, int64_t off)
   const uint32_t dw_maxsize_low  = (uint32_t)(maxsize & 0xFFFFFFFFL);
   const uint32_t dw_maxsize_high = (uint32_t)((maxsize >> 32) & 0xFFFFFFFFL);
 
-#  ifdef _MSC_VER
+#  if defined(_MSC_VER)
 #    pragma warning(pop)
 #  endif
 
@@ -299,6 +303,7 @@ mmap(void *addr, size_t len, int prot, int flags, int fildes, int64_t off)
   }
   return map;
 }
+
 /* */
 int
 munmap(void *addr, size_t len)
@@ -309,6 +314,7 @@ munmap(void *addr, size_t len)
   errno = GetLastError();
   return -1;
 }
+
 /* */
 int
 mprotect(void *addr, size_t len, int prot)
@@ -319,6 +325,7 @@ mprotect(void *addr, size_t len, int prot)
   errno = GetLastError();
   return -1;
 }
+
 /* */
 int
 msync(void *addr, size_t len, int flags)
@@ -329,6 +336,7 @@ msync(void *addr, size_t len, int flags)
   errno = GetLastError();
   return -1;
 }
+
 /* */
 int
 mlock(const void *addr, size_t len)
@@ -337,6 +345,7 @@ mlock(const void *addr, size_t len)
   errno = GetLastError();
   return -1;
 }
+
 /* */
 int
 munlock(const void *addr, size_t len)
@@ -442,12 +451,14 @@ console_handler_(DWORD dwCtrlType)
 
 static volatile sig_atomic_t g_interrupted = 0;
 
+/* */
 static inline void
 set_interrupted(void)
 {
   g_interrupted = 1;
 }
 
+/* */
 static inline int
 is_interrupted(void)
 {
@@ -489,7 +500,7 @@ signal_handler(int signum)
 void
 setup_signal_handler(void)
 {
-#ifdef _WIN32
+#if defined(_WIN32)
   if (!SetConsoleCtrlHandler(console_handler_, TRUE))
   {
     // Should almost never happen
@@ -518,7 +529,7 @@ setup_signal_handler(void)
 static double
 now_sec(void)
 {
-#ifdef _WIN32
+#if defined(_WIN32)
   static LARGE_INTEGER freq;
   static int           freq_init = 0;
   LARGE_INTEGER        counter;
@@ -553,7 +564,6 @@ now_sec(void)
  * #define STBI_NO_SIMD
  * #define STBI_ONLY_JPEG
  * #define STBI_ONLY_PNG
- * #define STBI_WINDOWS_UTF8
  * #define STB_IMAGE_IMPLEMENTATION
  * #include "stb_image.h"
  *
@@ -567,28 +577,154 @@ now_sec(void)
  * you are reading the code.
  */
 
-// NOLINTBEGIN  // Tell clang-tidy to shutup
-// Tell clang-format to ignore this blob
+// NOLINTBEGIN
 // clang-format off
-// Ignore all the warnings inside this blob
-
-#ifdef _MSC_VER
-// MSVC: Ignore GNU asm / GCC _Pragma
-#  define asm(...)          ((void)0)
+#if defined(_MSC_VER)
 #  pragma warning(push)
-#  pragma warning(disable : 4068) // unknown pragma
-#  ifndef restrict
-#    define restrict __restrict
-#  endif
+#  pragma warning(disable : 4138)
 #else
 #  pragma GCC diagnostic push
 #  pragma GCC diagnostic ignored "-Wdangling-else"
 #  pragma GCC diagnostic ignored "-Wmisleading-indentation"
 #  pragma GCC diagnostic ignored "-Wunknown-pragmas"
 #  pragma GCC diagnostic ignored "-Wunused-parameter"
+#  pragma GCC diagnostic ignored "-Wunused-but-set-variable="
 #  pragma GCC diagnostic ignored "-Wunused-variable"
 #endif
 
+#define Z1 float////////////////////////////////////////////////////////////////
+#define Z2 +0.5f;for(;;){if(G1<0)G1=0;if(G1>////////////////////////////////////
+#define Z3 (Z1*Gw,int Gx,void const*Gy){Z1*RESTRICT Gz=Gw;Z1*G0=(Z1*)Gz+Gx;unsi\
+gned char const*G1=(unsigned char const*)Gy;////////////////////////////////////
+#define Z4 Z3 Gz+=4;while(Gz<=G0){Gz[-4]=///////////////////////////////////////
+#define Z5 (Z1*Gw,unsigned int Gx,Z1 const*Gy,B4 const*Gz,Z1 const*G0,int G1){Z\
+1 const*G2=Gw+Gx*7;Z1*RESTRICT G3=Gw;do{Z1 const*G4=Gy+Gz->A*7;Z1 const*G5=G0;Z\
+1 G6,G7,G8,G9,G_,HA,HB,HC///////////////////////////////////////////////////////
+#define Z6 (Z1*Gw,Z1 const*Gx,Z1 const**Gy,Z1 const*Gz){Z1*RESTRICT G0=Gw;Z1 co\
+nst*G1=Gy[0];Z1 G2=Gx[0];Z1 const*G3=Gy[1];Z1 G4=Gx[1];Z1 const*G5=Gy[2];Z1 G6=\
+Gx[2];Z1 const*G7=Gy[3];Z1 G8=Gx[3];////////////////////////////////////////////
+#define Z7 Z5,HD,HE,HF,HG,HH,HI,HJ;HJ=G5[0];G6=G4[0]*HJ;G7=G4[1]*HJ;G8=G4[2]*HJ\
+;G9=G4[3]*HJ;G_=G4[4]*HJ;HA=G4[5]*HJ;HB=G4[6]*HJ;HJ=G5[1];HC=G4[7]*HJ;HD=G4[8]*\
+HJ;HE=G4[9]*HJ;HF=G4[10]*HJ;HG=G4[11]*HJ;HH=G4[12]*HJ;HI=G4[13]*HJ;HJ=G5[2];G6+\
+=G4[14]*HJ;G7+=G4[15]*HJ;G8+=G4[16]*HJ;G9+=G4[17]*HJ;G_+=G4[18]*HJ;HA+=G4[19]*H\
+J;HB+=G4[20]*HJ;HJ=G5[3];HC+=G4[21]*HJ;HD+=G4[22]*HJ;HE+=G4[23]*HJ;HF+=G4[24]*H\
+J;HG+=G4[25]*HJ;HH+=G4[26]*HJ;HI+=G4[27]*HJ;////////////////////////////////////
+#define Z8 Z7 HJ=G5[4];G6+=G4[28]*HJ;G7+=G4[29]*HJ;G8+=G4[30]*HJ;G9+=G4[31]*HJ;\
+G_+=G4[32]*HJ;HA+=G4[33]*HJ;HB+=G4[34]*HJ;//////////////////////////////////////
+#define Z9 Z8 HJ=G5[5];HC+=G4[35]*HJ;HD+=G4[36]*HJ;HE+=G4[37]*HJ;HF+=G4[38]*HJ;\
+HG+=G4[39]*HJ;HH+=G4[40]*HJ;HI+=G4[41]*HJ;//////////////////////////////////////
+#define Z0 const*G6=G0;Z1 G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI,HJ,HK;HK=G6[0]\
+;G7=G4[0]*HK;G8=G4[1]*HK;G9=G4[2]*HK;G_=G4[3]*HK;HA=G4[4]*HK;HB=G4[5]*HK;HC=G4[\
+6]*HK;HK=G6[1];HD=G4[7]*HK;HE=G4[8]*HK;HF=G4[9]*HK;HG=G4[10]*HK;HH=G4[11]*HK;HI\
+=G4[12]*HK;HJ=G4[13]*HK;HK=G6[2];G7+=G4[14]*HK;G8+=G4[15]*HK;G9+=G4[16]*HK;G_+=\
+G4[17]*HK;HA+=G4[18]*HK;HB+=G4[19]*HK;HC+=G4[20]*HK;HK=G6[3];HD+=G4[21]*HK;HE+=\
+G4[22]*HK;HF+=G4[23]*HK;HG+=G4[24]*HK;HH+=G4[25]*HK;HI+=G4[26]*HK;HJ+=G4[27]*HK\
+;do{G6+=4;G4+=28;HK=G6[0];G7+=G4[0]*HK;G8+=G4[1]*HK;G9+=G4[2]*HK;G_+=G4[3]*HK;H\
+A+=G4[4]*HK;HB+=G4[5]*HK;HC+=G4[6]*HK;HK=G6[1];HD+=G4[7]*HK;HE+=G4[8]*HK;HF+=G4\
+[9]*HK;HG+=G4[10]*HK;HH+=G4[11]*HK;HI+=G4[12]*HK;HJ+=G4[13]*HK;HK=G6[2];G7+=G4[\
+14]*HK;G8+=G4[15]*HK;G9+=G4[16]*HK;G_+=G4[17]*HK;HA+=G4[18]*HK;HB+=G4[19]*HK;HC\
++=G4[20]*HK;HK=G6[3];HD+=G4[21]*HK;HE+=G4[22]*HK;HF+=G4[23]*HK;HG+=G4[24]*HK;HH\
++=G4[25]*HK;HI+=G4[26]*HK;HJ+=G4[27]*HK;--G5;}while(G5>0);//////////////////////
+#define Za (Z1*Gw,unsigned int Gx,Z1 const*Gy,B4 const*Gz,Z1 const*G0,int G1){Z\
+1 const*G2=Gw+Gx*4;Z1*RESTRICT G3=Gw;do{Z1 const*G4=Gy+Gz->A*4;Z1 const*G5=G0;Z\
+1 G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G7=G4[1]*HD;G8=G4[2]*HD;G9=G4\
+[3]*HD;HD=G5[1];G_=G4[4]*HD;HA=G4[5]*HD;HB=G4[6]*HD;HC=G4[7]*HD;HD=G5[2];G6+=G4\
+[8]*HD;G7+=G4[9]*HD;G8+=G4[10]*HD;G9+=G4[11]*HD;HD=G5[3];G_+=G4[12]*HD;HA+=G4[1\
+3]*HD;HB+=G4[14]*HD;HC+=G4[15]*HD;HD=G5[4];G6+=G4[16]*HD;G7+=G4[17]*HD;G8+=G4[1\
+8]*HD;G9+=G4[19]*HD;////////////////////////////////////////////////////////////
+#define Zb (Z1*Gw,unsigned int Gx,Z1 const*Gy,B4 const*Gz,Z1 const*G0,int G1){Z\
+1 const*G2=Gw+Gx*3;Z1*RESTRICT G3=Gw;do{Z1 const*G4=Gy+Gz->A*3;Z1 const*G5=G0;Z\
+1 G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH;HH=G5[0];G6=G4[0]*HH;G7=G4[1]*HH;G8=G4\
+[2]*HH;HH=G5[1];G9=G4[3]*HH;G_=G4[4]*HH;HA=G4[5]*HH;HH=G5[2];HB=G4[6]*HH;HC=G4[\
+7]*HH;HD=G4[8]*HH;HH=G5[3];HE=G4[9]*HH;HF=G4[10]*HH;HG=G4[11]*HH;HH=G5[4];G6+=G\
+4[12]*HH;G7+=G4[13]*HH;G8+=G4[14]*HH;///////////////////////////////////////////
+#define Zc (Z1*Gw,unsigned int Gx,Z1 const*Gy,B4 const*Gz,Z1 const*G0,int G1){Z\
+1 const*G2=Gw+Gx*2;Z1*RESTRICT G3=Gw;do{Z1 const*G4=Gy+Gz->A*2;Z1 const*G5=G0;Z\
+1 G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G_=G4[1]*HD;HD=G5[1];G7=G4[2]\
+*HD;HA=G4[3]*HD;HD=G5[2];G8=G4[4]*HD;HB=G4[5]*HD;HD=G5[3];G9=G4[6]*HD;HC=G4[7]*\
+HD;/////////////////////////////////////////////////////////////////////////////
+#define Zd (void*Gw,int Gx,Z1 const*Gy){unsigned char*RESTRICT Gz=(unsigned cha\
+r*)Gw;unsigned char*G0=((unsigned char*)Gz)+Gx;/////////////////////////////////
+#define Ze +3)>>2;Z1 const*G6=G0;Z1 G7,G8,G9,G_,HA,HB,HC,HD,HE;HE=G6[0];G7=G4[0\
+]*HE;G8=G4[1]*HE;G9=G4[2]*HE;G_=G4[3]*HE;HE=G6[1];HA=G4[4]*HE;HB=G4[5]*HE;HC=G4\
+[6]*HE;HD=G4[7]*HE;HE=G6[2];G7+=G4[8]*HE;G8+=G4[9]*HE;G9+=G4[10]*HE;G_+=G4[11]*\
+HE;HE=G6[3];HA+=G4[12]*HE;HB+=G4[13]*HE;HC+=G4[14]*HE;HD+=G4[15]*HE;do{G6+=4;G4\
++=16;HE=G6[0];G7+=G4[0]*HE;G8+=G4[1]*HE;G9+=G4[2]*HE;G_+=G4[3]*HE;HE=G6[1];HA+=\
+G4[4]*HE;HB+=G4[5]*HE;HC+=G4[6]*HE;HD+=G4[7]*HE;HE=G6[2];G7+=G4[8]*HE;G8+=G4[9]\
+*HE;G9+=G4[10]*HE;G_+=G4[11]*HE;HE=G6[3];HA+=G4[12]*HE;HB+=G4[13]*HE;HC+=G4[14]\
+*HE;HD+=G4[15]*HE;--G5;}while(G5>0);////////////////////////////////////////////
+#define Zf (Z1*Gw,unsigned int Gx,Z1 const*Gy,B4 const*Gz,Z1 const*G0,int G1){Z\
+1 const*G2=Gw+Gx*1;Z1*RESTRICT G3=Gw;do{Z1 const*G4=Gy+Gz->A*1;/////////////////
+#define Zg +3)>>2;Z1 const*G6=G0;Z1 G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI;HI=G\
+6[0];G7=G4[0]*HI;G8=G4[1]*HI;G9=G4[2]*HI;HI=G6[1];G_=G4[3]*HI;HA=G4[4]*HI;HB=G4\
+[5]*HI;HI=G6[2];HC=G4[6]*HI;HD=G4[7]*HI;HE=G4[8]*HI;HI=G6[3];HF=G4[9]*HI;HG=G4[\
+10]*HI;HH=G4[11]*HI;do{G6+=4;G4+=12;HI=G6[0];G7+=G4[0]*HI;G8+=G4[1]*HI;G9+=G4[2\
+]*HI;HI=G6[1];G_+=G4[3]*HI;HA+=G4[4]*HI;HB+=G4[5]*HI;HI=G6[2];HC+=G4[6]*HI;HD+=\
+G4[7]*HI;HE+=G4[8]*HI;HI=G6[3];HF+=G4[9]*HI;HG+=G4[10]*HI;HH+=G4[11]*HI;--G5;}w\
+hile(G5>0);/////////////////////////////////////////////////////////////////////
+#define Zh (Z1**Gw,Z1 const*Gx,Z1 const*Gy,Z1 const*Gz){Z1*RESTRICT G0=Gw[0];;Z\
+1 G1=Gx[0];Z1*RESTRICT G2=Gw[1];Z1 G3=Gx[1];Z1*RESTRICT G4=Gw[2];Z1 G5=Gx[2];Z1\
+*RESTRICT G6=Gw[3];Z1 G7=Gx[3];/////////////////////////////////////////////////
+#define Zi (void*Gw,int Gx,Z1 const*Gy){unsigned short*RESTRICT Gz=(unsigned sh\
+ort*)Gw;unsigned short*G0=((unsigned short*)Gz)+Gx;Gz+=4;while(Gz<=G0){Z1 G1;G1\
+=Gy[////////////////////////////////////////////////////////////////////////////
+#define Zj (Z1*Gw,int Gx,void const*Gy){Z1*RESTRICT Gz=Gw;Z1*G0=(Z1*)Gz+Gx;unsi\
+gned short const*G1=(unsigned short const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((Z1)G\
+1[//////////////////////////////////////////////////////////////////////////////
+#define Zk +3)>>2;Z1 const*G6=G0;Z1 G7,G8,G9,G_,HA,HB,HC,HD,HE;HE=G6[0];G7=G4[0\
+]*HE;HA=G4[1]*HE;HE=G6[1];G8=G4[2]*HE;HB=G4[3]*HE;HE=G6[2];G9=G4[4]*HE;HC=G4[5]\
+*HE;HE=G6[3];G_=G4[6]*HE;HD=G4[7]*HE;do{G6+=4;G4+=8;HE=G6[0];G7+=G4[0]*HE;HA+=G\
+4[1]*HE;HE=G6[1];G8+=G4[2]*HE;HB+=G4[3]*HE;HE=G6[2];G9+=G4[4]*HE;HC+=G4[5]*HE;H\
+E=G6[3];G_+=G4[6]*HE;HD+=G4[7]*HE;--G5;}while(G5>0);////////////////////////////
+#define Zl Z9 HJ=G5[6];G6+=G4[42]*HJ;G7+=G4[43]*HJ;G8+=G4[44]*HJ;G9+=G4[45]*HJ;\
+G_+=G4[46]*HJ;HA+=G4[47]*HJ;HB+=G4[48]*HJ;HJ=G5[7];HC+=G4[49]*HJ;HD+=G4[50]*HJ;\
+HE+=G4[51]*HJ;HF+=G4[52]*HJ;HG+=G4[53]*HJ;HH+=G4[54]*HJ;HI+=G4[55]*HJ;HJ=G5[8];\
+G6+=G4[56]*HJ;G7+=G4[57]*HJ;G8+=G4[58]*HJ;G9+=G4[59]*HJ;G_+=G4[60]*HJ;HA+=G4[61\
+]*HJ;HB+=G4[62]*HJ;/////////////////////////////////////////////////////////////
+#define Zm G3[0]=G6+HC;G3[1]=G7+HD;G3[2]=G8+HE;G3[3]=G9+HF;G3[4]=G_+HG;G3[5]=HA\
++HH;G3[6]=HB+HI;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static void////////////////////
+#define Zn Za HD=G5[5];G_+=G4[20]*HD;HA+=G4[21]*HD;HB+=G4[22]*HD;HC+=G4[23]*HD;\
+HD=G5[6];G6+=G4[24]*HD;G7+=G4[25]*HD;G8+=G4[26]*HD;G9+=G4[27]*HD;HD=G5[7];G_+=G\
+4[28]*HD;HA+=G4[29]*HD;HB+=G4[30]*HD;HC+=G4[31]*HD;HD=G5[8];G6+=G4[32]*HD;G7+=G\
+4[33]*HD;G8+=G4[34]*HD;G9+=G4[35]*HD;///////////////////////////////////////////
+#define Zo (Z1*Gw,unsigned int Gx,Z1 const*Gy,B4 const*Gz,Z1 const*G0,int G1){Z\
+1 const*G2=Gw+Gx*3;Z1*RESTRICT G3=Gw;do{Z1 const*G4=Gy+Gz->A*3;/////////////////
+#define Zp (Z1*Gw,unsigned int Gx,Z1 const*Gy,B4 const*Gz,Z1 const*G0,int G1){Z\
+1 const*G2=Gw+Gx*4;Z1*RESTRICT G3=Gw;do{Z1 const*G4=Gy+Gz->A*4;/////////////////
+#define Zq G3[0]=(G6+HB)+(G9+HE);G3[1]=(G7+HC)+(G_+HF);G3[2]=(G8+HD)+(HA+HG);G0\
++=G1;++Gz;G3+=3;}while(G3<G2);}static void//////////////////////////////////////
+#define Zr G1[3]*G2;HG+=G3[0]*G4;HH+=G3[1]*G4;HI+=G3[2]*G4;HJ+=G3[3]*G4;HG+=G5[\
+0]*G6;HH+=G5[1]*G6;HI+=G5[2]*G6;HJ+=G5[3]*G6;HG+=G7[0]*G8;HH+=G7[1]*G8;HI+=G7[2\
+]*G8;HJ+=G7[3]*G8;HG+=G9[0]*G_;HH+=G9[1]*G_;HI+=G9[2]*G_;HJ+=G9[3]*G_;HG+=HA[0]\
+*HB;HH+=HA[1]*HB;HI+=HA[2]*HB;HJ+=HA[3]*HB;HG+=HC[0]*HD;HH+=HC[1]*HD;HI+=HC[2]*\
+HD;HJ+=HC[3]*HD;HG+=HE[0]*HF;HH+=HE[1]*HF;HI+=HE[2]*HF;HJ+=HE[3]*HF;G0[0]=HG;G0\
+[1]=HH;G0[2]=HI;G0[3]=HJ;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;G9+=4;HA+=4;HC+=4;HE+=4;\
+}while(G1<Gz){Z1 HG;HG=/////////////////////////////////////////////////////////
+#define Zs (Z1*Gw,unsigned int Gx,Z1 const*Gy,B4 const*Gz,Z1 const*G0,int G1){Z\
+1 const*G2=Gw+Gx*2;Z1*RESTRICT G3=Gw;do{Z1 const*G4=Gy+Gz->A*2;/////////////////
+#define Zt Zf Z1 const*G5=G0;Z1 G6,G7,G8,G9;G6=G4[0]*G5[0];G7=G4[1]*G5[1];G8=G4\
+[2]*G5[2];G9=G4[3]*G5[3];G6+=G4[4]*G5[4];G7+=G4[5]*G5[5];///////////////////////
+#define Zu G1[3]*G2;HE+=G3[0]*G4;HF+=G3[1]*G4;HG+=G3[2]*G4;HH+=G3[3]*G4;HE+=G5[\
+0]*G6;HF+=G5[1]*G6;HG+=G5[2]*G6;HH+=G5[3]*G6;HE+=G7[0]*G8;HF+=G7[1]*G8;HG+=G7[2\
+]*G8;HH+=G7[3]*G8;HE+=G9[0]*G_;HF+=G9[1]*G_;HG+=G9[2]*G_;HH+=G9[3]*G_;HE+=HA[0]\
+*HB;HF+=HA[1]*HB;HG+=HA[2]*HB;HH+=HA[3]*HB;HE+=HC[0]*HD;HF+=HC[1]*HD;HG+=HC[2]*\
+HD;HH+=HC[3]*HD;G0[0]=HE;G0[1]=HF;G0[2]=HG;G0[3]=HH;G0+=4;G1+=4;G3+=4;G5+=4;G7+\
+=4;G9+=4;HA+=4;HC+=4;}while(G1<Gz){Z1 HE;HE=////////////////////////////////////
+#define Zv Zb HH=G5[5];G9+=G4[15]*HH;G_+=G4[16]*HH;HA+=G4[17]*HH;HH=G5[6];HB+=G\
+4[18]*HH;HC+=G4[19]*HH;HD+=G4[20]*HH;HH=G5[7];HE+=G4[21]*HH;HF+=G4[22]*HH;HG+=G\
+4[23]*HH;HH=G5[8];G6+=G4[24]*HH;G7+=G4[25]*HH;G8+=G4[26]*HH;////////////////////
+#define Zw +3)>>2;Z1 const*G6=G0;Z1 G7,G8,G9,G_;G7=G4[0]*G6[0];G8=G4[1]*G6[1];G\
+9=G4[2]*G6[2];G_=G4[3]*G6[3];do{G6+=4;G4+=4;G7+=G4[0]*G6[0];G8+=G4[1]*G6[1];G9+\
+=G4[2]*G6[2];G_+=G4[3]*G6[3];--G5;}while(G5>0);/////////////////////////////////
+#define Zx Zc HD=G5[4];G6+=G4[8]*HD;G_+=G4[9]*HD;HD=G5[5];G7+=G4[10]*HD;HA+=G4[\
+11]*HD;HD=G5[6];G8+=G4[12]*HD;HB+=G4[13]*HD;HD=G5[7];G9+=G4[14]*HD;HC+=G4[15]*H\
+D;//////////////////////////////////////////////////////////////////////////////
+#define Zy G1[3]*G2;HC+=G3[0]*G4;HD+=G3[1]*G4;HE+=G3[2]*G4;HF+=G3[3]*G4;HC+=G5[\
+0]*G6;HD+=G5[1]*G6;HE+=G5[2]*G6;HF+=G5[3]*G6;HC+=G7[0]*G8;HD+=G7[1]*G8;HE+=G7[2\
+]*G8;HF+=G7[3]*G8;HC+=G9[0]*G_;HD+=G9[1]*G_;HE+=G9[2]*G_;HF+=G9[3]*G_;HC+=HA[0]\
+*HB;HD+=HA[1]*HB;HE+=HA[2]*HB;HF+=HA[3]*HB;G0[0]=HC;G0[1]=HD;G0[2]=HE;G0[3]=HF;\
+G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;G9+=4;HA+=4;}while(G1<Gz){Z1 HC;HC=///////////////
+////////////////////////////////////////////////////////////////////////////////
 enum{STBI_default=0,STBI_grey=1,STBI_grey_alpha=2,STBI_rgb=3,STBI_rgb_alpha=4};
 typedef unsigned char A;typedef unsigned short B;typedef struct{int(*A)(void*,//
 char*,int);void(*B)(void*,int);int(*C)(void*);}C;typedef uint16_t D;typedef/////
@@ -617,67 +753,65 @@ int Gx,int Gy,int Gz){return e(Gw,Gx)&&e(Gw*Gx,Gy)&&d(Gw*Gx*Gy,Gz);}static int h
 0;return c(Gw*Gx+Gy);}static void*j(int Gw,int Gx,int Gy,int Gz){if(!g(Gw,Gx,Gy,
 Gz))return 0;return c(Gw*Gx*Gy+Gz);}static void*k(int Gw,int Gx,int Gy,int Gz,//
 int G0){if(!h(Gw,Gx,Gy,Gz,G0))return 0;return c(Gw*Gx*Gy*Gz+G0);}static int l(//
-int Gw,int Gx){if((Gw>=0)!=(Gx>=0))return 1;if(Gw<0&&Gx<0)return Gw>=1-Gx;return
-Gw<=INT_MAX-Gx;}static int m(int Gw,int Gx){if(Gx==0||Gx==-1)return 1;if((Gw>=0)
-==(Gx>=0))return Gw<=32767/Gx;if(Gx<0)return Gw<=32768/Gx;return Gw>=32768/Gx;}
-extern void stbi_image_free(void*Gw){free(Gw);}static float*n(A*Gw,int Gx,int Gy
-,int Gz);static int o=0;extern void stbi_set_flip_vertically_on_load(int Gw){o=
-Gw;}static _Thread_local int p,q;extern void////////////////////////////////////
-stbi_set_flip_vertically_on_load_thread(int Gw){p=Gw;q=1;}static void*r(I*Gw,int
-*Gx,int*Gy,int*Gz,int G0,S*G1,int G2){memset(G1,0,12);G1->A=8;G1->C=////////////
-STBI_ORDER_RGB;G1->B=0;if(W(Gw))return X(Gw,Gx,Gy,Gz,G0,G1);if(T(Gw))return U(Gw
-,Gx,Gy,Gz,G0,G1);return((unsigned char*)(size_t)(b("unknown image type")?0:0));}
-static A*s(D*Gw,int Gx,int Gy,int Gz){int G0;int G1=Gx*Gy*Gz;A*G2;G2=(A*)c(G1);
-if(G2==0)return(unsigned char*)(size_t)(b("outofmem")?0:0);for(G0=0;G0<G1;++G0)
-G2[G0]=(A)((Gw[G0]>>8)&0xFF);free(Gw);return G2;}static D*t(A*Gw,int Gx,int Gy,
-int Gz){int G0;int G1=Gx*Gy*Gz;D*G2;G2=(D*)c(G1*2);if(G2==0)return(D*)((unsigned
-char*)(size_t)(b("outofmem")?0:0));for(G0=0;G0<G1;++G0)G2[G0]=(D)((Gw[G0]<<8)+Gw
-[G0]);free(Gw);return G2;}static void u(void*Gw,int Gx,int Gy,int Gz){int G0;///
-size_t G1=(size_t)Gx*Gz;A G2[2048];A*G3=(A*)Gw;for(G0=0;G0<(Gy>>1);G0++){A*G4=G3
-+G0*G1;A*G5=G3+(Gy-G0-1)*G1;size_t G6=G1;while(G6){size_t G7=(G6<2048)?G6:2048;
-memcpy(G2,G4,G7);memcpy(G4,G5,G7);memcpy(G5,G2,G7);G4+=G7;G5+=G7;G6-=G7;}}}/////
-static unsigned char*v(I*Gw,int*Gx,int*Gy,int*Gz,int G0){S G1;void*G2=r(Gw,Gx,Gy
-,Gz,G0,&G1,8);if(G2==0)return 0;if(G1.A!=8){G2=s((D*)G2,*Gx,*Gy,G0==0?*Gz:G0);G1
-.A=8;}if(q?p:o){int G3=G0?G0:*Gz;u(G2,*Gx,*Gy,G3*1);}return(unsigned char*)G2;}
-static D*w(I*Gw,int*Gx,int*Gy,int*Gz,int G0){S G1;void*G2=r(Gw,Gx,Gy,Gz,G0,&G1,
-16);if(G2==0)return 0;if(G1.A!=16){G2=t((A*)G2,*Gx,*Gy,G0==0?*Gz:G0);G1.A=16;}if
-(q?p:o){int G3=G0?G0:*Gz;u(G2,*Gx,*Gy,G3*2);}return(D*)G2;}static FILE*x(char///
-const*Gw,char const*Gx){FILE*Gy;Gy=fopen(Gw,Gx);return Gy;}extern A* ///////////
-stbi_load_from_file(FILE*Gw,int*Gx,int*Gy,int*Gz,int G0){unsigned char*G1;I G2;Q
-(&G2,Gw);G1=v(&G2,Gx,Gy,Gz,G0);if(G1)fseek(Gw,-(int)(G2.L-G2.K),1);return G1;}//
-extern A*stbi_load(char const*Gw,int*Gx,int*Gy,int*Gz,int G0){FILE*G1=x(Gw,"rb")
-;unsigned char*G2;if(!G1)return(unsigned char*)(size_t)(b("can't fopen")?0:0);G2
-=stbi_load_from_file(G1,Gx,Gy,Gz,G0);fclose(G1);return G2;}extern D* ///////////
-stbi_load_from_file_16(FILE*Gw,int*Gx,int*Gy,int*Gz,int G0){D*G1;I G2;Q(&G2,Gw);
-G1=w(&G2,Gx,Gy,Gz,G0);if(G1)fseek(Gw,-(int)(G2.L-G2.K),1);return G1;}extern B  *
+int a,int b){if((a>=0)!=(b>=0))return 1;if(a<0&&b<0)return a>=INT_MIN-b;return a
+<=INT_MAX-b;}static int m(int a,int b){if(b==0||b==-1)return 1;if((a>=0)==(b>=0)
+)return a<=32767/b;if(a<0)return a>=-32768/b;return a>=32768/b;}extern void/////
+stbi_image_free(void*Gw){free(Gw);}static Z1*n(A*Gw,int Gx,int Gy,int Gz);static
+int o=0;extern void stbi_set_flip_vertically_on_load(int Gw){o=Gw;}static///////
+_Thread_local int p,q;extern void stbi_set_flip_vertically_on_load_thread(int Gw
+){p=Gw;q=1;}static void*r(I*Gw,int*Gx,int*Gy,int*Gz,int G0,S*G1,int G2){memset(
+G1,0,12);G1->A=8;G1->C=STBI_ORDER_RGB;G1->B=0;if(W(Gw))return X(Gw,Gx,Gy,Gz,G0,
+G1);if(T(Gw))return U(Gw,Gx,Gy,Gz,G0,G1);return((unsigned char*)(size_t)(b(/////
+"unknown image type")?0:0));}static A*s(D*Gw,int Gx,int Gy,int Gz){int G0;int G1
+=Gx*Gy*Gz;A*G2;G2=(A*)c(G1);if(G2==0)return(unsigned char*)(size_t)(b("outofmem"
+)?0:0);for(G0=0;G0<G1;++G0)G2[G0]=(A)((Gw[G0]>>8)&0xFF);free(Gw);return G2;}////
+static D*t(A*Gw,int Gx,int Gy,int Gz){int G0;int G1=Gx*Gy*Gz;D*G2;G2=(D*)c(G1*2)
+;if(G2==0)return(D*)((unsigned char*)(size_t)(b("outofmem")?0:0));for(G0=0;G0<G1
+;++G0)G2[G0]=(D)((Gw[G0]<<8)+Gw[G0]);free(Gw);return G2;}static void u(void*Gw,
+int Gx,int Gy,int Gz){int G0;size_t G1=(size_t)Gx*Gz;A G2[2048];A*G3=(A*)Gw;for(
+G0=0;G0<(Gy>>1);G0++){A*G4=G3+G0*G1;A*G5=G3+(Gy-G0-1)*G1;size_t G6=G1;while(G6){
+size_t G7=(G6<2048)?G6:2048;memcpy(G2,G4,G7);memcpy(G4,G5,G7);memcpy(G5,G2,G7);
+G4+=G7;G5+=G7;G6-=G7;}}}static unsigned char*v(I*Gw,int*Gx,int*Gy,int*Gz,int G0)
+{S G1;void*G2=r(Gw,Gx,Gy,Gz,G0,&G1,8);if(G2==0)return 0;if(G1.A!=8){G2=s((D*)G2,
+*Gx,*Gy,G0==0?*Gz:G0);G1.A=8;}if(q?p:o){int G3=G0?G0:*Gz;u(G2,*Gx,*Gy,G3*1);}///
+return(unsigned char*)G2;}static D*w(I*Gw,int*Gx,int*Gy,int*Gz,int G0){S G1;void
+*G2=r(Gw,Gx,Gy,Gz,G0,&G1,16);if(G2==0)return 0;if(G1.A!=16){G2=t((A*)G2,*Gx,*Gy,
+G0==0?*Gz:G0);G1.A=16;}if(q?p:o){int G3=G0?G0:*Gz;u(G2,*Gx,*Gy,G3*2);}return(D*)
+G2;}static FILE*x(char const*Gw,char const*Gx){FILE*Gy;Gy=fopen(Gw,Gx);return Gy
+;}extern A*stbi_load_from_file(FILE*Gw,int*Gx,int*Gy,int*Gz,int G0){unsigned////
+char*G1;I G2;Q(&G2,Gw);G1=v(&G2,Gx,Gy,Gz,G0);if(G1)fseek(Gw,-(int)(G2.L-G2.K),1)
+;return G1;}extern A*stbi_load(char const*Gw,int*Gx,int*Gy,int*Gz,int G0){FILE*
+G1=x(Gw,"rb");unsigned char*G2;if(!G1)return(unsigned char*)(size_t)(b("can't f"
+"open")?0:0);G2=stbi_load_from_file(G1,Gx,Gy,Gz,G0);fclose(G1);return G2;}extern
+D*stbi_load_from_file_16(FILE*Gw,int*Gx,int*Gy,int*Gz,int G0){D*G1;I G2;Q(&G2,Gw
+);G1=w(&G2,Gx,Gy,Gz,G0);if(G1)fseek(Gw,-(int)(G2.L-G2.K),1);return G1;}extern B*
 stbi_load_16(char const*Gw,int*Gx,int*Gy,int*Gz,int G0){FILE*G1=x(Gw,"rb");D*G2;
 if(!G1)return(B*)((unsigned char*)(size_t)(b("can't fopen")?0:0));G2=///////////
-stbi_load_from_file_16(G1,Gx,Gy,Gz,G0);fclose(G1);return G2;}extern B* /////////
+stbi_load_from_file_16(G1,Gx,Gy,Gz,G0);fclose(G1);return G2;}extern B*//////////
 stbi_load_16_from_memory(A const*Gw,int Gx,int*Gy,int*Gz,int*G0,int G1){I G2;K(&
 G2,Gw,Gx);return w(&G2,Gy,Gz,G0,G1);}extern B*stbi_load_16_from_callbacks(C/////
 const*Gw,void*Gx,int*Gy,int*Gz,int*G0,int G1){I G2;L(&G2,(C*)Gw,Gx);return w(&G2
 ,Gy,Gz,G0,G1);}extern A*stbi_load_from_memory(A const*Gw,int Gx,int*Gy,int*Gz,//
-int*G0,int G1){I G2;K(&G2,Gw,Gx);return v(&G2,Gy,Gz,G0,G1);}extern A* //////////
+int*G0,int G1){I G2;K(&G2,Gw,Gx);return v(&G2,Gy,Gz,G0,G1);}extern A*///////////
 stbi_load_from_callbacks(C const*Gw,void*Gx,int*Gy,int*Gz,int*G0,int G1){I G2;L(
-&G2,(C*)Gw,Gx);return v(&G2,Gy,Gz,G0,G1);}static float*y(I*Gw,int*Gx,int*Gy,int*
-Gz,int G0){unsigned char*G1;G1=v(Gw,Gx,Gy,Gz,G0);if(G1)return n(G1,*Gx,*Gy,G0?G0
-:*Gz);return(float*)(size_t)(b("unknown image type")?0:0);}extern float* ///////
+&G2,(C*)Gw,Gx);return v(&G2,Gy,Gz,G0,G1);}static Z1*y(I*Gw,int*Gx,int*Gy,int*Gz,
+int G0){unsigned char*G1;G1=v(Gw,Gx,Gy,Gz,G0);if(G1)return n(G1,*Gx,*Gy,G0?G0:*
+Gz);return(Z1*)(size_t)(b("unknown image type")?0:0);}extern Z1*////////////////
 stbi_loadf_from_memory(A const*Gw,int Gx,int*Gy,int*Gz,int*G0,int G1){I G2;K(&G2
-,Gw,Gx);return y(&G2,Gy,Gz,G0,G1);}extern float*stbi_loadf_from_callbacks(C/////
-const*Gw,void*Gx,int*Gy,int*Gz,int*G0,int G1){I G2;L(&G2,(C*)Gw,Gx);return y(&G2
-,Gy,Gz,G0,G1);}extern float*stbi_loadf_from_file(FILE*Gw,int*Gx,int*Gy,int*Gz,//
-int G0){I G1;Q(&G1,Gw);return y(&G1,Gx,Gy,Gz,G0);}extern float*stbi_loadf(char//
-const*Gw,int*Gx,int*Gy,int*Gz,int G0){float*G1;FILE*G2=x(Gw,"rb");if(!G2)return(
-float*)(size_t)(b("can't fopen")?0:0);G1=stbi_loadf_from_file(G2,Gx,Gy,Gz,G0);//
-fclose(G2);return G1;}extern int stbi_is_hdr_from_memory(A const*Gw,int Gx){////
-return 0;}extern int stbi_is_hdr_from_file(FILE*Gw){(void)Gw;return 0;}extern///
-int stbi_is_hdr(char const*Gw){FILE*Gx=x(Gw,"rb");int Gy=0;if(Gx){Gy=///////////
-stbi_is_hdr_from_file(Gx);fclose(Gx);}return Gy;}extern int/////////////////////
-stbi_is_hdr_from_callbacks(C const*Gw,void*Gx){(void)Gw;(void)Gx;return 0;}/////
-static float z=2.2f,_=1.0f;extern void stbi_ldr_to_hdr_gamma(float Gw){z=Gw;}///
-extern void stbi_ldr_to_hdr_scale(float Gw){_=Gw;}static float AA=4.545e-01,AB=
-1.0f;extern void stbi_hdr_to_ldr_gamma(float Gw){AA=1/Gw;}extern void///////////
-stbi_hdr_to_ldr_scale(float Gw){AB=1/Gw;}enum{STBI__SCAN_load=0,STBI__SCAN_type,
+,Gw,Gx);return y(&G2,Gy,Gz,G0,G1);}extern Z1*stbi_loadf_from_callbacks(C const*
+Gw,void*Gx,int*Gy,int*Gz,int*G0,int G1){I G2;L(&G2,(C*)Gw,Gx);return y(&G2,Gy,Gz
+,G0,G1);}extern Z1*stbi_loadf_from_file(FILE*Gw,int*Gx,int*Gy,int*Gz,int G0){I//
+G1;Q(&G1,Gw);return y(&G1,Gx,Gy,Gz,G0);}extern Z1*stbi_loadf(char const*Gw,int*
+Gx,int*Gy,int*Gz,int G0){Z1*G1;FILE*G2=x(Gw,"rb");if(!G2)return(Z1*)(size_t)(b(
+"can't fopen")?0:0);G1=stbi_loadf_from_file(G2,Gx,Gy,Gz,G0);fclose(G2);return G1
+;}extern int stbi_is_hdr_from_memory(A const*Gw,int Gx){return 0;}extern int////
+stbi_is_hdr_from_file(FILE*Gw){(void)Gw;return 0;}extern int stbi_is_hdr(char///
+const*Gw){FILE*Gx=x(Gw,"rb");int Gy=0;if(Gx){Gy=stbi_is_hdr_from_file(Gx);fclose
+(Gx);}return Gy;}extern int stbi_is_hdr_from_callbacks(C const*Gw,void*Gx){(void
+)Gw;(void)Gx;return 0;}static Z1 z=2.2f,_=1.0f;extern void stbi_ldr_to_hdr_gamma
+(Z1 Gw){z=Gw;}extern void stbi_ldr_to_hdr_scale(Z1 Gw){_=Gw;}static Z1 AA=//////
+4.545e-01,AB=1.0f;extern void stbi_hdr_to_ldr_gamma(Z1 Gw){AA=1/Gw;}extern void
+stbi_hdr_to_ldr_scale(Z1 Gw){AB=1/Gw;}enum{STBI__SCAN_load=0,STBI__SCAN_type,///
 STBI__SCAN_header};static void J(I*Gx){int Gy=Gx->E.A(Gx->F,(char*)Gx->I,Gx->H);
 Gx->J+=(int)(Gx->K-Gx->M);if(Gy==0){Gx->G=0;Gx->K=Gx->I;Gx->L=Gx->I+1;*Gx->K=0;}
 else{Gx->K=Gx->I;Gx->L=Gx->I+Gy;}}static A AC(I*Gw){if(Gw->K<Gw->L)return*Gw->K
@@ -726,52 +860,52 @@ break;case 26:for(G1=Gz-1;G1>=0;--G1,G4+=3,G5+=2){G5[0]=AK(G4[0],G4[1],G4[2]);G5
 ],G4[2]);break;case 34:for(G1=Gz-1;G1>=0;--G1,G4+=4,G5+=2){G5[0]=AK(G4[0],G4[1],
 G4[2]);G5[1]=G4[3];}break;case 35:for(G1=Gz-1;G1>=0;--G1,G4+=4,G5+=3){G5[0]=G4[0
 ];G5[1]=G4[1];G5[2]=G4[2];}break;default:free(Gw);free(G3);return(D*)((unsigned
-char*)(size_t)(b("unsupported")?0:0));}}free(Gw);return G3;}static float*n(A*G0,
-int G1,int G2,int G3){int G4,G5,G6;float*G7;if(!G0)return 0;G7=(float*)k(G1,G2,
-G3,4,0);if(G7==0){free(G0);return(float*)(size_t)(b("outofmem")?0:0);}if(G3&1)G6
-=G3;else G6=G3-1;for(G4=0;G4<G1*G2;++G4)for(G5=0;G5<G6;++G5)G7[G4*G3+G5]=(float)
-(pow(G0[G4*G3+G5]/255.0f,z)*_);if(G6<G3)for(G4=0;G4<G1*G2;++G4)G7[G4*G3+G6]=G0[
-G4*G3+G6]/255.0f;free(G0);return G7;}typedef struct{A A[512];D B[256];A C[256];A
-D[257];unsigned int E[18];int F[17];}AM;typedef struct{I*A;AM B[4];AM C[4];D D[4
-][64];E E[4][512];int F,G;int H,I;int J,K;struct{int A;int B,C;int D;int E,F;int
-G;int H,I,J,K;A*L;void*M,*N;A*O;short*P;int Q,R;}L[4];F M;int N;unsigned char O;
-int P;int Q;int R;int S;int T;int U;int V;int W;int X;int Y;int Z,a[4];int b,c;
-void(*d)(A*,int,short[64]);void(*e)(A*,const A*,const A*,const A*,int,int);A*(*f
-)(A*,A*,A*,int,int);}AN;static int AO(AM*Gw,int*Gx){int Gy,Gz,G0=0;unsigned int
-G1;for(Gy=0;Gy<16;++Gy)for(Gz=0;Gz<Gx[Gy];++Gz){Gw->D[G0++]=(A)(Gy+1);if(G0>=257
-)return b("bad size list");}Gw->D[G0]=0;G1=0;G0=0;for(Gz=1;Gz<=16;++Gz){Gw->F[Gz
-]=G0-G1;if(Gw->D[G0]==Gz){while(Gw->D[G0]==Gz)Gw->B[G0++]=(D)(G1++);if(G1-1>=(1u
-<<Gz))return b("bad code lengths");}Gw->E[Gz]=G1<<(16-Gz);G1<<=1;}Gw->E[Gz]=////
-0xffffffff;memset(Gw->A,255,512);for(Gy=0;Gy<G0;++Gy){int G2=Gw->D[Gy];if(G2<=9)
-{int G3=Gw->B[Gy]<<(9-G2);int G4=1<<(9-G2);for(Gz=0;Gz<G4;++Gz)Gw->A[G3+Gz]=(A)
-Gy;}}return 1;}static void AP(E*Gw,AM*Gx){int Gy;for(Gy=0;Gy<512;++Gy){A Gz=Gx->
-A[Gy];Gw[Gy]=0;if(Gz<255){int G0=Gx->C[Gz];int G1=(G0>>4)&15;int G2=G0&15;int G3
-=Gx->D[Gz];if(G2&&G3+G2<=9){int G4=((Gy<<G3)&511)>>(9-G2);int G5=1<<(G2-1);if(G4
-<G5)G4+=(~0U<<G2)+1;if(G4>=-128&&G4<=127)Gw[Gy]=(E)((G4*256)+(G1*16)+(G3+G2));}}
-}}static void AQ(AN*Gw){do{unsigned int Gx=Gw->P?0:AC(Gw->A);if(Gx==0xff){int Gy
-=AC(Gw->A);while(Gy==0xff)Gy=AC(Gw->A);if(Gy!=0){Gw->O=(unsigned char)Gy;Gw->P=1
-;return;}}Gw->M|=Gx<<(24-Gw->N);Gw->N+=8;}while(Gw->N<=24);}static const F AR[17
-]={0,1,3,7,15,31,63,127,255,511,1023,2047,4095,8191,16383,32767,65535};static///
-int AS(AN*Gw,AM*Gx){unsigned int Gy;int Gz,G0;if(Gw->N<16)AQ(Gw);Gz=(Gw->M>>23)&
-511;G0=Gx->A[Gz];if(G0<255){int G1=Gx->D[G0];if(G1>Gw->N)return-1;Gw->M<<=G1;Gw
-->N-=G1;return Gx->C[G0];}Gy=Gw->M>>16;for(G0=10;;++G0)if(Gy<Gx->E[G0])break;if(
-G0==17){Gw->N-=16;return-1;}if(G0>Gw->N)return-1;Gz=((Gw->M>>(32-G0))&AR[G0])+Gx
-->F[G0];if(Gz<0||Gz>=256)return-1;Gw->N-=G0;Gw->M<<=G0;return Gx->C[Gz];}static
-const int AT[16]={0,-1,-3,-7,-15,-31,-63,-127,-255,-511,-1023,-2047,-4095,-8191,
--16383,-32767};static int AU(AN*Gw,int Gx){unsigned int Gy;int Gz;if(Gw->N<Gx)AQ
-(Gw);if(Gw->N<Gx)return 0;Gz=Gw->M>>31;Gy=((Gw->M<<Gx)|(Gw->M>>(-Gx&31)));Gw->M=
-Gy&~AR[Gx];Gy&=AR[Gx];Gw->N-=Gx;return Gy+(AT[Gx]&(Gz-1));}static int AV(AN*Gw,
-int Gx){unsigned int Gy;if(Gw->N<Gx)AQ(Gw);if(Gw->N<Gx)return 0;Gy=((Gw->M<<Gx)|
-(Gw->M>>(-Gx&31)));Gw->M=Gy&~AR[Gx];Gy&=AR[Gx];Gw->N-=Gx;return Gy;}static int//
-AW(AN*Gw){unsigned int Gx;if(Gw->N<1)AQ(Gw);if(Gw->N<1)return 0;Gx=Gw->M;Gw->M//
-<<=1;--Gw->N;return Gx&0x80000000;}static const A AX[79]={0,1,8,16,9,2,3,10,17,
-24,32,25,18,11,4,5,12,19,26,33,40,48,41,34,27,20,13,6,7,14,21,28,35,42,49,56,57,
-50,43,36,29,22,15,23,30,37,44,51,58,59,52,45,38,31,39,46,53,60,61,54,47,55,62,63
-,63,63,63,63,63,63,63,63,63,63,63,63,63,63,63};static int AY(AN*Gw,short Gx[64],
-AM*Gy,AM*Gz,E*G0,int G1,D*G2){int G3,G4,G5;int G6;if(Gw->N<16)AQ(Gw);G6=AS(Gw,Gy
-);if(G6<0||G6>15)return b("bad huffman code");memset(Gx,0,128);G3=G6?AU(Gw,G6):0
-;if(!l(Gw->L[G1].G,G3))return b("bad delta");G4=Gw->L[G1].G+G3;Gw->L[G1].G=G4;if
-(!m(G4,G2[0]))return b("can't merge dc and ac");Gx[0]=(short)(G4*G2[0]);G5=1;do{
+char*)(size_t)(b("unsupported")?0:0));}}free(Gw);return G3;}static Z1*n(A*G0,int
+G1,int G2,int G3){int G4,G5,G6;Z1*G7;if(!G0)return 0;G7=(Z1*)k(G1,G2,G3,4,0);if(
+G7==0){free(G0);return(Z1*)(size_t)(b("outofmem")?0:0);}if(G3&1)G6=G3;else G6=G3
+-1;for(G4=0;G4<G1*G2;++G4)for(G5=0;G5<G6;++G5)G7[G4*G3+G5]=(Z1)(pow(G0[G4*G3+G5]
+/255.0f,z)*_);if(G6<G3)for(G4=0;G4<G1*G2;++G4)G7[G4*G3+G6]=G0[G4*G3+G6]/255.0f;
+free(G0);return G7;}typedef struct{A A[512];D B[256];A C[256];A D[257];unsigned
+int E[18];int F[17];}AM;typedef struct{I*A;AM B[4];AM C[4];D D[4][64];E E[4][512
+];int F,G;int H,I;int J,K;struct{int A;int B,C;int D;int E,F;int G;int H,I,J,K;A
+*L;void*M,*N;A*O;short*P;int Q,R;}L[4];F M;int N;unsigned char O;int P;int Q;int
+R;int S;int T;int U;int V;int W;int X;int Y;int Z,a[4];int b,c;void(*d)(A*,int,
+short[64]);void(*e)(A*,const A*,const A*,const A*,int,int);A*(*f)(A*,A*,A*,int,
+int);}AN;static int AO(AM*Gw,int*Gx){int Gy,Gz,G0=0;unsigned int G1;for(Gy=0;Gy<
+16;++Gy)for(Gz=0;Gz<Gx[Gy];++Gz){Gw->D[G0++]=(A)(Gy+1);if(G0>=257)return b(/////
+"bad size list");}Gw->D[G0]=0;G1=0;G0=0;for(Gz=1;Gz<=16;++Gz){Gw->F[Gz]=G0-G1;if
+(Gw->D[G0]==Gz){while(Gw->D[G0]==Gz)Gw->B[G0++]=(D)(G1++);if(G1-1>=(1u<<Gz))////
+return b("bad code lengths");}Gw->E[Gz]=G1<<(16-Gz);G1<<=1;}Gw->E[Gz]=0xffffffff
+;memset(Gw->A,255,512);for(Gy=0;Gy<G0;++Gy){int G2=Gw->D[Gy];if(G2<=9){int G3=Gw
+->B[Gy]<<(9-G2);int G4=1<<(9-G2);for(Gz=0;Gz<G4;++Gz)Gw->A[G3+Gz]=(A)Gy;}}return
+1;}static void AP(E*Gw,AM*Gx){int Gy;for(Gy=0;Gy<512;++Gy){A Gz=Gx->A[Gy];Gw[Gy]
+=0;if(Gz<255){int G0=Gx->C[Gz];int G1=(G0>>4)&15;int G2=G0&15;int G3=Gx->D[Gz];
+if(G2&&G3+G2<=9){int G4=((Gy<<G3)&511)>>(9-G2);int G5=1<<(G2-1);if(G4<G5)G4+=(~
+0U<<G2)+1;if(G4>=-128&&G4<=127)Gw[Gy]=(E)((G4*256)+(G1*16)+(G3+G2));}}}}static//
+void AQ(AN*Gw){do{unsigned int Gx=Gw->P?0:AC(Gw->A);if(Gx==0xff){int Gy=AC(Gw->A
+);while(Gy==0xff)Gy=AC(Gw->A);if(Gy!=0){Gw->O=(unsigned char)Gy;Gw->P=1;return;}
+}Gw->M|=Gx<<(24-Gw->N);Gw->N+=8;}while(Gw->N<=24);}static const F AR[17]={0,1,3,
+7,15,31,63,127,255,511,1023,2047,4095,8191,16383,32767,65535};static int AS(AN*
+Gw,AM*Gx){unsigned int Gy;int Gz,G0;if(Gw->N<16)AQ(Gw);Gz=(Gw->M>>23)&511;G0=Gx
+->A[Gz];if(G0<255){int G1=Gx->D[G0];if(G1>Gw->N)return-1;Gw->M<<=G1;Gw->N-=G1;//
+return Gx->C[G0];}Gy=Gw->M>>16;for(G0=10;;++G0)if(Gy<Gx->E[G0])break;if(G0==17){
+Gw->N-=16;return-1;}if(G0>Gw->N)return-1;Gz=((Gw->M>>(32-G0))&AR[G0])+Gx->F[G0];
+if(Gz<0||Gz>=256)return-1;Gw->N-=G0;Gw->M<<=G0;return Gx->C[Gz];}static const///
+int AT[16]={0,-1,-3,-7,-15,-31,-63,-127,-255,-511,-1023,-2047,-4095,-8191,-16383
+,-32767};static int AU(AN*Gw,int Gx){unsigned int Gy;int Gz;if(Gw->N<Gx)AQ(Gw);
+if(Gw->N<Gx)return 0;Gz=Gw->M>>31;Gy=((Gw->M<<Gx)|(Gw->M>>(-Gx&31)));Gw->M=Gy&~
+AR[Gx];Gy&=AR[Gx];Gw->N-=Gx;return Gy+(AT[Gx]&(Gz-1));}static int AV(AN*Gw,int//
+Gx){unsigned int Gy;if(Gw->N<Gx)AQ(Gw);if(Gw->N<Gx)return 0;Gy=((Gw->M<<Gx)|(Gw
+->M>>(-Gx&31)));Gw->M=Gy&~AR[Gx];Gy&=AR[Gx];Gw->N-=Gx;return Gy;}static int AW(
+AN*Gw){unsigned int Gx;if(Gw->N<1)AQ(Gw);if(Gw->N<1)return 0;Gx=Gw->M;Gw->M<<=1;
+--Gw->N;return Gx&0x80000000;}static const A AX[79]={0,1,8,16,9,2,3,10,17,24,32,
+25,18,11,4,5,12,19,26,33,40,48,41,34,27,20,13,6,7,14,21,28,35,42,49,56,57,50,43,
+36,29,22,15,23,30,37,44,51,58,59,52,45,38,31,39,46,53,60,61,54,47,55,62,63,63,63
+,63,63,63,63,63,63,63,63,63,63,63,63,63};static int AY(AN*Gw,short Gx[64],AM*Gy,
+AM*Gz,E*G0,int G1,D*G2){int G3,G4,G5;int G6;if(Gw->N<16)AQ(Gw);G6=AS(Gw,Gy);if(
+G6<0||G6>15)return b("bad huffman code");memset(Gx,0,128);G3=G6?AU(Gw,G6):0;if(!
+l(Gw->L[G1].G,G3))return b("bad delta");G4=Gw->L[G1].G+G3;Gw->L[G1].G=G4;if(!m(
+G4,G2[0]))return b("can't merge dc and ac");Gx[0]=(short)(G4*G2[0]);G5=1;do{////
 unsigned int G7;int G8,G9,G_;if(Gw->N<16)AQ(Gw);G8=(Gw->M>>23)&511;G9=G0[G8];if(
 G9){G5+=(G9>>4)&15;G_=G9&15;if(G_>Gw->N)return b("bad huffman code");Gw->M<<=G_;
 Gw->N-=G_;G7=AX[G5++];Gx[G7]=(short)((G9>>8)*G2[G7]);}else{int HA=AS(Gw,Gz);if(
@@ -1047,12 +1181,12 @@ memcpy(Gw->F,Gw->A,Gy);Gw->A+=Gy;Gw->F+=Gy;return 1;}static int BK(A6*Gw){int Gx
 else if(Gz==3)return 0;else{if(Gz==1){if(!A5(&Gw->J,BL,288))return 0;if(!A5(&Gw
 ->K,BM,32))return 0;}else if(!BI(Gw))return 0;if(!BH(Gw))return 0;}}while(!Gy);
 return 1;}static int BO(A6*Gw,char*Gx,int Gy,int Gz,int G0){Gw->G=Gx;Gw->F=Gx;Gw
-->H=Gx+Gy;Gw->I=Gz;return BN(Gw,G0);}extern char* //////////////////////////////
+->H=Gx+Gy;Gw->I=Gz;return BN(Gw,G0);}extern char*///////////////////////////////
 stbi_zlib_decode_malloc_guesssize(const char*Gw,int Gx,int Gy,int*Gz){A6 G0;char
 *G1=(char*)c(Gy);if(G1==0)return 0;G0.A=(A*)Gw;G0.B=(A*)Gw+Gx;if(BO(&G0,G1,Gy,1,
 1)){if(Gz)*Gz=(int)(G0.F-G0.G);return G0.G;}else{free(G0.G);return 0;}}extern///
 char*stbi_zlib_decode_malloc(char const*Gw,int Gx,int*Gy){return////////////////
-stbi_zlib_decode_malloc_guesssize(Gw,Gx,16384,Gy);}extern char* ////////////////
+stbi_zlib_decode_malloc_guesssize(Gw,Gx,16384,Gy);}extern char*/////////////////
 stbi_zlib_decode_malloc_guesssize_headerflag(const char*Gw,int Gx,int Gy,int*Gz,
 int G0){A6 G1;char*G2=(char*)c(Gy);if(G2==0)return 0;G1.A=(A*)Gw;G1.B=(A*)Gw+Gx;
 if(BO(&G1,G2,Gy,1,G0)){if(Gz)*Gz=(int)(G1.F-G1.G);return G1.G;}else{free(G1.G);
@@ -1210,31 +1344,30 @@ STBIR_EDGE_WRAP=2,STBIR_EDGE_ZERO=3,}Bt;typedef enum{STBIR_FILTER_DEFAULT=0,////
 STBIR_FILTER_BOX=1,STBIR_FILTER_TRIANGLE=2,STBIR_FILTER_CUBICBSPLINE=3,/////////
 STBIR_FILTER_CATMULLROM=4,STBIR_FILTER_MITCHELL=5,STBIR_FILTER_POINT_SAMPLE=6,//
 STBIR_FILTER_OTHER=7,}Bu;typedef enum{STBIR_TYPE_UINT8=0,STBIR_TYPE_UINT8_SRGB=1
-,STBIR_TYPE_UINT8_SRGB_ALPHA=2,STBIR_TYPE_UINT16=3,STBIR_TYPE_FLOAT=4,//////////
-STBIR_TYPE_HALF_FLOAT=5}Bv;typedef void const*Bw(void*optional_output,void const
-*input_ptr,int num_pixels,int x,int y,void*context);typedef void Bx(void const*
-output_ptr,int num_pixels,int y,void*context);typedef float By(float x,float////
-scale,void*user_data);typedef float Bz(float scale,void*user_data);typedef//////
-struct A B0;typedef struct B{void*A;void const*B;int C,D;double E,F,G,H;Bw*I;///
-void*J;int K,L;int M,N,O,P;Bx*Q;int R;int S;int T;int U;int V;int W;Bs X;Bs Y;Bv
-Z;Bv a;Bu b,c;Bt d,e;By*f;Bz*g;By*h;Bz*i;B0*j;}B1;typedef enum{STBIRI_1CHANNEL=0
-,STBIRI_2CHANNEL=1,STBIRI_RGB=2,STBIRI_BGR=3,STBIRI_4CHANNEL=4,STBIRI_RGBA=5,///
-STBIRI_BGRA=6,STBIRI_ARGB=7,STBIRI_ABGR=8,STBIRI_RA=9,STBIRI_AR=10,/////////////
-STBIRI_RGBA_PM=11,STBIRI_BGRA_PM=12,STBIRI_ARGB_PM=13,STBIRI_ABGR_PM=14,////////
-STBIRI_RA_PM=15,STBIRI_AR_PM=16,}B2;static unsigned char B3[]={1,1,1,2,4,2};////
-typedef struct{int A;int B;}B4;typedef struct{int A;int B;int C;}B5;typedef/////
-struct{int A;int B;int C;}B6;typedef struct C{int A;int B;float C;float D;float
-E;int F;Bq G,H;}B7;typedef struct{B4*A;float*B;B4*C;float*D;B7 E;float F;Bu G;By
-*H;Bz*I;Bt J;int K;int L;int M;int N;int O;int P;B5 Q;int R;int S;int T;int U;//
-int V;}B8;typedef struct{B4 A;int B[2];B6 C[2];}B9;typedef struct{float*A;int B;
-int C;int D;int E,F;int G,H;float*I;float*J;char K[64];}B_;typedef float*CA(////
-float*,int,void const*);typedef void CB(float*,int);typedef void CC(float*,/////
-unsigned int,float const*,B4 const*,float const*,int);typedef void CD(float*,int
-);typedef void CE(void*,int,float const*);struct A{B8 A;B8 B;void const*C;void*D
-;int E;int F;int G;int H;Bv I;Bv J;Bw*K;void*L;Bx*M;B9 N;void*O;B_*P;CA*Q;CB*R;
-CC*S;CD*T;CE*U;int V;int W;B2 X;B2 Y;int Z;int a,b;int c;int d;int e;size_t f;};
+,STBIR_TYPE_UINT8_SRGB_ALPHA=2,STBIR_TYPE_UINT16=3,STBIR_TYPE_Z1=4,/////////////
+STBIR_TYPE_HALF_Z1=5}Bv;typedef void const*Bw(void*optional_output,void const*//
+input_ptr,int num_pixels,int x,int y,void*context);typedef void Bx(void const*//
+output_ptr,int num_pixels,int y,void*context);typedef Z1 By(Z1 x,Z1 scale,void*
+user_data);typedef Z1 Bz(Z1 scale,void*user_data);typedef struct A B0;typedef///
+struct B{void*A;void const*B;int C,D;double E,F,G,H;Bw*I;void*J;int K,L;int M,N,
+O,P;Bx*Q;int R;int S;int T;int U;int V;int W;Bs X;Bs Y;Bv Z;Bv a;Bu b,c;Bt d,e;
+By*f;Bz*g;By*h;Bz*i;B0*j;}B1;typedef enum{STBIRI_1CHANNEL=0,STBIRI_2CHANNEL=1,//
+STBIRI_RGB=2,STBIRI_BGR=3,STBIRI_4CHANNEL=4,STBIRI_RGBA=5,STBIRI_BGRA=6,////////
+STBIRI_ARGB=7,STBIRI_ABGR=8,STBIRI_RA=9,STBIRI_AR=10,STBIRI_RGBA_PM=11,/////////
+STBIRI_BGRA_PM=12,STBIRI_ARGB_PM=13,STBIRI_ABGR_PM=14,STBIRI_RA_PM=15,//////////
+STBIRI_AR_PM=16,}B2;static unsigned char B3[]={1,1,1,2,4,2};typedef struct{int A
+;int B;}B4;typedef struct{int A;int B;int C;}B5;typedef struct{int A;int B;int C
+;}B6;typedef struct C{int A;int B;Z1 C;Z1 D;Z1 E;int F;Bq G,H;}B7;typedef struct
+{B4*A;Z1*B;B4*C;Z1*D;B7 E;Z1 F;Bu G;By*H;Bz*I;Bt J;int K;int L;int M;int N;int O
+;int P;B5 Q;int R;int S;int T;int U;int V;}B8;typedef struct{B4 A;int B[2];B6 C[
+2];}B9;typedef struct{Z1*A;int B;int C;int D;int E,F;int G,H;Z1*I;Z1*J;char K[64
+];}B_;typedef Z1*CA(Z1*,int,void const*);typedef void CB(Z1*,int);typedef void//
+CC(Z1*,unsigned int,Z1 const*,B4 const*,Z1 const*,int);typedef void CD(Z1*,int);
+typedef void CE(void*,int,Z1 const*);struct A{B8 A;B8 B;void const*C;void*D;int
+E;int F;int G;int H;Bv I;Bv J;Bw*K;void*L;Bx*M;B9 N;void*O;B_*P;CA*Q;CB*R;CC*S;
+CD*T;CE*U;int V;int W;B2 X;B2 Y;int Z;int a,b;int c;int d;int e;size_t f;};/////
 static inline int CF(int Gw,int Gx){return Gw<Gx?Gw:Gx;}static inline int CG(int
-Gw,int Gx){return Gw>Gx?Gw:Gx;}static float CH[256]={0.0,0.000304f,0.000607f,///
+Gw,int Gx){return Gw>Gx?Gw:Gx;}static Z1 CH[256]={0.0,0.000304f,0.000607f,//////
 0.000911f,0.001214f,0.001518f,0.001821f,0.002125f,0.002428f,0.002732f,0.003035f,
 0.003347f,0.003677f,0.004025f,0.004391f,0.004777f,0.005182f,0.005605f,0.006049f,
 0.006512f,0.006995f,0.007499f,0.008023f,0.008568f,0.009134f,0.009721f,0.010330f,
@@ -1266,8 +1399,8 @@ Gw,int Gx){return Gw>Gx?Gw:Gx;}static float CH[256]={0.0,0.000304f,0.000607f,///
 0.768151f,0.775822f,0.783538f,0.791298f,0.799103f,0.806952f,0.814847f,0.822786f,
 0.830770f,0.838799f,0.846873f,0.854993f,0.863157f,0.871367f,0.879622f,0.887923f,
 0.896269f,0.904661f,0.913099f,0.921582f,0.930111f,0.938686f,0.947307f,0.955974f,
-0.964686f,0.973445f,0.982251f,0.991102f,1.0f};typedef union{unsigned int A;float
-B;}CI;static const Bq CJ[104]={7536653,7995405,8388621,8847373,9240589,9699341,
+0.964686f,0.973445f,0.982251f,0.991102f,1.0f};typedef union{unsigned int A;Z1 B;
+}CI;static const Bq CJ[104]={7536653,7995405,8388621,8847373,9240589,9699341,///
 10092557,10551309,10944538,11796506,12648474,13500442,14286874,15138842,15990810
 ,16842778,17694771,19398707,21037107,22741043,24444979,26148915,27787315,///////
 29491251,31195239,34537575,37945447,41287783,44695655,48037991,51445863,54788199
@@ -1281,1768 +1414,898 @@ B;}CI;static const Bq CJ[104]={7536653,7995405,8388621,8847373,9240589,9699341,
 0x37520507,0x39d504c5,0x3c37048b,0x3e7c0458,0x40a8042a,0x42bd0401,0x44c20798,///
 0x488e071e,0x4c1c06b6,0x4f76065d,0x52a50610,0x55ac05cc,0x5892058f,0x5b590559,///
 0x5e0c0a23,0x631c0980,0x67db08f6,0x6c55087f,0x70940818,0x74a007bd,0x787d076c,///
-0x7c330723,};static inline Bo CK(float Gw){static const CI Gx={0x3f7fffff};/////
-static const CI Gy={956301312};Bq Gz,G0,G1,G2;CI G3;if(!(Gw>Gy.B))return 0;if(Gw
->Gx.B)return 255;G3.B=Gw;Gz=CJ[(G3.A-Gy.A)>>20];G0=(Gz>>16)<<9;G1=Gz&0xffff;G2=(
-G3.A>>12)&0xff;return(unsigned char)((G0+G1*G2)>>16);}typedef union D{unsigned//
-short A;}CL;static inline float CM(CL Gw){static const CI Gx={2004877312};static
-const CI Gy={1199570944};CI Gz;Gz.A=(Gw.A&0x7fff)<<13;Gz.B*=Gx.B;if(Gz.B>=Gy.B)
-Gz.A|=255<<23;Gz.A|=(Gw.A&0x8000)<<16;return Gz.B;}static inline CL CN(float Gw)
-{CI Gx={255<<23};CI Gy={1199570944};CI Gz={1056964608};unsigned int G0=/////////
-0x80000000u;CL G1={0};CI G2;unsigned int G3;G2.B=Gw;G3=G2.A&G0;G2.A^=G3;if(G2.A
->=Gy.A)G1.A=(G2.A>Gx.A)?0x7e00:0x7c00;else if(G2.A<947912704){G2.B+=Gz.B;G1.A=(
-unsigned short)(G2.A-Gz.A);}else{unsigned int G4=(G2.A>>13)&1;G2.A=G2.A+////////
-3355443200u+0xfff;G2.A+=G4;G1.A=(unsigned short)(G2.A>>13);}G1.A|=G3>>16;return
-G1;}static void CO(void*Gw,void const*Gx,size_t Gy){char*restrict Gz=(char*)Gx;
-char*restrict G0=((char*)Gx)+Gy;ptrdiff_t G1=(char*)Gw-(char*)Gx;if(G1>=8){char*
-restrict G2=((char*)Gx)+(Gy&~7);if(((((ptrdiff_t)Gw)|((ptrdiff_t)Gx))&7)==0)////
-_Pragma("GCC unroll 1")_Pragma("GCC novector")do{asm(""::"r"(Gz));*(Br*)(Gz+G1)=
-*(Br*)Gz;Gz+=8;}while(Gz<G2);else _Pragma("GCC unroll 1")_Pragma("GCC novector")
-do{int G3,G4;asm(""::"r"(Gz));G3=((int*)Gz)[0];G4=((int*)Gz)[1];((int*)(Gz+G1))[
-0]=G3;((int*)(Gz+G1))[1]=G4;Gz+=8;}while(Gz<G2);if(Gz==G0)return;}_Pragma(//////
-"GCC unroll 1")_Pragma("GCC novector")do{asm(""::"r"(Gz));*(int*)(Gz+G1)=*(int*)
-Gz;Gz+=4;}while(Gz<G0);}static float CP(float Gw,float Gx,void*Gy){float Gz=Gx/2
-;float G0=0.5f+Gz;if(Gw<0.0f)Gw=-Gw;if(Gw>=G0)return 0.0f;else{float G1=0.5f-Gz;
-if(Gw<=G1)return 1.0f;else return(G0-Gw)/Gx;}}static float CQ(float Gw,void*Gx){
-return 0.5f+Gw/2.0f;}static float CR(float Gw,float Gx,void*Gy){if(Gw<0.0f)Gw= -
-Gw;if(Gw<=1.0f)return 1.0f-Gw;else return 0.0f;}static float CS(float Gw,float//
-Gx,void*Gy){return 1.0f;}static float CT(float Gw,float Gx,void*Gy){if(Gw<0.0f)
-Gw=-Gw;if(Gw<1.0f)return(4.0f+Gw*Gw*(3.0f*Gw-6.0f))/6.0f;else if(Gw<2.0f)return(
-8.0f+Gw*(-12.0+Gw*(6.0f-Gw)))/6.0f;return 0.0f;}static float CU(float Gw,float//
-Gx,void*Gy){if(Gw<0.0f)Gw=-Gw;if(Gw<1.0f)return 1.0f-Gw*Gw*(2.5f-1.5f*Gw);else//
-if(Gw<2.0f)return 2.0f-Gw*(4.0f+Gw*(0.5f*Gw-2.5f));return 0.0f;}static float CV(
-float Gw,float Gx,void*Gy){if(Gw<0.0f)Gw=-Gw;if(Gw<1.0f)return(16.0f+Gw*Gw*(////
-21.0f*Gw-36.0f))/18.0f;else if(Gw<2.0f)return(32.0f+Gw*(-60.0+Gw*(36.0f-7.0f*Gw)
-))/18.0f;return 0.0f;}static float CW(float Gw,void*Gx){return 0.5f;}static/////
-float CX(float Gw,void*Gx){return 1;}static float CZ(float Gw,void*Gx){return 2;
-}static int Ca(Bz*Gw,float Gx,void*Gy){if(Gx>=1.0)return(int)((float)ceil((float
-)(Gw(1.0f/Gx,Gy)*2.0f)));else return(int)((float)ceil((float)(Gw(Gx,Gy)*2.0f/Gx)
-));}static int Cb(B8*Gw,int Gx,void*Gy){float Gz=Gw->E.C;Bz*G0=Gw->I;switch(Gx){
-case 1:return(int)((float)ceil((float)(G0(1.0f/Gz,Gy)*2.0f)));case 2:return(int)
-((float)ceil((float)(G0(Gz,Gy)*2.0f/Gz)));case 0:return(int)((float)ceil((float)
-(G0(Gz,Gy)*2.0f)));default:return 0;}}static int Cc(B8*Gw,int Gx){if(Gx)return//
-Gw->E.B;else return Gw->E.A+Gw->M*2;}static int Cd(int Gw,int Gx){return 0;}////
-static int Ce(int Gw,int Gx){if(Gw<0)return 0;if(Gw>=Gx)return Gx-1;return Gw;}
-static int Cf(int Gw,int Gx){if(Gw<0)if(Gw>-Gx)return-Gw;else return Gx-1;if(Gw
->=Gx){int Gy=Gx*2;if(Gw>=Gy)return 0;else return Gy-Gw-1;}return Gw;}static int
-Cg(int Gw,int Gx){if(Gw>=0)return Gw%Gx;else{int Gy=(-Gw)%Gx;if(Gy!=0)Gy=Gx-Gy;
-return Gy;}}typedef int Ch(int n,int max);static Ch*Ci[]={Ce,Cf,Cg,Cd,};inline//
-static int Cj(Bt Gw,int Gx,int Gy){if(Gx>=0&&Gx<Gy)return Gx;return Ci[Gw](Gx,Gy
-);}static void Ck(B8*Gw,B9*Gx){int Gy,Gz;int G0,G1;int G2=0x7fffffff,G3=-///////
-0x7fffffff;int G4=0x7fffffff,G5=-0x7fffffff;int G6=0x7fffffff,G7=-0x7fffffff;Bt
-G8=Gw->J;B4*G9=Gw->A;int G_=Gw->E.B;int HA=Gw->E.A;int HB=Gw->M;Gz=G_;for(Gy=0;
-Gy<Gz;Gy++)if(G9[Gy].A<G2){G2=G9[Gy].A;Gz=Gy+HB;if(Gz>G_)Gz=G_;}Gz=0;for(Gy=G_-1
-;Gy>=Gz;Gy--)if(G9[Gy].B>G3){G3=G9[Gy].B;Gz=Gy-HB;if(Gz<0)Gz=0;}G0=0;if(G2<0){G0
-=-G2;G2=0;}G1=0;if(G3>=HA){G1=G3-HA+1;G3=HA-1;}Gx->B[0]=G0;Gx->B[1]=G1;Gx->C[0].
-A=G2;Gx->C[0].B=G3;Gx->C[0].C=G2;Gx->C[1].A=0;Gx->C[1].B=-1;Gx->C[1].C=0;if(G8==
-STBIR_EDGE_ZERO)return;for(Gy=-G0;Gy<0;Gy++){int HC=Cj(G8,Gy,HA);if(HC<G4)G4=HC;
-if(HC>G5)G5=HC;}for(Gy=HA;Gy<(HA+G1);Gy++){int HC=Cj(G8,Gy,HA);if(HC<G6)G6=HC;if
-(HC>G7)G7=HC;}if(G4!=0x7fffffff)if(((G4<=G2)&&((G5+16)>=G2))||((G2<=G4)&&((G3+16
-)>=G5))){Gx->C[0].A=G2=CF(G2,G4);Gx->C[0].B=G3=CG(G3,G5);Gx->C[0].C=G2;G0=0;}if(
-G6!=0x7fffffff)if(((G6<=G2)&&((G7+16)>=G2))||((G2<=G6)&&((G3+16)>=G7))){Gx->C[0]
-.A=G2=CF(G2,G6);Gx->C[0].B=G3=CG(G3,G7);Gx->C[0].C=G2;G1=0;}if(G0&&(G4!=////////
-0x7fffffff)){B6*HC=Gx->C+1;if(G4<Gx->C[0].A){Gx->C[1].C=Gx->C[0].A;Gx->C[1].A=Gx
-->C[0].A;Gx->C[1].B=Gx->C[0].B;--HC;}HC->C=G4;HC->A=-G0;HC->B=(G5-G4)-G0;Gx->B[0
-]=0;}else if(G1&&(G6!=0x7fffffff)){B6*HC=Gx->C+1;if(G6<Gx->C[0].A){Gx->C[1].C=Gx
-->C[0].A;Gx->C[1].A=Gx->C[0].A;Gx->C[1].B=Gx->C[0].B;--HC;}HC->C=G6;HC->A=Gx->C[
-1].B+1;HC->B=Gx->C[1].B+1+(G7-G6);Gx->B[1]=0;}if((Gx->C[1].B>Gx->C[1].A)&&(Gx->C
-[0].A>Gx->C[1].A)){B6 HC=Gx->C[0];Gx->C[0]=Gx->C[1];Gx->C[1]=HC;}}static void Cl
-(int*Gw,int*Gx,float Gy,float Gz,float G0,float G1,int G2,Bt G3){int G4,G5;float
-G6=Gy-Gz;float G7=Gy+Gz;float G8=(G6+G1)*G0;float G9=(G7+G1)*G0;G4=(int)(float)
-floor((float)(G8+0.5f));G5=(int)(float)floor((float)(G9-0.5f));if(G5<G4)G5=G4;if
-(G3==STBIR_EDGE_WRAP){if(G4<-G2)G4=-G2;if(G5>=(G2*2))G5=(G2*2)-1;}*Gw=G4;*Gx=G5;
-}static void Cm(float Gw,By*Gx,B7*Gy,int Gz,B4*G0,float*G1,int G2,Bt G3,void*G4)
-{int G5,G6;float G7=Gy->D;float G8=Gy->E;int G9=Gy->A;int G_=Gy->G;int HA=Gy->F
-&&(G_<Gz);G6=Gz;if(HA)G6=G_;for(G5=0;G5<G6;G5++){int HB;int HC;float HD=(float)
-G5+0.5f;float HE=(HD+G8)*G7;int HF,HG;Cl(&HF,&HG,HD,Gw,G7,G8,G9,G3);if((HG-HF+1)
->G2)HG=HF+G2-1;HC=-1;for(HB=0;HB<=HG-HF;HB++){float HH=(float)(HB+HF)+0.5f;float
-HI=Gx(HE-HH,G7,G4);if((HI<7.523e-37)&&(HI>-7.523e-37)){if(HB==0){++HF;HB--;/////
-continue;}HI=0;}else HC=HB;G1[HB]=HI;}HG=HC+HF;G0->A=HF;G0->B=HG;++G0;G1+=G2;}}
-static void Cn(B4*Gw,float*Gx,int Gy,float Gz,int G0){if(Gw->B<Gw->A){Gw->A=Gw->
-B=Gy;Gx[0]=Gz;}else if(Gy<=Gw->B){if(Gy<Gw->A){if((Gw->B-Gy+1)<=G0){int G1,G2=Gw
-->A-Gy;for(G1=Gw->B-Gw->A;G1>=0;G1--)Gx[G1+G2]=Gx[G1];for(G1=1;G1<G2;G1++)Gx[G1]
-=0;Gx[0]=Gz;Gw->A=Gy;}}else Gx[Gy-Gw->A]+=Gz;}else if((Gy-Gw->A+1)<=G0){int G1,
-G2=Gy-Gw->A;for(G1=(Gw->B-Gw->A)+1;G1<G2;G1++)Gx[G1]=0;Gx[G2]=Gz;Gw->B=Gy;}}////
-static void Co(int*Gw,int*Gx,float Gy,float Gz,float G0,float G1,int G2){float//
-G3=Gy-Gz;float G4=Gy+Gz;float G5=G3*G0-G1;float G6=G4*G0-G1;int G7=(int)(float)
-floor((float)(G5+0.5f));int G8=(int)(float)floor((float)(G6-0.5f));if(G7<0)G7=0;
-if(G8>=G2)G8=G2-1;*Gw=G7;*Gx=G8;}static void Cp(int Gw,int Gx,float Gy,By*Gz,B7*
-G0,int G1,int G2,B4*G3,float*G4,void*G5){int G6;int G7;int G8=-1;float G9=G0->C;
-float G_=G0->E;int HA=G0->B;int HB=G0->G;int HC=G0->F&&(HB<HA);for(G6=Gw;G6<Gx;
-G6++){float HD=(float)G6+0.5f;float HE=HD*G9-G_;int HF,HG;Co(&HF,&HG,HD,Gy,G9,G_
-,HA);if(HF>HG)continue;if(HC){if(HF==HB)break;if(HG>=HB)HG=HB-1;}for(G7=0;G7<=HG
--HF;G7++){float HH=(float)(G7+HF)+0.5f;float HI=HH-HE;float HJ=Gz(HI,G9,G5)*G9;
-if((HJ<7.523e-37)&&(HJ>-7.523e-37))HJ=0.0f;{int HK=G7+HF;float*HL=G4+HK*G1;B4*HM
-=G3+HK;if(HK>G8){G8=HK;HM->A=G6;HM->B=G6;HL[0]=HJ;}else{if(HL[0]==0.0f)HM->A=G6;
-HM->B=G6;HL[G6-HM->A]=HJ;}}}}}static void Cq(Bt Gw,B5*Gx,B7*Gy,int Gz,B4*G0,////
-float*G1,int G2){int G3=Gy->A;int G4=G3-1;int G5,G6;int G7=0x7fffffff;int G8=-//
-0x7fffffff;int G9=-1;int G_=Gy->G;int HA=Gy->H;int HB=Gy->F&&(G_<Gz);float*HC;B4
-*HD;HC=G1;HD=G0;G6=Gz;if(HB)G6=G_;for(G5=0;G5<G6;G5++){int HE;double HF,HG=0;int
-HH;HH=HD->B-HD->A;for(HE=0;HE<=HH;HE++)HG+=(double)HC[HE];if((HG<7.523e-37)&&(HG
->-7.523e-37)){HD->B=HD->A;HC[0]=0.0f;}else if((HG<1.0)||(HG>1.0)){HF=1.0/HG;for(
-HE=0;HE<=HH;HE++)HC[HE]=(float)(HC[HE]*HF);}++HD;HC+=G2;}if(HB){B4*HE=G0;B4*HF=
-G0+G_;for(G5=G_;G5<Gz;G5++){HF->A=HE->A+HA;HF->B=HE->B+HA;++HF;++HE;}CO(G1+G_*G2
-,G1,(Gz-G_)*G2*4);}HC=G1;HD=G0;for(G5=0;G5<Gz;G5++){int HE;if(Gw==//////////////
-STBIR_EDGE_ZERO){if(HD->B>G4)HD->B=G4;if(HD->A<0){int HF,HG,HH=0;HH=-HD->A;HD->A
-=0;HG=HD->B-HD->A+1;if(HG>0)for(HF=0;HF<HG;HF++)HC[HF]=HC[HF+HH];}}else if((Gw==
-STBIR_EDGE_CLAMP)||(Gw==STBIR_EDGE_REFLECT)){if(HD->B>G4){int HF=HD->A;int HG=HD
-->B;HD->B=G4;for(HE=G3;HE<=HG;HE++)Cn(HD,HC,Ci[Gw](HE,G3),HC[HE-HF],G2);}if(HD->
-A<0){int HF;float HG;float*HH=HC-(HD->A+1);for(HE=-1;HE>HD->A;HE--)Cn(HD,HC,Ci[
-Gw](HE,G3),*HH--,G2);HF=HD->A;HG=HH[0];HD->A=0;for(HE=0;HE<=HD->B;HE++)HC[HE]=HC
-[HE-HF];Cn(HD,HC,Ci[Gw](HF,G3),HG,G2);}}if(HD->A<=HD->B){int HF=HD->B-HD->A+1;//
-while(HF&&(HC[HF-1]==0.0f))--HF;HD->B=HD->A+HF-1;if(HD->A<=HD->B){if(HD->A<G7)G7
-=HD->A;if(HD->B>G8)G8=HD->B;if(HF>G9)G9=HF;}for(HE=HF;HE<G2;HE++)HC[HE]=0.0f;}++
-HD;HC+=G2;}Gx->A=G7;Gx->B=G8;Gx->C=G9;}static int Cr(int Gw,B4*Gx,float*Gy,int//
-Gz,int G0,int G1,int G2){int G3=G2+1;if(Gz!=G0){float*G4=Gy;float*G5=Gy;float*G6
-=Gy+Gw*G0;switch(G0){case 1:_Pragma("GCC unroll 1")_Pragma("GCC novector")do{{//
-asm(""::"r"(G4));((Bq*)G4)[0]=((Bq*)G5)[0];}++G4;G5+=Gz;}while(G4<G6);break;case
-2:_Pragma("GCC unroll 1")_Pragma("GCC novector")do{{asm(""::"r"(G4));((Br*)G4)[0
-]=((Br*)G5)[0];}G4+=2;G5+=Gz;}while(G4<G6);break;case 3:_Pragma("GCC unroll 1")
-_Pragma("GCC novector")do{{asm(""::"r"(G4));((Br*)G4)[0]=((Br*)G5)[0];}{asm(""::
-"r"(G4+2));((Bq*)(G4+2))[0]=((Bq*)(G5+2))[0];}G4+=3;G5+=Gz;}while(G4<G6);break;
-case 4:_Pragma("GCC unroll 1")_Pragma("GCC novector")do{{asm(""::"r"(G4));((Br*)
-G4)[0]=((Br*)G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}G4+=4;G5+=Gz;}while(G4<G6);break;
-case 5:_Pragma("GCC unroll 1")_Pragma("GCC novector")do{{asm(""::"r"(G4));((Br*)
-G4)[0]=((Br*)G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}{asm(""::"r"(G4+4));((Bq*)(G4+4))
-[0]=((Bq*)(G5+4))[0];}G4+=5;G5+=Gz;}while(G4<G6);break;case 6:_Pragma(//////////
-"GCC unroll 1")_Pragma("GCC novector")do{{asm(""::"r"(G4));((Br*)G4)[0]=((Br*)G5
-)[0];((Br*)G4)[1]=((Br*)G5)[1];}{asm(""::"r"(G4+4));((Br*)(G4+4))[0]=((Br*)(G5+4
-))[0];}G4+=6;G5+=Gz;}while(G4<G6);break;case 7:_Pragma("GCC unroll 1")_Pragma(//
-"GCC novector")do{{asm(""::"r"(G4));((Br*)G4)[0]=((Br*)G5)[0];((Br*)G4)[1]=((Br*
-)G5)[1];}{asm(""::"r"(G4+4));((Br*)(G4+4))[0]=((Br*)(G5+4))[0];}{asm(""::"r"(G4+
-6));((Bq*)(G4+6))[0]=((Bq*)(G5+6))[0];}G4+=7;G5+=Gz;}while(G4<G6);break;case 8:
-_Pragma("GCC unroll 1")_Pragma("GCC novector")do{{asm(""::"r"(G4));((Br*)G4)[0]=
-((Br*)G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}{asm(""::"r"(G4+4));((Br*)(G4+4))[0]=((
-Br*)(G5+4))[0];((Br*)(G4+4))[1]=((Br*)(G5+4))[1];}G4+=8;G5+=Gz;}while(G4<G6);///
-break;case 9:_Pragma("GCC unroll 1")_Pragma("GCC novector")do{{asm(""::"r"(G4));
-((Br*)G4)[0]=((Br*)G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}{asm(""::"r"(G4+4));((Br*)(
-G4+4))[0]=((Br*)(G5+4))[0];((Br*)(G4+4))[1]=((Br*)(G5+4))[1];}{asm(""::"r"(G4+8)
-);((Bq*)(G4+8))[0]=((Bq*)(G5+8))[0];}G4+=9;G5+=Gz;}while(G4<G6);break;case 10://
-_Pragma("GCC unroll 1")_Pragma("GCC novector")do{{asm(""::"r"(G4));((Br*)G4)[0]=
-((Br*)G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}{asm(""::"r"(G4+4));((Br*)(G4+4))[0]=((
-Br*)(G5+4))[0];((Br*)(G4+4))[1]=((Br*)(G5+4))[1];}{asm(""::"r"(G4+8));((Br*)(G4+
-8))[0]=((Br*)(G5+8))[0];}G4+=10;G5+=Gz;}while(G4<G6);break;case 11:_Pragma(/////
-"GCC unroll 1")_Pragma("GCC novector")do{{asm(""::"r"(G4));((Br*)G4)[0]=((Br*)G5
-)[0];((Br*)G4)[1]=((Br*)G5)[1];}{asm(""::"r"(G4+4));((Br*)(G4+4))[0]=((Br*)(G5+4
-))[0];((Br*)(G4+4))[1]=((Br*)(G5+4))[1];}{asm(""::"r"(G4+8));((Br*)(G4+8))[0]=((
-Br*)(G5+8))[0];}{asm(""::"r"(G4+10));((Bq*)(G4+10))[0]=((Bq*)(G5+10))[0];}G4+=11
-;G5+=Gz;}while(G4<G6);break;case 12:_Pragma("GCC unroll 1")_Pragma(/////////////
-"GCC novector")do{{asm(""::"r"(G4));((Br*)G4)[0]=((Br*)G5)[0];((Br*)G4)[1]=((Br*
-)G5)[1];}{asm(""::"r"(G4+4));((Br*)(G4+4))[0]=((Br*)(G5+4))[0];((Br*)(G4+4))[1]=
-((Br*)(G5+4))[1];}{asm(""::"r"(G4+8));((Br*)(G4+8))[0]=((Br*)(G5+8))[0];((Br*)(
-G4+8))[1]=((Br*)(G5+8))[1];}G4+=12;G5+=Gz;}while(G4<G6);break;default:_Pragma(//
-"GCC unroll 1")_Pragma("GCC novector")do{float*G7=G4+G0-4;float*G8=G5;do{asm(""
-::"r"(G4));{asm(""::"r"(G4));((Br*)G4)[0]=((Br*)G8)[0];((Br*)G4)[1]=((Br*)G8)[1]
-;}G4+=4;G8+=4;}while(G4<=G7);G7+=4;_Pragma("GCC unroll 1")_Pragma("GCC novector"
-)while(G4<G7){{asm(""::"r"(G4));((Bq*)G4)[0]=((Bq*)G8)[0];}++G4;++G8;}G5+=Gz;}//
-while(G4<G6);break;}}Gy[G0*Gw]=8888.0f;{B4*G4=Gx+Gw-1;float*G5=Gy+G0*(Gw-1);////
-while((G4>=Gx)&&((G4->A+G0*2)>=G3)){if((G4->A+G0)>G3){int G6=G0;if(G0>12){int G7
-;G7=G0&3;G6=(((G4->B-G4->A+1)-G7+3)&~3)+G7;if(G6<(8+G7))G6=8+G7;}if((G4->A+G6)>
-G3){int G7=G3-G6;int G8=G4->B-G4->A+1;int G9=G4->A-G7;float*G_=G5+G8-1;float*HA=
-G_+G9;while(G8){*HA-- =*G_--;--G8;}while(HA>=G5)*HA-- =0;G4->A=G7;if(G0>12){int
-HB;HB=G0&3;G6=(((G4->B-G4->A+1)-HB+3)&~3)+HB;if(G6<(8+HB))G6=8+HB;}}}--G4;G5-=G0
-;}}return G0;}static void Cs(B8*Gw,B8*Gx,void*Gy){int Gz;float G0=Gw->E.C;By*G1=
-Gw->H;Bz*G2=Gw->I;float G3=Gw->E.D;int G4=Gw->E.A;int G5=Gw->N;B4*G6=Gw->A;float
-*G7=Gw->B;int G8=Gw->K;switch(Gw->R){case 1:{float G9=G2(G3,Gy)*G0;Cm(G9,G1,&Gw
-->E,G5,G6,G7,G8,Gw->J,Gy);Cq(Gw->J,&Gw->Q,&Gw->E,G5,G6,G7,G8);}break;case 0:case
-2:{float G9=G2(G0,Gy)*G3;int G_=Gw->M;int HA=G4+G_;if(!Gw->R){if(Gx){G6=Gx->A;G7
-=Gx->B;G8=Gx->K;G5=Gx->N;Gw->Q.A=Gx->Q.A;Gw->Q.B=Gx->Q.B;Gw->Q.C=Gx->Q.C;goto///
+0x7c330723,};static inline Bo CK(Z1 Gw){static const CI Gx={0x3f7fffff};static//
+const CI Gy={956301312};Bq Gz,G0,G1,G2;CI G3;if(!(Gw>Gy.B))return 0;if(Gw>Gx.B)
+return 255;G3.B=Gw;Gz=CJ[(G3.A-Gy.A)>>20];G0=(Gz>>16)<<9;G1=Gz&0xffff;G2=(G3.A>>
+12)&0xff;return(unsigned char)((G0+G1*G2)>>16);}typedef union D{unsigned short A
+;}CL;static inline Z1 CM(CL Gw){static const CI Gx={2004877312};static const CI
+Gy={1199570944};CI Gz;Gz.A=(Gw.A&0x7fff)<<13;Gz.B*=Gx.B;if(Gz.B>=Gy.B)Gz.A|=255
+<<23;Gz.A|=(Gw.A&0x8000)<<16;return Gz.B;}static inline CL CN(Z1 Gw){CI Gx={255
+<<23};CI Gy={1199570944};CI Gz={1056964608};unsigned int G0=0x80000000u;CL G1={0
+};CI G2;unsigned int G3;G2.B=Gw;G3=G2.A&G0;G2.A^=G3;if(G2.A>=Gy.A)G1.A=(G2.A>Gx.
+A)?0x7e00:0x7c00;else if(G2.A<947912704){G2.B+=Gz.B;G1.A=(unsigned short)(G2.A-
+Gz.A);}else{unsigned int G4=(G2.A>>13)&1;G2.A=G2.A+3355443200u+0xfff;G2.A+=G4;G1
+.A=(unsigned short)(G2.A>>13);}G1.A|=G3>>16;return G1;}static void CO(void*Gw,//
+void const*Gx,size_t Gy){char*RESTRICT Gz=(char*)Gx;char*RESTRICT G0=((char*)Gx)
++Gy;ptrdiff_t G1=(char*)Gw-(char*)Gx;if(G1>=8){char*RESTRICT G2=((char*)Gx)+(Gy&
+~7);if(((((ptrdiff_t)Gw)|((ptrdiff_t)Gx))&7)==0)do{*(Br*)(Gz+G1)=*(Br*)Gz;Gz+=8;
+}while(Gz<G2);else do{int G3,G4;G3=((int*)Gz)[0];G4=((int*)Gz)[1];((int*)(Gz+G1)
+)[0]=G3;((int*)(Gz+G1))[1]=G4;Gz+=8;}while(Gz<G2);if(Gz==G0)return;}do{*(int*)(
+Gz+G1)=*(int*)Gz;Gz+=4;}while(Gz<G0);}static Z1 CP(Z1 Gw,Z1 Gx,void*Gy){Z1 Gz=Gx
+/2;Z1 G0=0.5f+Gz;if(Gw<0.0f)Gw=-Gw;if(Gw>=G0)return 0.0f;else{Z1 G1=0.5f-Gz;if(
+Gw<=G1)return 1.0f;else return(G0-Gw)/Gx;}}static Z1 CQ(Z1 Gw,void*Gx){return///
+0.5f+Gw/2.0f;}static Z1 CR(Z1 Gw,Z1 Gx,void*Gy){if(Gw<0.0f)Gw=-Gw;if(Gw<=1.0f)//
+return 1.0f-Gw;else return 0.0f;}static Z1 CS(Z1 Gw,Z1 Gx,void*Gy){return 1.0f;}
+static Z1 CT(Z1 Gw,Z1 Gx,void*Gy){if(Gw<0.0f)Gw=-Gw;if(Gw<1.0f)return(4.0f+Gw*Gw
+*(3.0f*Gw-6.0f))/6.0f;else if(Gw<2.0f)return(8.0f+Gw*(-12.0+Gw*(6.0f-Gw)))/6.0f;
+return 0.0f;}static Z1 CU(Z1 Gw,Z1 Gx,void*Gy){if(Gw<0.0f)Gw=-Gw;if(Gw<1.0f)////
+return 1.0f-Gw*Gw*(2.5f-1.5f*Gw);else if(Gw<2.0f)return 2.0f-Gw*(4.0f+Gw*(0.5f*
+Gw-2.5f));return 0.0f;}static Z1 CV(Z1 Gw,Z1 Gx,void*Gy){if(Gw<0.0f)Gw=-Gw;if(Gw
+<1.0f)return(16.0f+Gw*Gw*(21.0f*Gw-36.0f))/18.0f;else if(Gw<2.0f)return(32.0f+Gw
+*(-60.0+Gw*(36.0f-7.0f*Gw)))/18.0f;return 0.0f;}static Z1 CW(Z1 Gw,void*Gx){////
+return 0.5f;}static Z1 CX(Z1 Gw,void*Gx){return 1;}static Z1 CZ(Z1 Gw,void*Gx){
+return 2;}static int Ca(Bz*Gw,Z1 Gx,void*Gy){if(Gx>=1.0)return(int)((Z1)ceil((Z1
+)(Gw(1.0f/Gx,Gy)*2.0f)));else return(int)((Z1)ceil((Z1)(Gw(Gx,Gy)*2.0f/Gx)));}//
+static int Cb(B8*Gw,int Gx,void*Gy){Z1 Gz=Gw->E.C;Bz*G0=Gw->I;switch(Gx){case 1:
+return(int)((Z1)ceil((Z1)(G0(1.0f/Gz,Gy)*2.0f)));case 2:return(int)((Z1)ceil((Z1
+)(G0(Gz,Gy)*2.0f/Gz)));case 0:return(int)((Z1)ceil((Z1)(G0(Gz,Gy)*2.0f)));//////
+default:return 0;}}static int Cc(B8*Gw,int Gx){if(Gx)return Gw->E.B;else return
+Gw->E.A+Gw->M*2;}static int Cd(int Gw,int Gx){return 0;}static int Ce(int Gw,int
+Gx){if(Gw<0)return 0;if(Gw>=Gx)return Gx-1;return Gw;}static int Cf(int Gw,int//
+Gx){if(Gw<0)if(Gw>-Gx)return-Gw;else return Gx-1;if(Gw>=Gx){int Gy=Gx*2;if(Gw>=
+Gy)return 0;else return Gy-Gw-1;}return Gw;}static int Cg(int Gw,int Gx){if(Gw>=
+0)return Gw%Gx;else{int Gy=(-Gw)%Gx;if(Gy!=0)Gy=Gx-Gy;return Gy;}}typedef int Ch
+(int n,int max);static Ch*Ci[]={Ce,Cf,Cg,Cd,};inline static int Cj(Bt Gw,int Gx,
+int Gy){if(Gx>=0&&Gx<Gy)return Gx;return Ci[Gw](Gx,Gy);}static void Ck(B8*Gw,B9*
+Gx){int Gy,Gz;int G0,G1;int G2=0x7fffffff,G3=-2147483647;int G4=0x7fffffff,G5=-
+0x7fffffff;int G6=0x7fffffff,G7=-0x7fffffff;Bt G8=Gw->J;B4*G9=Gw->A;int G_=Gw->E
+.B;int HA=Gw->E.A;int HB=Gw->M;Gz=G_;for(Gy=0;Gy<Gz;Gy++)if(G9[Gy].A<G2){G2=G9[
+Gy].A;Gz=Gy+HB;if(Gz>G_)Gz=G_;}Gz=0;for(Gy=G_-1;Gy>=Gz;Gy--)if(G9[Gy].B>G3){G3=
+G9[Gy].B;Gz=Gy-HB;if(Gz<0)Gz=0;}G0=0;if(G2<0){G0=-G2;G2=0;}G1=0;if(G3>=HA){G1=G3
+-HA+1;G3=HA-1;}Gx->B[0]=G0;Gx->B[1]=G1;Gx->C[0].A=G2;Gx->C[0].B=G3;Gx->C[0].C=G2
+;Gx->C[1].A=0;Gx->C[1].B=-1;Gx->C[1].C=0;if(G8==STBIR_EDGE_ZERO)return;for(Gy= -
+G0;Gy<0;Gy++){int HC=Cj(G8,Gy,HA);if(HC<G4)G4=HC;if(HC>G5)G5=HC;}for(Gy=HA;Gy<(
+HA+G1);Gy++){int HC=Cj(G8,Gy,HA);if(HC<G6)G6=HC;if(HC>G7)G7=HC;}if(G4!=/////////
+0x7fffffff)if(((G4<=G2)&&((G5+16)>=G2))||((G2<=G4)&&((G3+16)>=G5))){Gx->C[0].A=
+G2=CF(G2,G4);Gx->C[0].B=G3=CG(G3,G5);Gx->C[0].C=G2;G0=0;}if(G6!=0x7fffffff)if(((
+G6<=G2)&&((G7+16)>=G2))||((G2<=G6)&&((G3+16)>=G7))){Gx->C[0].A=G2=CF(G2,G6);Gx->
+C[0].B=G3=CG(G3,G7);Gx->C[0].C=G2;G1=0;}if(G0&&(G4!=0x7fffffff)){B6*HC=Gx->C+1;
+if(G4<Gx->C[0].A){Gx->C[1].C=Gx->C[0].A;Gx->C[1].A=Gx->C[0].A;Gx->C[1].B=Gx->C[0
+].B;--HC;}HC->C=G4;HC->A=-G0;HC->B=(G5-G4)-G0;Gx->B[0]=0;}else if(G1&&(G6!=/////
+0x7fffffff)){B6*HC=Gx->C+1;if(G6<Gx->C[0].A){Gx->C[1].C=Gx->C[0].A;Gx->C[1].A=Gx
+->C[0].A;Gx->C[1].B=Gx->C[0].B;--HC;}HC->C=G6;HC->A=Gx->C[1].B+1;HC->B=Gx->C[1].
+B+1+(G7-G6);Gx->B[1]=0;}if((Gx->C[1].B>Gx->C[1].A)&&(Gx->C[0].A>Gx->C[1].A)){B6
+HC=Gx->C[0];Gx->C[0]=Gx->C[1];Gx->C[1]=HC;}}static void Cl(int*Gw,int*Gx,Z1 Gy,
+Z1 Gz,Z1 G0,Z1 G1,int G2,Bt G3){int G4,G5;Z1 G6=Gy-Gz;Z1 G7=Gy+Gz;Z1 G8=(G6+G1)*
+G0;Z1 G9=(G7+G1)*G0;G4=(int)(Z1)floor((Z1)(G8+0.5f));G5=(int)(Z1)floor((Z1)(G9-
+0.5f));if(G5<G4)G5=G4;if(G3==STBIR_EDGE_WRAP){if(G4<-G2)G4=-G2;if(G5>=(G2*2))G5=
+(G2*2)-1;}*Gw=G4;*Gx=G5;}static void Cm(Z1 Gw,By*Gx,B7*Gy,int Gz,B4*G0,Z1*G1,int
+G2,Bt G3,void*G4){int G5,G6;Z1 G7=Gy->D;Z1 G8=Gy->E;int G9=Gy->A;int G_=Gy->G;//
+int HA=Gy->F&&(G_<Gz);G6=Gz;if(HA)G6=G_;for(G5=0;G5<G6;G5++){int HB;int HC;Z1 HD
+=(Z1)G5+0.5f;Z1 HE=(HD+G8)*G7;int HF,HG;Cl(&HF,&HG,HD,Gw,G7,G8,G9,G3);if((HG-HF+
+1)>G2)HG=HF+G2-1;HC=-1;for(HB=0;HB<=HG-HF;HB++){Z1 HH=(Z1)(HB+HF)+0.5f;Z1 HI=Gx(
+HE-HH,G7,G4);if((HI<7.523e-37)&&(HI>-7.523e-37)){if(HB==0){++HF;HB--;continue;}
+HI=0;}else HC=HB;G1[HB]=HI;}HG=HC+HF;G0->A=HF;G0->B=HG;++G0;G1+=G2;}}static void
+Cn(B4*Gw,Z1*Gx,int Gy,Z1 Gz,int G0){if(Gw->B<Gw->A){Gw->A=Gw->B=Gy;Gx[0]=Gz;}///
+else if(Gy<=Gw->B){if(Gy<Gw->A){if((Gw->B-Gy+1)<=G0){int G1,G2=Gw->A-Gy;for(G1=
+Gw->B-Gw->A;G1>=0;G1--)Gx[G1+G2]=Gx[G1];for(G1=1;G1<G2;G1++)Gx[G1]=0;Gx[0]=Gz;Gw
+->A=Gy;}}else Gx[Gy-Gw->A]+=Gz;}else if((Gy-Gw->A+1)<=G0){int G1,G2=Gy-Gw->A;for
+(G1=(Gw->B-Gw->A)+1;G1<G2;G1++)Gx[G1]=0;Gx[G2]=Gz;Gw->B=Gy;}}static void Co(int*
+Gw,int*Gx,Z1 Gy,Z1 Gz,Z1 G0,Z1 G1,int G2){Z1 G3=Gy-Gz;Z1 G4=Gy+Gz;Z1 G5=G3*G0-G1
+;Z1 G6=G4*G0-G1;int G7=(int)(Z1)floor((Z1)(G5+0.5f));int G8=(int)(Z1)floor((Z1)(
+G6-0.5f));if(G7<0)G7=0;if(G8>=G2)G8=G2-1;*Gw=G7;*Gx=G8;}static void Cp(int Gw,//
+int Gx,Z1 Gy,By*Gz,B7*G0,int G1,int G2,B4*G3,Z1*G4,void*G5){int G6;int G7;int G8
+=-1;Z1 G9=G0->C;Z1 G_=G0->E;int HA=G0->B;int HB=G0->G;int HC=G0->F&&(HB<HA);for(
+G6=Gw;G6<Gx;G6++){Z1 HD=(Z1)G6+0.5f;Z1 HE=HD*G9-G_;int HF,HG;Co(&HF,&HG,HD,Gy,G9
+,G_,HA);if(HF>HG)continue;if(HC){if(HF==HB)break;if(HG>=HB)HG=HB-1;}for(G7=0;G7
+<=HG-HF;G7++){Z1 HH=(Z1)(G7+HF)+0.5f;Z1 HI=HH-HE;Z1 HJ=Gz(HI,G9,G5)*G9;if((HJ<//
+7.523e-37)&&(HJ>-7.523e-37))HJ=0.0f;{int HK=G7+HF;Z1*HL=G4+HK*G1;B4*HM=G3+HK;if(
+HK>G8){G8=HK;HM->A=G6;HM->B=G6;HL[0]=HJ;}else{if(HL[0]==0.0f)HM->A=G6;HM->B=G6;
+HL[G6-HM->A]=HJ;}}}}}static void Cq(Bt Gw,B5*Gx,B7*Gy,int Gz,B4*G0,Z1*G1,int G2)
+{int G3=Gy->A;int G4=G3-1;int G5,G6;int G7=0x7fffffff;int G8=-2147483647;int G9=
+-1;int G_=Gy->G;int HA=Gy->H;int HB=Gy->F&&(G_<Gz);Z1*HC;B4*HD;HC=G1;HD=G0;G6=Gz
+;if(HB)G6=G_;for(G5=0;G5<G6;G5++){int HE;double HF,HG=0;int HH;HH=HD->B-HD->A;//
+for(HE=0;HE<=HH;HE++)HG+=(double)HC[HE];if((HG<7.523e-37)&&(HG>-7.523e-37)){HD->
+B=HD->A;HC[0]=0.0f;}else if((HG<1.0)||(HG>1.0)){HF=1.0/HG;for(HE=0;HE<=HH;HE++)
+HC[HE]=(Z1)(HC[HE]*HF);}++HD;HC+=G2;}if(HB){B4*HE=G0;B4*HF=G0+G_;for(G5=G_;G5<Gz
+;G5++){HF->A=HE->A+HA;HF->B=HE->B+HA;++HF;++HE;}CO(G1+G_*G2,G1,(Gz-G_)*G2*4);}HC
+=G1;HD=G0;for(G5=0;G5<Gz;G5++){int HE;if(Gw==STBIR_EDGE_ZERO){if(HD->B>G4)HD->B=
+G4;if(HD->A<0){int HF,HG,HH=0;HH=-HD->A;HD->A=0;HG=HD->B-HD->A+1;if(HG>0)for(HF=
+0;HF<HG;HF++)HC[HF]=HC[HF+HH];}}else if((Gw==STBIR_EDGE_CLAMP)||(Gw==///////////
+STBIR_EDGE_REFLECT)){if(HD->B>G4){int HF=HD->A;int HG=HD->B;HD->B=G4;for(HE=G3;
+HE<=HG;HE++)Cn(HD,HC,Ci[Gw](HE,G3),HC[HE-HF],G2);}if(HD->A<0){int HF;Z1 HG;Z1*HH
+=HC-(HD->A+1);for(HE=-1;HE>HD->A;HE--)Cn(HD,HC,Ci[Gw](HE,G3),*HH--,G2);HF=HD->A;
+HG=HH[0];HD->A=0;for(HE=0;HE<=HD->B;HE++)HC[HE]=HC[HE-HF];Cn(HD,HC,Ci[Gw](HF,G3)
+,HG,G2);}}if(HD->A<=HD->B){int HF=HD->B-HD->A+1;while(HF&&(HC[HF-1]==0.0f))--HF;
+HD->B=HD->A+HF-1;if(HD->A<=HD->B){if(HD->A<G7)G7=HD->A;if(HD->B>G8)G8=HD->B;if(
+HF>G9)G9=HF;}for(HE=HF;HE<G2;HE++)HC[HE]=0.0f;}++HD;HC+=G2;}Gx->A=G7;Gx->B=G8;Gx
+->C=G9;}static int Cr(int Gw,B4*Gx,Z1*Gy,int Gz,int G0,int G1,int G2){int G3=G2+
+1;if(Gz!=G0){Z1*G4=Gy;Z1*G5=Gy;Z1*G6=Gy+Gw*G0;switch(G0){case 1:do{{((Bq*)G4)[0]
+=((Bq*)G5)[0];}++G4;G5+=Gz;}while(G4<G6);break;case 2:do{{((Br*)G4)[0]=((Br*)G5)
+[0];}G4+=2;G5+=Gz;}while(G4<G6);break;case 3:do{{((Br*)G4)[0]=((Br*)G5)[0];}{((
+Bq*)(G4+2))[0]=((Bq*)(G5+2))[0];}G4+=3;G5+=Gz;}while(G4<G6);break;case 4:do{{((
+Br*)G4)[0]=((Br*)G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}G4+=4;G5+=Gz;}while(G4<G6);//
+break;case 5:do{{((Br*)G4)[0]=((Br*)G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}{((Bq*)(G4
++4))[0]=((Bq*)(G5+4))[0];}G4+=5;G5+=Gz;}while(G4<G6);break;case 6:do{{((Br*)G4)[
+0]=((Br*)G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}{((Br*)(G4+4))[0]=((Br*)(G5+4))[0];}
+G4+=6;G5+=Gz;}while(G4<G6);break;case 7:do{{((Br*)G4)[0]=((Br*)G5)[0];((Br*)G4)[
+1]=((Br*)G5)[1];}{((Br*)(G4+4))[0]=((Br*)(G5+4))[0];}{((Bq*)(G4+6))[0]=((Bq*)(G5
++6))[0];}G4+=7;G5+=Gz;}while(G4<G6);break;case 8:do{{((Br*)G4)[0]=((Br*)G5)[0];(
+(Br*)G4)[1]=((Br*)G5)[1];}{((Br*)(G4+4))[0]=((Br*)(G5+4))[0];((Br*)(G4+4))[1]=((
+Br*)(G5+4))[1];}G4+=8;G5+=Gz;}while(G4<G6);break;case 9:do{{((Br*)G4)[0]=((Br*)
+G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}{((Br*)(G4+4))[0]=((Br*)(G5+4))[0];((Br*)(G4+4
+))[1]=((Br*)(G5+4))[1];}{((Bq*)(G4+8))[0]=((Bq*)(G5+8))[0];}G4+=9;G5+=Gz;}while(
+G4<G6);break;case 10:do{{((Br*)G4)[0]=((Br*)G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}{(
+(Br*)(G4+4))[0]=((Br*)(G5+4))[0];((Br*)(G4+4))[1]=((Br*)(G5+4))[1];}{((Br*)(G4+8
+))[0]=((Br*)(G5+8))[0];}G4+=10;G5+=Gz;}while(G4<G6);break;case 11:do{{((Br*)G4)[
+0]=((Br*)G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}{((Br*)(G4+4))[0]=((Br*)(G5+4))[0];((
+Br*)(G4+4))[1]=((Br*)(G5+4))[1];}{((Br*)(G4+8))[0]=((Br*)(G5+8))[0];}{((Bq*)(G4+
+10))[0]=((Bq*)(G5+10))[0];}G4+=11;G5+=Gz;}while(G4<G6);break;case 12:do{{((Br*)
+G4)[0]=((Br*)G5)[0];((Br*)G4)[1]=((Br*)G5)[1];}{((Br*)(G4+4))[0]=((Br*)(G5+4))[0
+];((Br*)(G4+4))[1]=((Br*)(G5+4))[1];}{((Br*)(G4+8))[0]=((Br*)(G5+8))[0];((Br*)(
+G4+8))[1]=((Br*)(G5+8))[1];}G4+=12;G5+=Gz;}while(G4<G6);break;default:do{Z1*G7=
+G4+G0-4;Z1*G8=G5;do{{((Br*)G4)[0]=((Br*)G8)[0];((Br*)G4)[1]=((Br*)G8)[1];}G4+=4;
+G8+=4;}while(G4<=G7);G7+=4;while(G4<G7){{((Bq*)G4)[0]=((Bq*)G8)[0];}++G4;++G8;}
+G5+=Gz;}while(G4<G6);break;}}Gy[G0*Gw]=8888.0f;{B4*G4=Gx+Gw-1;Z1*G5=Gy+G0*(Gw-1)
+;while((G4>=Gx)&&((G4->A+G0*2)>=G3)){if((G4->A+G0)>G3){int G6=G0;if(G0>12){int//
+G7;G7=G0&3;G6=(((G4->B-G4->A+1)-G7+3)&~3)+G7;if(G6<(8+G7))G6=8+G7;}if((G4->A+G6)
+>G3){int G7=G3-G6;int G8=G4->B-G4->A+1;int G9=G4->A-G7;Z1*G_=G5+G8-1;Z1*HA=G_+G9
+;while(G8){*HA-- =*G_--;--G8;}while(HA>=G5)*HA-- =0;G4->A=G7;if(G0>12){int HB;HB
+=G0&3;G6=(((G4->B-G4->A+1)-HB+3)&~3)+HB;if(G6<(8+HB))G6=8+HB;}}}--G4;G5-=G0;}}//
+return G0;}static void Cs(B8*Gw,B8*Gx,void*Gy){int Gz;Z1 G0=Gw->E.C;By*G1=Gw->H;
+Bz*G2=Gw->I;Z1 G3=Gw->E.D;int G4=Gw->E.A;int G5=Gw->N;B4*G6=Gw->A;Z1*G7=Gw->B;//
+int G8=Gw->K;switch(Gw->R){case 1:{Z1 G9=G2(G3,Gy)*G0;Cm(G9,G1,&Gw->E,G5,G6,G7,
+G8,Gw->J,Gy);Cq(Gw->J,&Gw->Q,&Gw->E,G5,G6,G7,G8);}break;case 0:case 2:{Z1 G9=G2(
+G0,Gy)*G3;int G_=Gw->M;int HA=G4+G_;if(!Gw->R){if(Gx){G6=Gx->A;G7=Gx->B;G8=Gx->K
+;G5=Gx->N;Gw->Q.A=Gx->Q.A;Gw->Q.B=Gx->Q.B;Gw->Q.C=Gx->Q.C;goto//////////////////
 jump_right_to_pivot;}G6=Gw->C;G7=Gw->D;G8=Gw->T;G5=Gw->S;}Cp(-G_,HA,G9,G1,&Gw->E
 ,G8,G5,G6,G7,Gy);Cq(Gw->J,&Gw->Q,&Gw->E,G5,G6,G7,G8);if(!Gw->R){B4*HB;int HC;///
 jump_right_to_pivot:HC=(-G_)-1;for(Gz=0;Gz<G5;Gz++){int HD;int HE=G6->A,HF=G6->B
-;int HG=Gw->K;float*HH=Gw->B+(HE+G_)*HG;float*HI=G7;HB=Gw->A+(HE+G_);for(HD=HE;
-HD<=HF;HD++){float HJ=*HI++;if((HJ>=7.523e-37)||(HJ<=-7.523e-37))if((HD>HC)||(HB
-->A>HB->B)){{B4*HK=Gw->A+(HC+G_+1);while(HK<HB){HK->A=0;HK->B=-1;++HK;}}HB->A=Gz
-;HB->B=Gz;HH[0]=HJ;HC=HD;}else Cn(HB,HH,Gz,HJ,HG);++HB;HH+=HG;}++G6;G7+=G8;}{B4*
-HD=Gw->A+(HC+G_+1);B4*HE=Gw->A+Gw->N;while(HD<HE){HD->A=0;HD->B=-1;++HD;}}}}////
-break;}}static float*Ct(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;////
-float*G0=(float*)Gz+Gx;unsigned char const*G1=(unsigned char const*)Gy;Gz+=4;///
-while(Gz<=G0){Gz[-4]=((float)G1[0])*3.922e-03;Gz[-3]=((float)G1[1])*3.922e-03;Gz
-[-2]=((float)G1[2])*3.922e-03;Gz[-1]=((float)G1[3])*3.922e-03;Gz+=4;G1+=4;}Gz-=4
-;_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gz<G0){asm(""::"r"(Gz));Gz[
-0]=((float)G1[0])*3.922e-03;Gz+=1;G1+=1;}return G0;}static void Cu(void*Gw,int//
-Gx,float const*Gy){unsigned char*restrict Gz=(unsigned char*)Gw;unsigned char*G0
-=((unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[0]*255.0f+0.5f;for(;
-;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy[1]*255.0f
-+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=
-Gy[2]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-2]=(unsigned
-char)G1;G1=Gy[3]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-1]
-=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma(///////////
-"GCC novector")while(Gz<G0){float G1;asm(""::"r"(Gy));G1=Gy[0]*255.0f+0.5f;for(;
-;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[0]=(unsigned char)G1;Gz+=1;Gy+=1;}}//
-static float*Cv(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(//
-float*)Gz+Gx;unsigned char const*G1=(unsigned char const*)Gy;Gz+=4;while(Gz<=G0)
-{Gz[-4]=((float)G1[0]);Gz[-3]=((float)G1[1]);Gz[-2]=((float)G1[2]);Gz[-1]=((////
-float)G1[3]);Gz+=4;G1+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma("GCC novector")//
-while(Gz<G0){asm(""::"r"(Gz));Gz[0]=((float)G1[0]);Gz+=1;G1+=1;}return G0;}/////
-static void Cw(void*Gw,int Gx,float const*Gy){unsigned char*restrict Gz=(///////
-unsigned char*)Gw;unsigned char*G0=((unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=G0){
-float G1;G1=Gy[0]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-4]=(////
-unsigned char)G1;G1=Gy[1]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-
-3]=(unsigned char)G1;G1=Gy[2]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}
-Gz[-2]=(unsigned char)G1;G1=Gy[3]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;///
-break;}Gz[-1]=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;_Pragma("GCC unroll 1")//////
-_Pragma("GCC novector")while(Gz<G0){float G1;asm(""::"r"(Gy));G1=Gy[0]+0.5f;for(
-;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[0]=(unsigned char)G1;Gz+=1;Gy+=1;}}
-static float*Cx(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(//
-float*)Gz+Gx;unsigned char const*G1=(unsigned char const*)Gy;Gz+=4;while(Gz<=G0)
-{Gz[-4]=CH[G1[0]];Gz[-3]=CH[G1[1]];Gz[-2]=CH[G1[2]];Gz[-1]=CH[G1[3]];Gz+=4;G1+=4
-;}Gz-=4;_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gz<G0){asm(""::"r"(
-Gz));Gz[0]=CH[G1[0]];Gz+=1;G1+=1;}return G0;}static void Cy(void*Gw,int Gx,float
-const*Gy){unsigned char*restrict Gz=(unsigned char*)Gw;unsigned char*G0=((//////
-unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=G0){Gz[-4]=CK(Gy[0]);Gz[-3]=CK(Gy[1]);Gz[-
-2]=CK(Gy[2]);Gz[-1]=CK(Gy[3]);Gz+=4;Gy+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma(
-"GCC novector")while(Gz<G0){asm(""::"r"(Gy));Gz[0]=CK(Gy[0]);Gz+=1;Gy+=1;}}/////
-static float*Cz(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(//
-float*)Gz+Gx;unsigned char const*G1=(unsigned char const*)Gy;do{Gz[0]=CH[G1[0]];
-Gz[1]=CH[G1[1]];Gz[2]=CH[G1[2]];Gz[3]=((float)G1[3])*3.922e-03;G1+=4;Gz+=4;}////
-while(Gz<G0);return G0;}static void C0(void*Gw,int Gx,float const*Gy){unsigned//
-char*restrict Gz=(unsigned char*)Gw;unsigned char*G0=((unsigned char*)Gz)+Gx;do{
-float G1;Gz[0]=CK(Gy[0]);Gz[1]=CK(Gy[1]);Gz[2]=CK(Gy[2]);G1=Gy[3]*255.0f+0.5f;//
-for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[3]=(unsigned char)G1;Gz+=4;Gy+=4
-;}while(Gz<G0);}static float*C1(float*Gw,int Gx,void const*Gy){float*restrict Gz
-=Gw;float*G0=(float*)Gz+Gx;unsigned char const*G1=(unsigned char const*)Gy;Gz+=4
-;while(Gz<=G0){Gz[-4]=CH[G1[0]];Gz[-3]=((float)G1[1])*3.922e-03;Gz[-2]=CH[G1[2]]
-;Gz[-1]=((float)G1[3])*3.922e-03;G1+=4;Gz+=4;}Gz-=4;if(Gz<G0){Gz[0]=CH[G1[0]];Gz
-[1]=((float)G1[1])*3.922e-03;}return G0;}static void C2(void*Gw,int Gx,float////
-const*Gy){unsigned char*restrict Gz=(unsigned char*)Gw;unsigned char*G0=((//////
-unsigned char*)Gz)+Gx;do{float G1;Gz[0]=CK(Gy[0]);G1=Gy[1]*255.0f+0.5f;for(;;){
-if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[1]=(unsigned char)G1;Gz+=2;Gy+=2;}while(
-Gz<G0);}static float*C3(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;////
-float*G0=(float*)Gz+Gx;unsigned short const*G1=(unsigned short const*)Gy;Gz+=4;
-while(Gz<=G0){Gz[-4]=((float)G1[0])*1.526e-05;Gz[-3]=((float)G1[1])*1.526e-05;Gz
-[-2]=((float)G1[2])*1.526e-05;Gz[-1]=((float)G1[3])*1.526e-05;Gz+=4;G1+=4;}Gz-=4
-;_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gz<G0){asm(""::"r"(Gz));Gz[
-0]=((float)G1[0])*1.526e-05;Gz+=1;G1+=1;}return G0;}static void C4(void*Gw,int//
-Gx,float const*Gy){unsigned short*restrict Gz=(unsigned short*)Gw;unsigned short
-*G0=((unsigned short*)Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[0]*65535.0f+0.5f
-;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-4]=(unsigned short)G1;G1=
-Gy[1]*65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-3]=(///
-unsigned short)G1;G1=Gy[2]*65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=///
-65535;break;}Gz[-2]=(unsigned short)G1;G1=Gy[3]*65535.0f+0.5f;for(;;){if(G1<0)G1
-=0;if(G1>65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;////
-_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gz<G0){float G1;asm(""::"r"(
-Gy));G1=Gy[0]*65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[
-0]=(unsigned short)G1;Gz+=1;Gy+=1;}}static float*C5(float*Gw,int Gx,void const*
-Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned short const*G1=(///////
-unsigned short const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((float)G1[0]);Gz[-3]=((////
-float)G1[1]);Gz[-2]=((float)G1[2]);Gz[-1]=((float)G1[3]);Gz+=4;G1+=4;}Gz-=4;////
-_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gz<G0){asm(""::"r"(Gz));Gz[0
-]=((float)G1[0]);Gz+=1;G1+=1;}return G0;}static void C6(void*Gw,int Gx,float////
-const*Gy){unsigned short*restrict Gz=(unsigned short*)Gw;unsigned short*G0=((///
-unsigned short*)Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[0]+0.5f;for(;;){if(G1<
-0)G1=0;if(G1>65535)G1=65535;break;}Gz[-4]=(unsigned short)G1;G1=Gy[1]+0.5f;for(;
-;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-3]=(unsigned short)G1;G1=Gy[2]+
-0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-2]=(unsigned short)G1;
-G1=Gy[3]+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-1]=(unsigned
-short)G1;Gz+=4;Gy+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma("GCC novector")while(
-Gz<G0){float G1;asm(""::"r"(Gy));G1=Gy[0]+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)
-G1=65535;break;}Gz[0]=(unsigned short)G1;Gz+=1;Gy+=1;}}static float*C7(float*Gw,
-int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;CL const*G1=(
-CL const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=CM(G1[0]);Gz[-3]=CM(G1[1]);Gz[-2]=CM(G1[
-2]);Gz[-1]=CM(G1[3]);Gz+=4;G1+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma(/////////
-"GCC novector")while(Gz<G0){asm(""::"r"(Gz));Gz[0]=CM(G1[0]);Gz+=1;G1+=1;}return
-G0;}static void C8(void*Gw,int Gx,float const*Gy){CL*restrict Gz=(CL*)Gw;CL*G0=(
-(CL*)Gz)+Gx;Gz+=4;while(Gz<=G0){Gz[-4]=CN(Gy[0]);Gz[-3]=CN(Gy[1]);Gz[-2]=CN(Gy[2
-]);Gz[-1]=CN(Gy[3]);Gz+=4;Gy+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma(//////////
-"GCC novector")while(Gz<G0){asm(""::"r"(Gz));Gz[0]=CN(Gy[0]);Gz+=1;Gy+=1;}}/////
-static float*C9(float*Gw,int Gx,void const*Gy){if((void*)Gw!=Gy)memcpy(Gw,Gy,Gx*
-4);return Gw+Gx;}static void C_(void*Gw,int Gx,float const*Gy){if((void*)Gw!=(//
-void*)Gy)memcpy(Gw,Gy,Gx*4);}static float*DA(float*Gw,int Gx,void const*Gy){////
-float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned char const*G1=(unsigned////
-char const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((float)G1[2])*3.922e-03;Gz[-3]=((////
-float)G1[1])*3.922e-03;Gz[-2]=((float)G1[0])*3.922e-03;Gz[-1]=((float)G1[3])* //
-3.922e-03;Gz+=4;G1+=4;}Gz-=4;return G0;}static void DB(void*Gw,int Gx,float/////
-const*Gy){unsigned char*restrict Gz=(unsigned char*)Gw;unsigned char*G0=((//////
-unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[2]*255.0f+0.5f;for(;;){
-if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy[1]*255.0f+//
-0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=Gy
-[0]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-2]=(unsigned///
-char)G1;G1=Gy[3]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-1]
-=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;}static float*DC(float*Gw,int Gx,void/////
-const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned char const*G1=(//
-unsigned char const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((float)G1[2]);Gz[-3]=((float
-)G1[1]);Gz[-2]=((float)G1[0]);Gz[-1]=((float)G1[3]);Gz+=4;G1+=4;}Gz-=4;return G0
-;}static void DD(void*Gw,int Gx,float const*Gy){unsigned char*restrict Gz=(/////
-unsigned char*)Gw;unsigned char*G0=((unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=G0){
-float G1;G1=Gy[2]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-4]=(////
-unsigned char)G1;G1=Gy[1]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-
-3]=(unsigned char)G1;G1=Gy[0]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}
-Gz[-2]=(unsigned char)G1;G1=Gy[3]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;///
-break;}Gz[-1]=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;}static float*DE(float*Gw,int
-Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned char/////
-const*G1=(unsigned char const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=CH[G1[2]];Gz[-3]=CH
-[G1[1]];Gz[-2]=CH[G1[0]];Gz[-1]=CH[G1[3]];Gz+=4;G1+=4;}Gz-=4;return G0;}static//
-void DF(void*Gw,int Gx,float const*Gy){unsigned char*restrict Gz=(unsigned char*
-)Gw;unsigned char*G0=((unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=G0){Gz[-4]=CK(Gy[2]
-);Gz[-3]=CK(Gy[1]);Gz[-2]=CK(Gy[0]);Gz[-1]=CK(Gy[3]);Gz+=4;Gy+=4;}Gz-=4;}static
-float*DG(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz
-+Gx;unsigned char const*G1=(unsigned char const*)Gy;do{Gz[0]=CH[G1[2]];Gz[1]=CH[
-G1[1]];Gz[2]=CH[G1[0]];Gz[3]=((float)G1[3])*3.922e-03;G1+=4;Gz+=4;}while(Gz<G0);
-return G0;}static void DH(void*Gw,int Gx,float const*Gy){unsigned char*restrict
-Gz=(unsigned char*)Gw;unsigned char*G0=((unsigned char*)Gz)+Gx;do{float G1;Gz[2]
-=CK(Gy[0]);Gz[1]=CK(Gy[1]);Gz[0]=CK(Gy[2]);G1=Gy[3]*255.0f+0.5f;for(;;){if(G1<0)
-G1=0;if(G1>255)G1=255;break;}Gz[3]=(unsigned char)G1;Gz+=4;Gy+=4;}while(Gz<G0);}
-static float*DI(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(//
-float*)Gz+Gx;unsigned short const*G1=(unsigned short const*)Gy;Gz+=4;while(Gz<=
-G0){Gz[-4]=((float)G1[2])*1.526e-05;Gz[-3]=((float)G1[1])*1.526e-05;Gz[-2]=((///
-float)G1[0])*1.526e-05;Gz[-1]=((float)G1[3])*1.526e-05;Gz+=4;G1+=4;}Gz-=4;return
-G0;}static void DJ(void*Gw,int Gx,float const*Gy){unsigned short*restrict Gz=(//
-unsigned short*)Gw;unsigned short*G0=((unsigned short*)Gz)+Gx;Gz+=4;while(Gz<=G0
-){float G1;G1=Gy[2]*65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;////
-break;}Gz[-4]=(unsigned short)G1;G1=Gy[1]*65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(
-G1>65535)G1=65535;break;}Gz[-3]=(unsigned short)G1;G1=Gy[0]*65535.0f+0.5f;for(;;
-){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-2]=(unsigned short)G1;G1=Gy[3] *
-65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-1]=(unsigned
-short)G1;Gz+=4;Gy+=4;}Gz-=4;}static float*DK(float*Gw,int Gx,void const*Gy){////
-float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned short const*G1=(unsigned///
-short const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((float)G1[2]);Gz[-3]=((float)G1[1]);
-Gz[-2]=((float)G1[0]);Gz[-1]=((float)G1[3]);Gz+=4;G1+=4;}Gz-=4;return G0;}static
-void DL(void*Gw,int Gx,float const*Gy){unsigned short*restrict Gz=(unsigned/////
-short*)Gw;unsigned short*G0=((unsigned short*)Gz)+Gx;Gz+=4;while(Gz<=G0){float//
-G1;G1=Gy[2]+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-4]=(//////
-unsigned short)G1;G1=Gy[1]+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;
-}Gz[-3]=(unsigned short)G1;G1=Gy[0]+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=///
-65535;break;}Gz[-2]=(unsigned short)G1;G1=Gy[3]+0.5f;for(;;){if(G1<0)G1=0;if(G1>
-65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;}static float
-*DM(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;
-CL const*G1=(CL const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=CM(G1[2]);Gz[-3]=CM(G1[1]);
-Gz[-2]=CM(G1[0]);Gz[-1]=CM(G1[3]);Gz+=4;G1+=4;}Gz-=4;return G0;}static void DN(
-void*Gw,int Gx,float const*Gy){CL*restrict Gz=(CL*)Gw;CL*G0=((CL*)Gz)+Gx;Gz+=4;
-while(Gz<=G0){Gz[-4]=CN(Gy[2]);Gz[-3]=CN(Gy[1]);Gz[-2]=CN(Gy[0]);Gz[-1]=CN(Gy[3]
-);Gz+=4;Gy+=4;}Gz-=4;}static float*DO(float*Gw,int Gx,void const*Gy){float* ////
-restrict Gz=Gw;float*G0=(float*)Gz+Gx;float const*G1=(float const*)Gy;Gz+=4;////
-while(Gz<=G0){Gz[-4]=G1[2];Gz[-3]=G1[1];Gz[-2]=G1[0];Gz[-1]=G1[3];Gz+=4;G1+=4;}
-Gz-=4;return G0;}static void DP(void*Gw,int Gx,float const*Gy){float*restrict Gz
-=(float*)Gw;float*G0=((float*)Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[2];Gz[-4
-]=G1;G1=Gy[1];Gz[-3]=G1;G1=Gy[0];Gz[-2]=G1;G1=Gy[3];Gz[-1]=G1;Gz+=4;Gy+=4;}Gz-=4
-;}static float*DQ(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(
-float*)Gz+Gx;unsigned char const*G1=(unsigned char const*)Gy;Gz+=4;while(Gz<=G0)
-{Gz[-4]=((float)G1[1])*3.922e-03;Gz[-3]=((float)G1[2])*3.922e-03;Gz[-2]=((float)
-G1[3])*3.922e-03;Gz[-1]=((float)G1[0])*3.922e-03;Gz+=4;G1+=4;}Gz-=4;return G0;}
-static void DR(void*Gw,int Gx,float const*Gy){unsigned char*restrict Gz=(///////
-unsigned char*)Gw;unsigned char*G0=((unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=G0){
-float G1;G1=Gy[3]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-4
-]=(unsigned char)G1;G1=Gy[0]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;
-break;}Gz[-3]=(unsigned char)G1;G1=Gy[1]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>
-255)G1=255;break;}Gz[-2]=(unsigned char)G1;G1=Gy[2]*255.0f+0.5f;for(;;){if(G1<0)
-G1=0;if(G1>255)G1=255;break;}Gz[-1]=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;}static
-float*DS(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz
-+Gx;unsigned char const*G1=(unsigned char const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=(
-(float)G1[1]);Gz[-3]=((float)G1[2]);Gz[-2]=((float)G1[3]);Gz[-1]=((float)G1[0]);
-Gz+=4;G1+=4;}Gz-=4;return G0;}static void DT(void*Gw,int Gx,float const*Gy){////
-unsigned char*restrict Gz=(unsigned char*)Gw;unsigned char*G0=((unsigned char*)
-Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[3]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255
-)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy[0]+0.5f;for(;;){if(G1<0)G1=0;if(G1
->255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=Gy[1]+0.5f;for(;;){if(G1<0)G1=0;
-if(G1>255)G1=255;break;}Gz[-2]=(unsigned char)G1;G1=Gy[2]+0.5f;for(;;){if(G1<0)
-G1=0;if(G1>255)G1=255;break;}Gz[-1]=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;}static
-float*DU(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz
-+Gx;unsigned char const*G1=(unsigned char const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=
-CH[G1[1]];Gz[-3]=CH[G1[2]];Gz[-2]=CH[G1[3]];Gz[-1]=CH[G1[0]];Gz+=4;G1+=4;}Gz-=4;
-return G0;}static void DV(void*Gw,int Gx,float const*Gy){unsigned char*restrict
-Gz=(unsigned char*)Gw;unsigned char*G0=((unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=
-G0){Gz[-4]=CK(Gy[3]);Gz[-3]=CK(Gy[0]);Gz[-2]=CK(Gy[1]);Gz[-1]=CK(Gy[2]);Gz+=4;Gy
-+=4;}Gz-=4;}static float*DW(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;
-float*G0=(float*)Gz+Gx;unsigned char const*G1=(unsigned char const*)Gy;do{Gz[0]=
-CH[G1[1]];Gz[1]=CH[G1[2]];Gz[2]=CH[G1[3]];Gz[3]=((float)G1[0])*3.922e-03;G1+=4;
-Gz+=4;}while(Gz<G0);return G0;}static void DX(void*Gw,int Gx,float const*Gy){///
-unsigned char*restrict Gz=(unsigned char*)Gw;unsigned char*G0=((unsigned char*)
-Gz)+Gx;do{float G1;Gz[1]=CK(Gy[0]);Gz[2]=CK(Gy[1]);Gz[3]=CK(Gy[2]);G1=Gy[3]* ///
-255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[0]=(unsigned char)G1
-;Gz+=4;Gy+=4;}while(Gz<G0);}static float*DY(float*Gw,int Gx,void const*Gy){float
-*restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned short const*G1=(unsigned short//
-const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((float)G1[1])*1.526e-05;Gz[-3]=((float)G1[
-2])*1.526e-05;Gz[-2]=((float)G1[3])*1.526e-05;Gz[-1]=((float)G1[0])*1.526e-05;Gz
-+=4;G1+=4;}Gz-=4;return G0;}static void DZ(void*Gw,int Gx,float const*Gy){//////
-unsigned short*restrict Gz=(unsigned short*)Gw;unsigned short*G0=((unsigned/////
-short*)Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[3]*65535.0f+0.5f;for(;;){if(G1<
-0)G1=0;if(G1>65535)G1=65535;break;}Gz[-4]=(unsigned short)G1;G1=Gy[0]*65535.0f+
-0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-3]=(unsigned short)G1;
-G1=Gy[1]*65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-2]=(
-unsigned short)G1;G1=Gy[2]*65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=///
-65535;break;}Gz[-1]=(unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;}static float*Da(float
-*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned//
-short const*G1=(unsigned short const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((float)G1[1
-]);Gz[-3]=((float)G1[2]);Gz[-2]=((float)G1[3]);Gz[-1]=((float)G1[0]);Gz+=4;G1+=4
-;}Gz-=4;return G0;}static void Db(void*Gw,int Gx,float const*Gy){unsigned short*
-restrict Gz=(unsigned short*)Gw;unsigned short*G0=((unsigned short*)Gz)+Gx;Gz+=4
-;while(Gz<=G0){float G1;G1=Gy[3]+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;
-break;}Gz[-4]=(unsigned short)G1;G1=Gy[0]+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)
-G1=65535;break;}Gz[-3]=(unsigned short)G1;G1=Gy[1]+0.5f;for(;;){if(G1<0)G1=0;if(
-G1>65535)G1=65535;break;}Gz[-2]=(unsigned short)G1;G1=Gy[2]+0.5f;for(;;){if(G1<0
-)G1=0;if(G1>65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;}
-static float*Dc(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(//
-float*)Gz+Gx;CL const*G1=(CL const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=CM(G1[1]);Gz[-
-3]=CM(G1[2]);Gz[-2]=CM(G1[3]);Gz[-1]=CM(G1[0]);Gz+=4;G1+=4;}Gz-=4;return G0;}///
-static void Dd(void*Gw,int Gx,float const*Gy){CL*restrict Gz=(CL*)Gw;CL*G0=((CL*
-)Gz)+Gx;Gz+=4;while(Gz<=G0){Gz[-4]=CN(Gy[3]);Gz[-3]=CN(Gy[0]);Gz[-2]=CN(Gy[1]);
-Gz[-1]=CN(Gy[2]);Gz+=4;Gy+=4;}Gz-=4;}static float*De(float*Gw,int Gx,void const*
-Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;float const*G1=(float const*)Gy;
-Gz+=4;while(Gz<=G0){Gz[-4]=G1[1];Gz[-3]=G1[2];Gz[-2]=G1[3];Gz[-1]=G1[0];Gz+=4;G1
-+=4;}Gz-=4;return G0;}static void Df(void*Gw,int Gx,float const*Gy){float* /////
-restrict Gz=(float*)Gw;float*G0=((float*)Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=
-Gy[3];Gz[-4]=G1;G1=Gy[0];Gz[-3]=G1;G1=Gy[1];Gz[-2]=G1;G1=Gy[2];Gz[-1]=G1;Gz+=4;
-Gy+=4;}Gz-=4;}static float*Dg(float*Gw,int Gx,void const*Gy){float*restrict Gz=
-Gw;float*G0=(float*)Gz+Gx;unsigned char const*G1=(unsigned char const*)Gy;Gz+=4;
-while(Gz<=G0){Gz[-4]=((float)G1[3])*3.922e-03;Gz[-3]=((float)G1[2])*3.922e-03;Gz
-[-2]=((float)G1[1])*3.922e-03;Gz[-1]=((float)G1[0])*3.922e-03;Gz+=4;G1+=4;}Gz-=4
-;return G0;}static void Dh(void*Gw,int Gx,float const*Gy){unsigned char*restrict
-Gz=(unsigned char*)Gw;unsigned char*G0=((unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=
-G0){float G1;G1=Gy[3]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}
-Gz[-4]=(unsigned char)G1;G1=Gy[2]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=
-255;break;}Gz[-3]=(unsigned char)G1;G1=Gy[1]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if
-(G1>255)G1=255;break;}Gz[-2]=(unsigned char)G1;G1=Gy[0]*255.0f+0.5f;for(;;){if(
-G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-1]=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;}
-static float*Di(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(//
-float*)Gz+Gx;unsigned char const*G1=(unsigned char const*)Gy;Gz+=4;while(Gz<=G0)
-{Gz[-4]=((float)G1[3]);Gz[-3]=((float)G1[2]);Gz[-2]=((float)G1[1]);Gz[-1]=((////
-float)G1[0]);Gz+=4;G1+=4;}Gz-=4;return G0;}static void Dj(void*Gw,int Gx,float//
-const*Gy){unsigned char*restrict Gz=(unsigned char*)Gw;unsigned char*G0=((//////
-unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[3]+0.5f;for(;;){if(G1<0
-)G1=0;if(G1>255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy[2]+0.5f;for(;;){if(
-G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=Gy[1]+0.5f;for(;;)
-{if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-2]=(unsigned char)G1;G1=Gy[0]+0.5f;for
-(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-1]=(unsigned char)G1;Gz+=4;Gy+=4;}
-Gz-=4;}static float*Dk(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float
-*G0=(float*)Gz+Gx;unsigned char const*G1=(unsigned char const*)Gy;Gz+=4;while(Gz
-<=G0){Gz[-4]=CH[G1[3]];Gz[-3]=CH[G1[2]];Gz[-2]=CH[G1[1]];Gz[-1]=CH[G1[0]];Gz+=4;
-G1+=4;}Gz-=4;return G0;}static void Dl(void*Gw,int Gx,float const*Gy){unsigned//
-char*restrict Gz=(unsigned char*)Gw;unsigned char*G0=((unsigned char*)Gz)+Gx;Gz
-+=4;while(Gz<=G0){Gz[-4]=CK(Gy[3]);Gz[-3]=CK(Gy[2]);Gz[-2]=CK(Gy[1]);Gz[-1]=CK(
-Gy[0]);Gz+=4;Gy+=4;}Gz-=4;}static float*Dm(float*Gw,int Gx,void const*Gy){float*
-restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned char const*G1=(unsigned char/////
-const*)Gy;do{Gz[0]=CH[G1[3]];Gz[1]=CH[G1[2]];Gz[2]=CH[G1[1]];Gz[3]=((float)G1[0]
-)*3.922e-03;G1+=4;Gz+=4;}while(Gz<G0);return G0;}static void Dn(void*Gw,int Gx,
-float const*Gy){unsigned char*restrict Gz=(unsigned char*)Gw;unsigned char*G0=((
-unsigned char*)Gz)+Gx;do{float G1;Gz[3]=CK(Gy[0]);Gz[2]=CK(Gy[1]);Gz[1]=CK(Gy[2]
-);G1=Gy[3]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[0]=(/////
-unsigned char)G1;Gz+=4;Gy+=4;}while(Gz<G0);}static float*Do(float*Gw,int Gx,void
-const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned short const*G1=(
-unsigned short const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((float)G1[3])*1.526e-05;Gz[
--3]=((float)G1[2])*1.526e-05;Gz[-2]=((float)G1[1])*1.526e-05;Gz[-1]=((float)G1[0
-])*1.526e-05;Gz+=4;G1+=4;}Gz-=4;return G0;}static void Dp(void*Gw,int Gx,float//
-const*Gy){unsigned short*restrict Gz=(unsigned short*)Gw;unsigned short*G0=((///
-unsigned short*)Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[3]*65535.0f+0.5f;for(;
-;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-4]=(unsigned short)G1;G1=Gy[2]*
-65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-3]=(unsigned
-short)G1;G1=Gy[1]*65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;
-}Gz[-2]=(unsigned short)G1;G1=Gy[0]*65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>///
-65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;}static float
-*Dq(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;
-unsigned short const*G1=(unsigned short const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((
-float)G1[3]);Gz[-3]=((float)G1[2]);Gz[-2]=((float)G1[1]);Gz[-1]=((float)G1[0]);
-Gz+=4;G1+=4;}Gz-=4;return G0;}static void Dr(void*Gw,int Gx,float const*Gy){////
-unsigned short*restrict Gz=(unsigned short*)Gw;unsigned short*G0=((unsigned/////
-short*)Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[3]+0.5f;for(;;){if(G1<0)G1=0;if
-(G1>65535)G1=65535;break;}Gz[-4]=(unsigned short)G1;G1=Gy[2]+0.5f;for(;;){if(G1<
-0)G1=0;if(G1>65535)G1=65535;break;}Gz[-3]=(unsigned short)G1;G1=Gy[1]+0.5f;for(;
-;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-2]=(unsigned short)G1;G1=Gy[0]+
-0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;
-Gz+=4;Gy+=4;}Gz-=4;}static float*Ds(float*Gw,int Gx,void const*Gy){float* //////
-restrict Gz=Gw;float*G0=(float*)Gz+Gx;CL const*G1=(CL const*)Gy;Gz+=4;while(Gz<=
-G0){Gz[-4]=CM(G1[3]);Gz[-3]=CM(G1[2]);Gz[-2]=CM(G1[1]);Gz[-1]=CM(G1[0]);Gz+=4;G1
-+=4;}Gz-=4;return G0;}static void Dt(void*Gw,int Gx,float const*Gy){CL*restrict
-Gz=(CL*)Gw;CL*G0=((CL*)Gz)+Gx;Gz+=4;while(Gz<=G0){Gz[-4]=CN(Gy[3]);Gz[-3]=CN(Gy[
-2]);Gz[-2]=CN(Gy[1]);Gz[-1]=CN(Gy[0]);Gz+=4;Gy+=4;}Gz-=4;}static float*Du(float*
-Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;float const
-*G1=(float const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=G1[3];Gz[-3]=G1[2];Gz[-2]=G1[1];
-Gz[-1]=G1[0];Gz+=4;G1+=4;}Gz-=4;return G0;}static void Dv(void*Gw,int Gx,float//
-const*Gy){float*restrict Gz=(float*)Gw;float*G0=((float*)Gz)+Gx;Gz+=4;while(Gz<=
-G0){float G1;G1=Gy[3];Gz[-4]=G1;G1=Gy[2];Gz[-3]=G1;G1=Gy[1];Gz[-2]=G1;G1=Gy[0];
-Gz[-1]=G1;Gz+=4;Gy+=4;}Gz-=4;}static float*Dw(float*Gw,int Gx,void const*Gy){///
-float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned char const*G1=(unsigned////
-char const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((float)G1[1])*3.922e-03;Gz[-3]=((////
-float)G1[0])*3.922e-03;Gz[-2]=((float)G1[3])*3.922e-03;Gz[-1]=((float)G1[2])* //
-3.922e-03;Gz+=4;G1+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma("GCC novector")while
-(Gz<G0){asm(""::"r"(Gz));Gz[0]=((float)G1[1])*3.922e-03;Gz[1]=((float)G1[0])* //
-3.922e-03;Gz+=2;G1+=2;}return G0;}static void Dx(void*Gw,int Gx,float const*Gy){
-unsigned char*restrict Gz=(unsigned char*)Gw;unsigned char*G0=((unsigned char*)
-Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[1]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if
-(G1>255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy[0]*255.0f+0.5f;for(;;){if(
-G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=Gy[3]*255.0f+0.5f;
-for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-2]=(unsigned char)G1;G1=Gy[2]*
-255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-1]=(unsigned char)
-G1;Gz+=4;Gy+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gz<G0)
-{float G1;asm(""::"r"(Gy));G1=Gy[1]*255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)
-G1=255;break;}Gz[0]=(unsigned char)G1;G1=Gy[0]*255.0f+0.5f;for(;;){if(G1<0)G1=0;
-if(G1>255)G1=255;break;}Gz[1]=(unsigned char)G1;Gz+=2;Gy+=2;}}static float*Dy(//
-float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;/////
-unsigned char const*G1=(unsigned char const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((///
-float)G1[1]);Gz[-3]=((float)G1[0]);Gz[-2]=((float)G1[3]);Gz[-1]=((float)G1[2]);
-Gz+=4;G1+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gz<G0){//
-asm(""::"r"(Gz));Gz[0]=((float)G1[1]);Gz[1]=((float)G1[0]);Gz+=2;G1+=2;}return//
-G0;}static void Dz(void*Gw,int Gx,float const*Gy){unsigned char*restrict Gz=(///
-unsigned char*)Gw;unsigned char*G0=((unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=G0){
-float G1;G1=Gy[1]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-4]=(////
-unsigned char)G1;G1=Gy[0]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[-
-3]=(unsigned char)G1;G1=Gy[3]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}
-Gz[-2]=(unsigned char)G1;G1=Gy[2]+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;///
-break;}Gz[-1]=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;_Pragma("GCC unroll 1")//////
-_Pragma("GCC novector")while(Gz<G0){float G1;asm(""::"r"(Gy));G1=Gy[1]+0.5f;for(
-;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[0]=(unsigned char)G1;G1=Gy[0]+0.5f;
-for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[1]=(unsigned char)G1;Gz+=2;Gy+=2
-;}}static float*D0(float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=
-(float*)Gz+Gx;unsigned char const*G1=(unsigned char const*)Gy;Gz+=4;while(Gz<=G0
-){Gz[-4]=CH[G1[1]];Gz[-3]=CH[G1[0]];Gz[-2]=CH[G1[3]];Gz[-1]=CH[G1[2]];Gz+=4;G1+=
-4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gz<G0){asm(""::"r"(
-Gz));Gz[0]=CH[G1[1]];Gz[1]=CH[G1[0]];Gz+=2;G1+=2;}return G0;}static void D1(void
-*Gw,int Gx,float const*Gy){unsigned char*restrict Gz=(unsigned char*)Gw;unsigned
-char*G0=((unsigned char*)Gz)+Gx;Gz+=4;while(Gz<=G0){Gz[-4]=CK(Gy[1]);Gz[-3]=CK(
-Gy[0]);Gz[-2]=CK(Gy[3]);Gz[-1]=CK(Gy[2]);Gz+=4;Gy+=4;}Gz-=4;_Pragma(////////////
-"GCC unroll 1")_Pragma("GCC novector")while(Gz<G0){asm(""::"r"(Gy));Gz[0]=CK(Gy[
-1]);Gz[1]=CK(Gy[0]);Gz+=2;Gy+=2;}}static float*D2(float*Gw,int Gx,void const*Gy)
-{float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned char const*G1=(unsigned///
-char const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=CH[G1[1]];Gz[-3]=((float)G1[0])* /////
-3.922e-03;Gz[-2]=CH[G1[3]];Gz[-1]=((float)G1[2])*3.922e-03;G1+=4;Gz+=4;}Gz-=4;if
-(Gz<G0){Gz[0]=CH[G1[1]];Gz[1]=((float)G1[0])*3.922e-03;}return G0;}static void//
-D3(void*Gw,int Gx,float const*Gy){unsigned char*restrict Gz=(unsigned char*)Gw;
-unsigned char*G0=((unsigned char*)Gz)+Gx;do{float G1;Gz[1]=CK(Gy[0]);G1=Gy[1]  *
-255.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>255)G1=255;break;}Gz[0]=(unsigned char)G1
-;Gz+=2;Gy+=2;}while(Gz<G0);}static float*D4(float*Gw,int Gx,void const*Gy){float
-*restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned short const*G1=(unsigned short//
-const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((float)G1[1])*1.526e-05;Gz[-3]=((float)G1[
-0])*1.526e-05;Gz[-2]=((float)G1[3])*1.526e-05;Gz[-1]=((float)G1[2])*1.526e-05;Gz
-+=4;G1+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gz<G0){asm(
-""::"r"(Gz));Gz[0]=((float)G1[1])*1.526e-05;Gz[1]=((float)G1[0])*1.526e-05;Gz+=2
-;G1+=2;}return G0;}static void D5(void*Gw,int Gx,float const*Gy){unsigned short*
-restrict Gz=(unsigned short*)Gw;unsigned short*G0=((unsigned short*)Gz)+Gx;Gz+=4
-;while(Gz<=G0){float G1;G1=Gy[1]*65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)
-G1=65535;break;}Gz[-4]=(unsigned short)G1;G1=Gy[0]*65535.0f+0.5f;for(;;){if(G1<0
-)G1=0;if(G1>65535)G1=65535;break;}Gz[-3]=(unsigned short)G1;G1=Gy[3]*65535.0f+//
-0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-2]=(unsigned short)G1;
-G1=Gy[2]*65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-1]=(
-unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma(////////////
-"GCC novector")while(Gz<G0){float G1;asm(""::"r"(Gy));G1=Gy[1]*65535.0f+0.5f;for
-(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[0]=(unsigned short)G1;G1=Gy[0]*
-65535.0f+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[1]=(unsigned//
-short)G1;Gz+=2;Gy+=2;}}static float*D6(float*Gw,int Gx,void const*Gy){float* ///
-restrict Gz=Gw;float*G0=(float*)Gz+Gx;unsigned short const*G1=(unsigned short///
-const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=((float)G1[1]);Gz[-3]=((float)G1[0]);Gz[-2]
-=((float)G1[3]);Gz[-1]=((float)G1[2]);Gz+=4;G1+=4;}Gz-=4;_Pragma("GCC unroll 1")
-_Pragma("GCC novector")while(Gz<G0){asm(""::"r"(Gz));Gz[0]=((float)G1[1]);Gz[1]=
-((float)G1[0]);Gz+=2;G1+=2;}return G0;}static void D7(void*Gw,int Gx,float const
-*Gy){unsigned short*restrict Gz=(unsigned short*)Gw;unsigned short*G0=((unsigned
-short*)Gz)+Gx;Gz+=4;while(Gz<=G0){float G1;G1=Gy[1]+0.5f;for(;;){if(G1<0)G1=0;if
-(G1>65535)G1=65535;break;}Gz[-4]=(unsigned short)G1;G1=Gy[0]+0.5f;for(;;){if(G1<
-0)G1=0;if(G1>65535)G1=65535;break;}Gz[-3]=(unsigned short)G1;G1=Gy[3]+0.5f;for(;
-;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-2]=(unsigned short)G1;G1=Gy[2]+
-0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;
-Gz+=4;Gy+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gz<G0){//
-float G1;asm(""::"r"(Gy));G1=Gy[1]+0.5f;for(;;){if(G1<0)G1=0;if(G1>65535)G1=////
-65535;break;}Gz[0]=(unsigned short)G1;G1=Gy[0]+0.5f;for(;;){if(G1<0)G1=0;if(G1>
-65535)G1=65535;break;}Gz[1]=(unsigned short)G1;Gz+=2;Gy+=2;}}static float*D8(///
-float*Gw,int Gx,void const*Gy){float*restrict Gz=Gw;float*G0=(float*)Gz+Gx;CL///
-const*G1=(CL const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=CM(G1[1]);Gz[-3]=CM(G1[0]);Gz[
--2]=CM(G1[3]);Gz[-1]=CM(G1[2]);Gz+=4;G1+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma
-("GCC novector")while(Gz<G0){asm(""::"r"(Gz));Gz[0]=CM(G1[1]);Gz[1]=CM(G1[0]);Gz
-+=2;G1+=2;}return G0;}static void D9(void*Gw,int Gx,float const*Gy){CL*restrict
+;int HG=Gw->K;Z1*HH=Gw->B+(HE+G_)*HG;Z1*HI=G7;HB=Gw->A+(HE+G_);for(HD=HE;HD<=HF;
+HD++){Z1 HJ=*HI++;if((HJ>=7.523e-37)||(HJ<=-7.523e-37))if((HD>HC)||(HB->A>HB->B)
+){{B4*HK=Gw->A+(HC+G_+1);while(HK<HB){HK->A=0;HK->B=-1;++HK;}}HB->A=Gz;HB->B=Gz;
+HH[0]=HJ;HC=HD;}else Cn(HB,HH,Gz,HJ,HG);++HB;HH+=HG;}++G6;G7+=G8;}{B4*HD=Gw->A+(
+HC+G_+1);B4*HE=Gw->A+Gw->N;while(HD<HE){HD->A=0;HD->B=-1;++HD;}}}}break;}}static
+Z1*Ct Z4((Z1)G1[0])*3.922e-03;Gz[-3]=((Z1)G1[1])*3.922e-03;Gz[-2]=((Z1)G1[2])*//
+3.922e-03;Gz[-1]=((Z1)G1[3])*3.922e-03;Gz+=4;G1+=4;}Gz-=4;while(Gz<G0){Gz[0]=((
+Z1)G1[0])*3.922e-03;Gz+=1;G1+=1;}return G0;}static void Cu Zd Gz+=4;while(Gz<=G0
+){Z1 G1;G1=Gy[0]*255.0f Z2 255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy[1]*
+255.0f Z2 255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=Gy[2]*255.0f Z2 255)G1=
+255;break;}Gz[-2]=(unsigned char)G1;G1=Gy[3]*255.0f Z2 255)G1=255;break;}Gz[-1]=
+(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;while(Gz<G0){Z1 G1;G1=Gy[0]*255.0f Z2 255)
+G1=255;break;}Gz[0]=(unsigned char)G1;Gz+=1;Gy+=1;}}static Z1*Cv Z4((Z1)G1[0]);
+Gz[-3]=((Z1)G1[1]);Gz[-2]=((Z1)G1[2]);Gz[-1]=((Z1)G1[3]);Gz+=4;G1+=4;}Gz-=4;////
+while(Gz<G0){Gz[0]=((Z1)G1[0]);Gz+=1;G1+=1;}return G0;}static void Cw Zd Gz+=4;
+while(Gz<=G0){Z1 G1;G1=Gy[0]Z2 255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy[
+1]Z2 255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=Gy[2]Z2 255)G1=255;break;}Gz[
+-2]=(unsigned char)G1;G1=Gy[3]Z2 255)G1=255;break;}Gz[-1]=(unsigned char)G1;Gz+=
+4;Gy+=4;}Gz-=4;while(Gz<G0){Z1 G1;G1=Gy[0]Z2 255)G1=255;break;}Gz[0]=(unsigned//
+char)G1;Gz+=1;Gy+=1;}}static Z1*Cx Z4 CH[G1[0]];Gz[-3]=CH[G1[1]];Gz[-2]=CH[G1[2]
+];Gz[-1]=CH[G1[3]];Gz+=4;G1+=4;}Gz-=4;while(Gz<G0){Gz[0]=CH[G1[0]];Gz+=1;G1+=1;}
+return G0;}static void Cy Zd Gz+=4;while(Gz<=G0){Gz[-4]=CK(Gy[0]);Gz[-3]=CK(Gy[1
+]);Gz[-2]=CK(Gy[2]);Gz[-1]=CK(Gy[3]);Gz+=4;Gy+=4;}Gz-=4;while(Gz<G0){Gz[0]=CK(Gy
+[0]);Gz+=1;Gy+=1;}}static Z1*Cz Z3 do{Gz[0]=CH[G1[0]];Gz[1]=CH[G1[1]];Gz[2]=CH[
+G1[2]];Gz[3]=((Z1)G1[3])*3.922e-03;G1+=4;Gz+=4;}while(Gz<G0);return G0;}static//
+void C0 Zd do{Z1 G1;Gz[0]=CK(Gy[0]);Gz[1]=CK(Gy[1]);Gz[2]=CK(Gy[2]);G1=Gy[3]*///
+255.0f Z2 255)G1=255;break;}Gz[3]=(unsigned char)G1;Gz+=4;Gy+=4;}while(Gz<G0);}
+static Z1*C1 Z4 CH[G1[0]];Gz[-3]=((Z1)G1[1])*3.922e-03;Gz[-2]=CH[G1[2]];Gz[-1]=(
+(Z1)G1[3])*3.922e-03;G1+=4;Gz+=4;}Gz-=4;if(Gz<G0){Gz[0]=CH[G1[0]];Gz[1]=((Z1)G1[
+1])*3.922e-03;}return G0;}static void C2 Zd do{Z1 G1;Gz[0]=CK(Gy[0]);G1=Gy[1]*//
+255.0f Z2 255)G1=255;break;}Gz[1]=(unsigned char)G1;Gz+=2;Gy+=2;}while(Gz<G0);}
+static Z1*C3 Zj 0])*1.526e-05;Gz[-3]=((Z1)G1[1])*1.526e-05;Gz[-2]=((Z1)G1[2])*//
+1.526e-05;Gz[-1]=((Z1)G1[3])*1.526e-05;Gz+=4;G1+=4;}Gz-=4;while(Gz<G0){Gz[0]=((
+Z1)G1[0])*1.526e-05;Gz+=1;G1+=1;}return G0;}static void C4 Zi 0]*65535.0f Z2////
+65535)G1=65535;break;}Gz[-4]=(unsigned short)G1;G1=Gy[1]*65535.0f Z2 65535)G1=//
+65535;break;}Gz[-3]=(unsigned short)G1;G1=Gy[2]*65535.0f Z2 65535)G1=65535;break
+;}Gz[-2]=(unsigned short)G1;G1=Gy[3]*65535.0f Z2 65535)G1=65535;break;}Gz[-1]=(
+unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;while(Gz<G0){Z1 G1;G1=Gy[0]*65535.0f Z2////
+65535)G1=65535;break;}Gz[0]=(unsigned short)G1;Gz+=1;Gy+=1;}}static Z1*C5 Zj 0])
+;Gz[-3]=((Z1)G1[1]);Gz[-2]=((Z1)G1[2]);Gz[-1]=((Z1)G1[3]);Gz+=4;G1+=4;}Gz-=4;///
+while(Gz<G0){Gz[0]=((Z1)G1[0]);Gz+=1;G1+=1;}return G0;}static void C6 Zi 0]Z2///
+65535)G1=65535;break;}Gz[-4]=(unsigned short)G1;G1=Gy[1]Z2 65535)G1=65535;break;
+}Gz[-3]=(unsigned short)G1;G1=Gy[2]Z2 65535)G1=65535;break;}Gz[-2]=(unsigned////
+short)G1;G1=Gy[3]Z2 65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;Gz+=4;Gy+=4;
+}Gz-=4;while(Gz<G0){Z1 G1;G1=Gy[0]Z2 65535)G1=65535;break;}Gz[0]=(unsigned short
+)G1;Gz+=1;Gy+=1;}}static Z1*C7(Z1*Gw,int Gx,void const*Gy){Z1*RESTRICT Gz=Gw;Z1*
+G0=(Z1*)Gz+Gx;CL const*G1=(CL const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=CM(G1[0]);Gz[
+-3]=CM(G1[1]);Gz[-2]=CM(G1[2]);Gz[-1]=CM(G1[3]);Gz+=4;G1+=4;}Gz-=4;while(Gz<G0){
+Gz[0]=CM(G1[0]);Gz+=1;G1+=1;}return G0;}static void C8(void*Gw,int Gx,Z1 const*
+Gy){CL*RESTRICT Gz=(CL*)Gw;CL*G0=((CL*)Gz)+Gx;Gz+=4;while(Gz<=G0){Gz[-4]=CN(Gy[0
+]);Gz[-3]=CN(Gy[1]);Gz[-2]=CN(Gy[2]);Gz[-1]=CN(Gy[3]);Gz+=4;Gy+=4;}Gz-=4;while(
+Gz<G0){Gz[0]=CN(Gy[0]);Gz+=1;Gy+=1;}}static Z1*C9(Z1*Gw,int Gx,void const*Gy){if
+((void*)Gw!=Gy)memcpy(Gw,Gy,Gx*4);return Gw+Gx;}static void C_(void*Gw,int Gx,Z1
+const*Gy){if((void*)Gw!=(void*)Gy)memcpy(Gw,Gy,Gx*4);}static Z1*DA Z4((Z1)G1[2])
+*3.922e-03;Gz[-3]=((Z1)G1[1])*3.922e-03;Gz[-2]=((Z1)G1[0])*3.922e-03;Gz[-1]=((Z1
+)G1[3])*3.922e-03;Gz+=4;G1+=4;}Gz-=4;return G0;}static void DB Zd Gz+=4;while(Gz
+<=G0){Z1 G1;G1=Gy[2]*255.0f Z2 255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy[
+1]*255.0f Z2 255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=Gy[0]*255.0f Z2 255)
+G1=255;break;}Gz[-2]=(unsigned char)G1;G1=Gy[3]*255.0f Z2 255)G1=255;break;}Gz[-
+1]=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;}static Z1*DC Z4((Z1)G1[2]);Gz[-3]=((Z1)
+G1[1]);Gz[-2]=((Z1)G1[0]);Gz[-1]=((Z1)G1[3]);Gz+=4;G1+=4;}Gz-=4;return G0;}/////
+static void DD Zd Gz+=4;while(Gz<=G0){Z1 G1;G1=Gy[2]Z2 255)G1=255;break;}Gz[-4]=
+(unsigned char)G1;G1=Gy[1]Z2 255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=Gy[0]
+Z2 255)G1=255;break;}Gz[-2]=(unsigned char)G1;G1=Gy[3]Z2 255)G1=255;break;}Gz[-1
+]=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;}static Z1*DE Z4 CH[G1[2]];Gz[-3]=CH[G1[1
+]];Gz[-2]=CH[G1[0]];Gz[-1]=CH[G1[3]];Gz+=4;G1+=4;}Gz-=4;return G0;}static void//
+DF Zd Gz+=4;while(Gz<=G0){Gz[-4]=CK(Gy[2]);Gz[-3]=CK(Gy[1]);Gz[-2]=CK(Gy[0]);Gz[
+-1]=CK(Gy[3]);Gz+=4;Gy+=4;}Gz-=4;}static Z1*DG Z3 do{Gz[0]=CH[G1[2]];Gz[1]=CH[G1
+[1]];Gz[2]=CH[G1[0]];Gz[3]=((Z1)G1[3])*3.922e-03;G1+=4;Gz+=4;}while(Gz<G0);/////
+return G0;}static void DH Zd do{Z1 G1;Gz[2]=CK(Gy[0]);Gz[1]=CK(Gy[1]);Gz[0]=CK(
+Gy[2]);G1=Gy[3]*255.0f Z2 255)G1=255;break;}Gz[3]=(unsigned char)G1;Gz+=4;Gy+=4;
+}while(Gz<G0);}static Z1*DI Zj 2])*1.526e-05;Gz[-3]=((Z1)G1[1])*1.526e-05;Gz[-2]
+=((Z1)G1[0])*1.526e-05;Gz[-1]=((Z1)G1[3])*1.526e-05;Gz+=4;G1+=4;}Gz-=4;return G0
+;}static void DJ Zi 2]*65535.0f Z2 65535)G1=65535;break;}Gz[-4]=(unsigned short)
+G1;G1=Gy[1]*65535.0f Z2 65535)G1=65535;break;}Gz[-3]=(unsigned short)G1;G1=Gy[0]
+*65535.0f Z2 65535)G1=65535;break;}Gz[-2]=(unsigned short)G1;G1=Gy[3]*65535.0f//
+Z2 65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;}static Z1
+*DK Zj 2]);Gz[-3]=((Z1)G1[1]);Gz[-2]=((Z1)G1[0]);Gz[-1]=((Z1)G1[3]);Gz+=4;G1+=4;
+}Gz-=4;return G0;}static void DL Zi 2]Z2 65535)G1=65535;break;}Gz[-4]=(unsigned
+short)G1;G1=Gy[1]Z2 65535)G1=65535;break;}Gz[-3]=(unsigned short)G1;G1=Gy[0]Z2//
+65535)G1=65535;break;}Gz[-2]=(unsigned short)G1;G1=Gy[3]Z2 65535)G1=65535;break;
+}Gz[-1]=(unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;}static Z1*DM(Z1*Gw,int Gx,void///
+const*Gy){Z1*RESTRICT Gz=Gw;Z1*G0=(Z1*)Gz+Gx;CL const*G1=(CL const*)Gy;Gz+=4;///
+while(Gz<=G0){Gz[-4]=CM(G1[2]);Gz[-3]=CM(G1[1]);Gz[-2]=CM(G1[0]);Gz[-1]=CM(G1[3]
+);Gz+=4;G1+=4;}Gz-=4;return G0;}static void DN(void*Gw,int Gx,Z1 const*Gy){CL*//
+RESTRICT Gz=(CL*)Gw;CL*G0=((CL*)Gz)+Gx;Gz+=4;while(Gz<=G0){Gz[-4]=CN(Gy[2]);Gz[-
+3]=CN(Gy[1]);Gz[-2]=CN(Gy[0]);Gz[-1]=CN(Gy[3]);Gz+=4;Gy+=4;}Gz-=4;}static Z1*DO(
+Z1*Gw,int Gx,void const*Gy){Z1*RESTRICT Gz=Gw;Z1*G0=(Z1*)Gz+Gx;Z1 const*G1=(Z1//
+const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=G1[2];Gz[-3]=G1[1];Gz[-2]=G1[0];Gz[-1]=G1[3
+];Gz+=4;G1+=4;}Gz-=4;return G0;}static void DP(void*Gw,int Gx,Z1 const*Gy){Z1*//
+RESTRICT Gz=(Z1*)Gw;Z1*G0=((Z1*)Gz)+Gx;Gz+=4;while(Gz<=G0){Z1 G1;G1=Gy[2];Gz[-4]
+=G1;G1=Gy[1];Gz[-3]=G1;G1=Gy[0];Gz[-2]=G1;G1=Gy[3];Gz[-1]=G1;Gz+=4;Gy+=4;}Gz-=4;
+}static Z1*DQ Z4((Z1)G1[1])*3.922e-03;Gz[-3]=((Z1)G1[2])*3.922e-03;Gz[-2]=((Z1)
+G1[3])*3.922e-03;Gz[-1]=((Z1)G1[0])*3.922e-03;Gz+=4;G1+=4;}Gz-=4;return G0;}////
+static void DR Zd Gz+=4;while(Gz<=G0){Z1 G1;G1=Gy[3]*255.0f Z2 255)G1=255;break;
+}Gz[-4]=(unsigned char)G1;G1=Gy[0]*255.0f Z2 255)G1=255;break;}Gz[-3]=(unsigned
+char)G1;G1=Gy[1]*255.0f Z2 255)G1=255;break;}Gz[-2]=(unsigned char)G1;G1=Gy[2]*
+255.0f Z2 255)G1=255;break;}Gz[-1]=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;}static
+Z1*DS Z4((Z1)G1[1]);Gz[-3]=((Z1)G1[2]);Gz[-2]=((Z1)G1[3]);Gz[-1]=((Z1)G1[0]);Gz
++=4;G1+=4;}Gz-=4;return G0;}static void DT Zd Gz+=4;while(Gz<=G0){Z1 G1;G1=Gy[3]
+Z2 255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy[0]Z2 255)G1=255;break;}Gz[-3
+]=(unsigned char)G1;G1=Gy[1]Z2 255)G1=255;break;}Gz[-2]=(unsigned char)G1;G1=Gy[
+2]Z2 255)G1=255;break;}Gz[-1]=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;}static Z1*DU
+Z4 CH[G1[1]];Gz[-3]=CH[G1[2]];Gz[-2]=CH[G1[3]];Gz[-1]=CH[G1[0]];Gz+=4;G1+=4;}Gz
+-=4;return G0;}static void DV Zd Gz+=4;while(Gz<=G0){Gz[-4]=CK(Gy[3]);Gz[-3]=CK(
+Gy[0]);Gz[-2]=CK(Gy[1]);Gz[-1]=CK(Gy[2]);Gz+=4;Gy+=4;}Gz-=4;}static Z1*DW Z3 do{
+Gz[0]=CH[G1[1]];Gz[1]=CH[G1[2]];Gz[2]=CH[G1[3]];Gz[3]=((Z1)G1[0])*3.922e-03;G1+=
+4;Gz+=4;}while(Gz<G0);return G0;}static void DX Zd do{Z1 G1;Gz[1]=CK(Gy[0]);Gz[2
+]=CK(Gy[1]);Gz[3]=CK(Gy[2]);G1=Gy[3]*255.0f Z2 255)G1=255;break;}Gz[0]=(unsigned
+char)G1;Gz+=4;Gy+=4;}while(Gz<G0);}static Z1*DY Zj 1])*1.526e-05;Gz[-3]=((Z1)G1[
+2])*1.526e-05;Gz[-2]=((Z1)G1[3])*1.526e-05;Gz[-1]=((Z1)G1[0])*1.526e-05;Gz+=4;G1
++=4;}Gz-=4;return G0;}static void DZ Zi 3]*65535.0f Z2 65535)G1=65535;break;}Gz[
+-4]=(unsigned short)G1;G1=Gy[0]*65535.0f Z2 65535)G1=65535;break;}Gz[-3]=(//////
+unsigned short)G1;G1=Gy[1]*65535.0f Z2 65535)G1=65535;break;}Gz[-2]=(unsigned///
+short)G1;G1=Gy[2]*65535.0f Z2 65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;Gz
++=4;Gy+=4;}Gz-=4;}static Z1*Da Zj 1]);Gz[-3]=((Z1)G1[2]);Gz[-2]=((Z1)G1[3]);Gz[-
+1]=((Z1)G1[0]);Gz+=4;G1+=4;}Gz-=4;return G0;}static void Db Zi 3]Z2 65535)G1=///
+65535;break;}Gz[-4]=(unsigned short)G1;G1=Gy[0]Z2 65535)G1=65535;break;}Gz[-3]=(
+unsigned short)G1;G1=Gy[1]Z2 65535)G1=65535;break;}Gz[-2]=(unsigned short)G1;G1=
+Gy[2]Z2 65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;}////
+static Z1*Dc(Z1*Gw,int Gx,void const*Gy){Z1*RESTRICT Gz=Gw;Z1*G0=(Z1*)Gz+Gx;CL//
+const*G1=(CL const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=CM(G1[1]);Gz[-3]=CM(G1[2]);Gz[
+-2]=CM(G1[3]);Gz[-1]=CM(G1[0]);Gz+=4;G1+=4;}Gz-=4;return G0;}static void Dd(void
+*Gw,int Gx,Z1 const*Gy){CL*RESTRICT Gz=(CL*)Gw;CL*G0=((CL*)Gz)+Gx;Gz+=4;while(Gz
+<=G0){Gz[-4]=CN(Gy[3]);Gz[-3]=CN(Gy[0]);Gz[-2]=CN(Gy[1]);Gz[-1]=CN(Gy[2]);Gz+=4;
+Gy+=4;}Gz-=4;}static Z1*De(Z1*Gw,int Gx,void const*Gy){Z1*RESTRICT Gz=Gw;Z1*G0=(
+Z1*)Gz+Gx;Z1 const*G1=(Z1 const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=G1[1];Gz[-3]=G1[2
+];Gz[-2]=G1[3];Gz[-1]=G1[0];Gz+=4;G1+=4;}Gz-=4;return G0;}static void Df(void*Gw
+,int Gx,Z1 const*Gy){Z1*RESTRICT Gz=(Z1*)Gw;Z1*G0=((Z1*)Gz)+Gx;Gz+=4;while(Gz<=
+G0){Z1 G1;G1=Gy[3];Gz[-4]=G1;G1=Gy[0];Gz[-3]=G1;G1=Gy[1];Gz[-2]=G1;G1=Gy[2];Gz[-
+1]=G1;Gz+=4;Gy+=4;}Gz-=4;}static Z1*Dg Z4((Z1)G1[3])*3.922e-03;Gz[-3]=((Z1)G1[2]
+)*3.922e-03;Gz[-2]=((Z1)G1[1])*3.922e-03;Gz[-1]=((Z1)G1[0])*3.922e-03;Gz+=4;G1+=
+4;}Gz-=4;return G0;}static void Dh Zd Gz+=4;while(Gz<=G0){Z1 G1;G1=Gy[3]*255.0f
+Z2 255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy[2]*255.0f Z2 255)G1=255;////
+break;}Gz[-3]=(unsigned char)G1;G1=Gy[1]*255.0f Z2 255)G1=255;break;}Gz[-2]=(///
+unsigned char)G1;G1=Gy[0]*255.0f Z2 255)G1=255;break;}Gz[-1]=(unsigned char)G1;
+Gz+=4;Gy+=4;}Gz-=4;}static Z1*Di Z4((Z1)G1[3]);Gz[-3]=((Z1)G1[2]);Gz[-2]=((Z1)G1
+[1]);Gz[-1]=((Z1)G1[0]);Gz+=4;G1+=4;}Gz-=4;return G0;}static void Dj Zd Gz+=4;//
+while(Gz<=G0){Z1 G1;G1=Gy[3]Z2 255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy[
+2]Z2 255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=Gy[1]Z2 255)G1=255;break;}Gz[
+-2]=(unsigned char)G1;G1=Gy[0]Z2 255)G1=255;break;}Gz[-1]=(unsigned char)G1;Gz+=
+4;Gy+=4;}Gz-=4;}static Z1*Dk Z4 CH[G1[3]];Gz[-3]=CH[G1[2]];Gz[-2]=CH[G1[1]];Gz[-
+1]=CH[G1[0]];Gz+=4;G1+=4;}Gz-=4;return G0;}static void Dl Zd Gz+=4;while(Gz<=G0)
+{Gz[-4]=CK(Gy[3]);Gz[-3]=CK(Gy[2]);Gz[-2]=CK(Gy[1]);Gz[-1]=CK(Gy[0]);Gz+=4;Gy+=4
+;}Gz-=4;}static Z1*Dm Z3 do{Gz[0]=CH[G1[3]];Gz[1]=CH[G1[2]];Gz[2]=CH[G1[1]];Gz[3
+]=((Z1)G1[0])*3.922e-03;G1+=4;Gz+=4;}while(Gz<G0);return G0;}static void Dn Zd//
+do{Z1 G1;Gz[3]=CK(Gy[0]);Gz[2]=CK(Gy[1]);Gz[1]=CK(Gy[2]);G1=Gy[3]*255.0f Z2 255)
+G1=255;break;}Gz[0]=(unsigned char)G1;Gz+=4;Gy+=4;}while(Gz<G0);}static Z1*Do Zj
+3])*1.526e-05;Gz[-3]=((Z1)G1[2])*1.526e-05;Gz[-2]=((Z1)G1[1])*1.526e-05;Gz[-1]=(
+(Z1)G1[0])*1.526e-05;Gz+=4;G1+=4;}Gz-=4;return G0;}static void Dp Zi 3]*65535.0f
+Z2 65535)G1=65535;break;}Gz[-4]=(unsigned short)G1;G1=Gy[2]*65535.0f Z2 65535)G1
+=65535;break;}Gz[-3]=(unsigned short)G1;G1=Gy[1]*65535.0f Z2 65535)G1=65535;////
+break;}Gz[-2]=(unsigned short)G1;G1=Gy[0]*65535.0f Z2 65535)G1=65535;break;}Gz[-
+1]=(unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;}static Z1*Dq Zj 3]);Gz[-3]=((Z1)G1[2])
+;Gz[-2]=((Z1)G1[1]);Gz[-1]=((Z1)G1[0]);Gz+=4;G1+=4;}Gz-=4;return G0;}static void
+Dr Zi 3]Z2 65535)G1=65535;break;}Gz[-4]=(unsigned short)G1;G1=Gy[2]Z2 65535)G1=
+65535;break;}Gz[-3]=(unsigned short)G1;G1=Gy[1]Z2 65535)G1=65535;break;}Gz[-2]=(
+unsigned short)G1;G1=Gy[0]Z2 65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;Gz
++=4;Gy+=4;}Gz-=4;}static Z1*Ds(Z1*Gw,int Gx,void const*Gy){Z1*RESTRICT Gz=Gw;Z1*
+G0=(Z1*)Gz+Gx;CL const*G1=(CL const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=CM(G1[3]);Gz[
+-3]=CM(G1[2]);Gz[-2]=CM(G1[1]);Gz[-1]=CM(G1[0]);Gz+=4;G1+=4;}Gz-=4;return G0;}//
+static void Dt(void*Gw,int Gx,Z1 const*Gy){CL*RESTRICT Gz=(CL*)Gw;CL*G0=((CL*)Gz
+)+Gx;Gz+=4;while(Gz<=G0){Gz[-4]=CN(Gy[3]);Gz[-3]=CN(Gy[2]);Gz[-2]=CN(Gy[1]);Gz[-
+1]=CN(Gy[0]);Gz+=4;Gy+=4;}Gz-=4;}static Z1*Du(Z1*Gw,int Gx,void const*Gy){Z1*///
+RESTRICT Gz=Gw;Z1*G0=(Z1*)Gz+Gx;Z1 const*G1=(Z1 const*)Gy;Gz+=4;while(Gz<=G0){Gz
+[-4]=G1[3];Gz[-3]=G1[2];Gz[-2]=G1[1];Gz[-1]=G1[0];Gz+=4;G1+=4;}Gz-=4;return G0;}
+static void Dv(void*Gw,int Gx,Z1 const*Gy){Z1*RESTRICT Gz=(Z1*)Gw;Z1*G0=((Z1*)Gz
+)+Gx;Gz+=4;while(Gz<=G0){Z1 G1;G1=Gy[3];Gz[-4]=G1;G1=Gy[2];Gz[-3]=G1;G1=Gy[1];Gz
+[-2]=G1;G1=Gy[0];Gz[-1]=G1;Gz+=4;Gy+=4;}Gz-=4;}static Z1*Dw Z4((Z1)G1[1])*//////
+3.922e-03;Gz[-3]=((Z1)G1[0])*3.922e-03;Gz[-2]=((Z1)G1[3])*3.922e-03;Gz[-1]=((Z1)
+G1[2])*3.922e-03;Gz+=4;G1+=4;}Gz-=4;while(Gz<G0){Gz[0]=((Z1)G1[1])*3.922e-03;Gz[
+1]=((Z1)G1[0])*3.922e-03;Gz+=2;G1+=2;}return G0;}static void Dx Zd Gz+=4;while(
+Gz<=G0){Z1 G1;G1=Gy[1]*255.0f Z2 255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=
+Gy[0]*255.0f Z2 255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=Gy[3]*255.0f Z2///
+255)G1=255;break;}Gz[-2]=(unsigned char)G1;G1=Gy[2]*255.0f Z2 255)G1=255;break;}
+Gz[-1]=(unsigned char)G1;Gz+=4;Gy+=4;}Gz-=4;while(Gz<G0){Z1 G1;G1=Gy[1]*255.0f//
+Z2 255)G1=255;break;}Gz[0]=(unsigned char)G1;G1=Gy[0]*255.0f Z2 255)G1=255;break
+;}Gz[1]=(unsigned char)G1;Gz+=2;Gy+=2;}}static Z1*Dy Z4((Z1)G1[1]);Gz[-3]=((Z1)
+G1[0]);Gz[-2]=((Z1)G1[3]);Gz[-1]=((Z1)G1[2]);Gz+=4;G1+=4;}Gz-=4;while(Gz<G0){Gz[
+0]=((Z1)G1[1]);Gz[1]=((Z1)G1[0]);Gz+=2;G1+=2;}return G0;}static void Dz Zd Gz+=4
+;while(Gz<=G0){Z1 G1;G1=Gy[1]Z2 255)G1=255;break;}Gz[-4]=(unsigned char)G1;G1=Gy
+[0]Z2 255)G1=255;break;}Gz[-3]=(unsigned char)G1;G1=Gy[3]Z2 255)G1=255;break;}Gz
+[-2]=(unsigned char)G1;G1=Gy[2]Z2 255)G1=255;break;}Gz[-1]=(unsigned char)G1;Gz
++=4;Gy+=4;}Gz-=4;while(Gz<G0){Z1 G1;G1=Gy[1]Z2 255)G1=255;break;}Gz[0]=(unsigned
+char)G1;G1=Gy[0]Z2 255)G1=255;break;}Gz[1]=(unsigned char)G1;Gz+=2;Gy+=2;}}/////
+static Z1*D0 Z4 CH[G1[1]];Gz[-3]=CH[G1[0]];Gz[-2]=CH[G1[3]];Gz[-1]=CH[G1[2]];Gz
++=4;G1+=4;}Gz-=4;while(Gz<G0){Gz[0]=CH[G1[1]];Gz[1]=CH[G1[0]];Gz+=2;G1+=2;}/////
+return G0;}static void D1 Zd Gz+=4;while(Gz<=G0){Gz[-4]=CK(Gy[1]);Gz[-3]=CK(Gy[0
+]);Gz[-2]=CK(Gy[3]);Gz[-1]=CK(Gy[2]);Gz+=4;Gy+=4;}Gz-=4;while(Gz<G0){Gz[0]=CK(Gy
+[1]);Gz[1]=CK(Gy[0]);Gz+=2;Gy+=2;}}static Z1*D2 Z4 CH[G1[1]];Gz[-3]=((Z1)G1[0])*
+3.922e-03;Gz[-2]=CH[G1[3]];Gz[-1]=((Z1)G1[2])*3.922e-03;G1+=4;Gz+=4;}Gz-=4;if(Gz
+<G0){Gz[0]=CH[G1[1]];Gz[1]=((Z1)G1[0])*3.922e-03;}return G0;}static void D3 Zd//
+do{Z1 G1;Gz[1]=CK(Gy[0]);G1=Gy[1]*255.0f Z2 255)G1=255;break;}Gz[0]=(unsigned///
+char)G1;Gz+=2;Gy+=2;}while(Gz<G0);}static Z1*D4 Zj 1])*1.526e-05;Gz[-3]=((Z1)G1[
+0])*1.526e-05;Gz[-2]=((Z1)G1[3])*1.526e-05;Gz[-1]=((Z1)G1[2])*1.526e-05;Gz+=4;G1
++=4;}Gz-=4;while(Gz<G0){Gz[0]=((Z1)G1[1])*1.526e-05;Gz[1]=((Z1)G1[0])*1.526e-05;
+Gz+=2;G1+=2;}return G0;}static void D5 Zi 1]*65535.0f Z2 65535)G1=65535;break;}
+Gz[-4]=(unsigned short)G1;G1=Gy[0]*65535.0f Z2 65535)G1=65535;break;}Gz[-3]=(///
+unsigned short)G1;G1=Gy[3]*65535.0f Z2 65535)G1=65535;break;}Gz[-2]=(unsigned///
+short)G1;G1=Gy[2]*65535.0f Z2 65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;Gz
++=4;Gy+=4;}Gz-=4;while(Gz<G0){Z1 G1;G1=Gy[1]*65535.0f Z2 65535)G1=65535;break;}
+Gz[0]=(unsigned short)G1;G1=Gy[0]*65535.0f Z2 65535)G1=65535;break;}Gz[1]=(/////
+unsigned short)G1;Gz+=2;Gy+=2;}}static Z1*D6 Zj 1]);Gz[-3]=((Z1)G1[0]);Gz[-2]=((
+Z1)G1[3]);Gz[-1]=((Z1)G1[2]);Gz+=4;G1+=4;}Gz-=4;while(Gz<G0){Gz[0]=((Z1)G1[1]);
+Gz[1]=((Z1)G1[0]);Gz+=2;G1+=2;}return G0;}static void D7 Zi 1]Z2 65535)G1=65535;
+break;}Gz[-4]=(unsigned short)G1;G1=Gy[0]Z2 65535)G1=65535;break;}Gz[-3]=(//////
+unsigned short)G1;G1=Gy[3]Z2 65535)G1=65535;break;}Gz[-2]=(unsigned short)G1;G1=
+Gy[2]Z2 65535)G1=65535;break;}Gz[-1]=(unsigned short)G1;Gz+=4;Gy+=4;}Gz-=4;while
+(Gz<G0){Z1 G1;G1=Gy[1]Z2 65535)G1=65535;break;}Gz[0]=(unsigned short)G1;G1=Gy[0]
+Z2 65535)G1=65535;break;}Gz[1]=(unsigned short)G1;Gz+=2;Gy+=2;}}static Z1*D8(Z1*
+Gw,int Gx,void const*Gy){Z1*RESTRICT Gz=Gw;Z1*G0=(Z1*)Gz+Gx;CL const*G1=(CL/////
+const*)Gy;Gz+=4;while(Gz<=G0){Gz[-4]=CM(G1[1]);Gz[-3]=CM(G1[0]);Gz[-2]=CM(G1[3])
+;Gz[-1]=CM(G1[2]);Gz+=4;G1+=4;}Gz-=4;while(Gz<G0){Gz[0]=CM(G1[1]);Gz[1]=CM(G1[0]
+);Gz+=2;G1+=2;}return G0;}static void D9(void*Gw,int Gx,Z1 const*Gy){CL*RESTRICT
 Gz=(CL*)Gw;CL*G0=((CL*)Gz)+Gx;Gz+=4;while(Gz<=G0){Gz[-4]=CN(Gy[1]);Gz[-3]=CN(Gy[
-0]);Gz[-2]=CN(Gy[3]);Gz[-1]=CN(Gy[2]);Gz+=4;Gy+=4;}Gz-=4;_Pragma("GCC unroll 1")
-_Pragma("GCC novector")while(Gz<G0){asm(""::"r"(Gz));Gz[0]=CN(Gy[1]);Gz[1]=CN(Gy
-[0]);Gz+=2;Gy+=2;}}static float*D_(float*Gw,int Gx,void const*Gy){float*restrict
-Gz=Gw;float*G0=(float*)Gz+Gx;float const*G1=(float const*)Gy;Gz+=4;while(Gz<=G0)
-{Gz[-4]=G1[1];Gz[-3]=G1[0];Gz[-2]=G1[3];Gz[-1]=G1[2];Gz+=4;G1+=4;}Gz-=4;_Pragma(
-"GCC unroll 1")_Pragma("GCC novector")while(Gz<G0){asm(""::"r"(Gz));Gz[0]=G1[1];
-Gz[1]=G1[0];Gz+=2;G1+=2;}return G0;}static void EA(void*Gw,int Gx,float const*Gy
-){float*restrict Gz=(float*)Gw;float*G0=((float*)Gz)+Gx;Gz+=4;while(Gz<=G0){////
-float G1;G1=Gy[1];Gz[-4]=G1;G1=Gy[0];Gz[-3]=G1;G1=Gy[3];Gz[-2]=G1;G1=Gy[2];Gz[-1
-]=G1;Gz+=4;Gy+=4;}Gz-=4;_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gz<
-G0){float G1;asm(""::"r"(Gy));G1=Gy[1];Gz[0]=G1;G1=Gy[0];Gz[1]=G1;Gz+=2;Gy+=2;}}
-static void EB(float*Gw,int Gx){float*restrict Gy=Gw;float const*Gz=Gw+(Gx/4)*7;
-float*restrict G0=(float*)Gz-Gx;while(G0<Gz){float G1=G0[0],G2=G0[1],G3=G0[2],G4
-=G0[3];Gy[0]=G1;Gy[1]=G2;Gy[2]=G3;Gy[3]=G4;Gy[4]=G1*G4;Gy[5]=G2*G4;Gy[6]=G3*G4;
-Gy+=7;G0+=4;}}static void EC(float*Gw,int Gx){float*restrict Gy=Gw;float const*
-Gz=Gw+(Gx/2)*3;float*restrict G0=(float*)Gz-Gx;while(G0<Gz){float G1=G0[0],G2=G0
-[1];Gy[0]=G1;Gy[1]=G2;Gy[2]=G1*G2;Gy+=3;G0+=2;}}static void ED(float*Gw,int Gx){
-float*restrict Gy=Gw;float*restrict Gz=Gw;float const*G0=Gw+Gx;do{float G1=Gz[3]
-;if(G1<7.523e-37){Gy[0]=Gz[0];Gy[1]=Gz[1];Gy[2]=Gz[2];}else{float G2=1.0f/G1;Gy[
-0]=Gz[4]*G2;Gy[1]=Gz[5]*G2;Gy[2]=Gz[6]*G2;}Gy[3]=G1;Gz+=7;Gy+=4;}while(Gy<G0);}
-static void EE(float*Gw,int Gx){float*restrict Gy=Gw;float*restrict Gz=Gw;float
-const*G0=Gw+Gx;do{float G1=Gz[1];Gy[0]=Gz[0];if(G1>=7.523e-37)Gy[0]=Gz[2]/G1;Gy[
-1]=G1;Gz+=3;Gy+=2;}while(Gy<G0);}static void EF(float*Gw,int Gx){float*restrict
-Gy=Gw;float const*Gz=Gw+Gx;while(Gy<Gz){float G0=Gy[3];Gy[0]*=G0;Gy[1]*=G0;Gy[2]
-*=G0;Gy+=4;}}static void EG(float*Gw,int Gx){float*restrict Gy=Gw;float const*Gz
-=Gw+Gx;while(Gy<Gz){float G0=Gy[1];Gy[0]*=G0;Gy+=2;}}static void EH(float*Gw,int
-Gx){float*restrict Gy=Gw;float const*Gz=Gw+Gx;do{float G0=Gy[3];if(G0>=7.523e-37
-){float G1=1.0f/G0;Gy[0]*=G1;Gy[1]*=G1;Gy[2]*=G1;}Gy+=4;}while(Gy<Gz);}static///
-void EI(float*Gw,int Gx){float*restrict Gy=Gw;float const*Gz=Gw+Gx;do{float G0=
-Gy[1];if(G0>=7.523e-37)Gy[0]/=G0;Gy+=2;}while(Gy<Gz);}static void EJ(float*Gw,//
-int Gx){float*restrict Gy=Gw;float const*Gz=Gw+Gx;Gz-=12;_Pragma("GCC unroll 1")
-_Pragma("GCC novector")while(Gy<=Gz){float G0,G1,G2,G3;asm(""::"r"(Gy));G0=Gy[0]
-;G1=Gy[3];G2=Gy[6];G3=Gy[9];Gy[0]=Gy[2];Gy[3]=Gy[5];Gy[6]=Gy[8];Gy[9]=Gy[11];Gy[
-2]=G0;Gy[5]=G1;Gy[8]=G2;Gy[11]=G3;Gy+=12;}Gz+=12;_Pragma("GCC unroll 1")_Pragma(
-"GCC novector")while(Gy<Gz){float G0=Gy[0];asm(""::"r"(Gy));Gy[0]=Gy[2];Gy[2]=G0
-;Gy+=3;}}static void EK(B0 const*Gw,int Gx,float*Gy){int Gz=Gw->d;int G0=Gw->e;
-int G1=B3[Gw->I]*Gz;Bt G2=Gw->A.J;Bt G3=Gw->B.J;int G4=Cj(G3,Gx,Gw->B.E.A);const
-void*G5=((char*)Gw->C)+(size_t)G4*(size_t)Gw->E;B6 const*G6=Gw->N.C;float*G7=Gy-
-Gw->N.A.A*G0;float*G8=0;do{float*G9;void const*G_;float*HA;int HB;int HC;if(G6->
-B<G6->A)break;HC=G6->B+1-G6->A;G9=G7+G6->A*G0;HA=G7+(G6->B+1)*G0;HB=HC*Gz;G_=((
-char*)G5)+G6->C*G1;if(Gw->K)G_=Gw->K(((char*)HA)-(HC*G1)+((Gw->I!=//////////////
-STBIR_TYPE_FLOAT)?12:0),G5,HC,G6->C,G4,Gw->L);G8=Gw->Q((float*)HA-HB,HB,G_);if(
-Gw->R)Gw->R(G9,HB);++G6;}while(G6<=(&Gw->N.C[1]));if((G2==STBIR_EDGE_WRAP)&&(Gw
-->N.B[0]|Gw->N.B[1])){int G9,G_[2];int HA=Gw->A.E.A;G_[0]=-Gw->N.B[0];G_[1]=HA;
-for(G9=0;G9<2;G9++){int HB=Gw->N.B[G9];if(HB){int HC=G_[G9];float*HD=G7+HC*G0;//
-float const*HE=G7+Cj(G2,HC,HA)*G0;memcpy(HD,HE,HB*G0*4);if(G9==1)G8=HD+HB*G0;}}}
-G8[0]=0.0f;G8[1]=0.0f;}static void EL(float*Gw,unsigned int Gx,float const*Gy,B4
-const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*1;float*restrict G3=Gw;do{
-float const*G4=Gy+Gz->A*1;float const*G5=G0;float G6;G6=G4[0]*G5[0];G3[0]=G6;G0
-+=G1;++Gz;G3+=1;}while(G3<G2);}static void EM(float*Gw,unsigned int Gx,float////
-const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*1;float* //////
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*1;float const*G5=G0;float G6;G6=G4[0]*
-G5[0];G6+=G4[1]*G5[1];G3[0]=G6;G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EN(
-float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float
-const*G2=Gw+Gx*1;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*1;float const*
-G5=G0;float G6;G6=G4[0]*G5[0];G6+=G4[1]*G5[1];G6+=G4[2]*G5[2];G3[0]=G6;G0+=G1;++
-Gz;G3+=1;}while(G3<G2);}static void EO(float*Gw,unsigned int Gx,float const*Gy,
-B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*1;float*restrict G3=Gw;
-do{float const*G4=Gy+Gz->A*1;float const*G5=G0;float G6,G7,G8,G9;G6=G4[0]*G5[0];
-G7=G4[1]*G5[1];G8=G4[2]*G5[2];G9=G4[3]*G5[3];G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;
-G3+=1;}while(G3<G2);}static void EP(float*Gw,unsigned int Gx,float const*Gy,B4//
-const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*1;float*restrict G3=Gw;do{
-float const*G4=Gy+Gz->A*1;float const*G5=G0;float G6,G7,G8,G9;G6=G4[0]*G5[0];G7=
-G4[1]*G5[1];G8=G4[2]*G5[2];G9=G4[3]*G5[3];G6+=G4[4]*G5[4];G3[0]=(G6+G8)+(G7+G9);
-G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EQ(float*Gw,unsigned int Gx,float//
-const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*1;float* //////
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*1;float const*G5=G0;float G6,G7,G8,G9;
-G6=G4[0]*G5[0];G7=G4[1]*G5[1];G8=G4[2]*G5[2];G9=G4[3]*G5[3];G6+=G4[4]*G5[4];G7+=
-G4[5]*G5[5];G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void//
-ER(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){//
-float const*G2=Gw+Gx*1;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*1;float//
-const*G5=G0;float G6,G7,G8,G9;G6=G4[0]*G5[0];G7=G4[1]*G5[1];G8=G4[2]*G5[2];G9=G4
-[3]*G5[3];G6+=G4[4]*G5[4];G7+=G4[5]*G5[5];G8+=G4[6]*G5[6];G3[0]=(G6+G8)+(G7+G9);
-G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void ES(float*Gw,unsigned int Gx,float//
-const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*1;float* //////
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*1;float const*G5=G0;float G6,G7,G8,G9;
-G6=G4[0]*G5[0];G7=G4[1]*G5[1];G8=G4[2]*G5[2];G9=G4[3]*G5[3];G6+=G4[4]*G5[4];G7+=
-G4[5]*G5[5];G8+=G4[6]*G5[6];G9+=G4[7]*G5[7];G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3
-+=1;}while(G3<G2);}static void ET(float*Gw,unsigned int Gx,float const*Gy,B4////
-const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*1;float*restrict G3=Gw;do{
-float const*G4=Gy+Gz->A*1;float const*G5=G0;float G6,G7,G8,G9;G6=G4[0]*G5[0];G7=
-G4[1]*G5[1];G8=G4[2]*G5[2];G9=G4[3]*G5[3];G6+=G4[4]*G5[4];G7+=G4[5]*G5[5];G8+=G4
-[6]*G5[6];G9+=G4[7]*G5[7];G6+=G4[8]*G5[8];G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3+=
-1;}while(G3<G2);}static void EU(float*Gw,unsigned int Gx,float const*Gy,B4 const
-*Gz,float const*G0,int G1){float const*G2=Gw+Gx*1;float*restrict G3=Gw;do{float
-const*G4=Gy+Gz->A*1;float const*G5=G0;float G6,G7,G8,G9;G6=G4[0]*G5[0];G7=G4[1]*
-G5[1];G8=G4[2]*G5[2];G9=G4[3]*G5[3];G6+=G4[4]*G5[4];G7+=G4[5]*G5[5];G8+=G4[6]*G5
-[6];G9+=G4[7]*G5[7];G6+=G4[8]*G5[8];G7+=G4[9]*G5[9];G3[0]=(G6+G8)+(G7+G9);G0+=G1
-;++Gz;G3+=1;}while(G3<G2);}static void EV(float*Gw,unsigned int Gx,float const*
-Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*1;float*restrict G3=
-Gw;do{float const*G4=Gy+Gz->A*1;float const*G5=G0;float G6,G7,G8,G9;G6=G4[0]*G5[
-0];G7=G4[1]*G5[1];G8=G4[2]*G5[2];G9=G4[3]*G5[3];G6+=G4[4]*G5[4];G7+=G4[5]*G5[5];
-G8+=G4[6]*G5[6];G9+=G4[7]*G5[7];G6+=G4[8]*G5[8];G7+=G4[9]*G5[9];G8+=G4[10]*G5[10
-];G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EW(float*Gw
-,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*
-G2=Gw+Gx*1;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*1;float const*G5=G0;
-float G6,G7,G8,G9;G6=G4[0]*G5[0];G7=G4[1]*G5[1];G8=G4[2]*G5[2];G9=G4[3]*G5[3];G6
-+=G4[4]*G5[4];G7+=G4[5]*G5[5];G8+=G4[6]*G5[6];G9+=G4[7]*G5[7];G6+=G4[8]*G5[8];G7
-+=G4[9]*G5[9];G8+=G4[10]*G5[10];G9+=G4[11]*G5[11];G3[0]=(G6+G8)+(G7+G9);G0+=G1;
-++Gz;G3+=1;}while(G3<G2);}static void EX(float*Gw,unsigned int Gx,float const*Gy
-,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*1;float*restrict G3=Gw;
-do{float const*G4=Gy+Gz->A*1;int G5=((Gz->B-Gz->A+1)-4+3)>>2;float const*G6=G0;
-float G7,G8,G9,G_;G7=G4[0]*G6[0];G8=G4[1]*G6[1];G9=G4[2]*G6[2];G_=G4[3]*G6[3];do
-{G6+=4;G4+=4;G7+=G4[0]*G6[0];G8+=G4[1]*G6[1];G9+=G4[2]*G6[2];G_+=G4[3]*G6[3];--
-G5;}while(G5>0);G3[0]=(G7+G9)+(G8+G_);G0+=G1;++Gz;G3+=1;}while(G3<G2);}static///
-void EY(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int//
-G1){float const*G2=Gw+Gx*1;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*1;int
-G5=((Gz->B-Gz->A+1)-5+3)>>2;float const*G6=G0;float G7,G8,G9,G_;G7=G4[0]*G6[0];
-G8=G4[1]*G6[1];G9=G4[2]*G6[2];G_=G4[3]*G6[3];do{G6+=4;G4+=4;G7+=G4[0]*G6[0];G8+=
-G4[1]*G6[1];G9+=G4[2]*G6[2];G_+=G4[3]*G6[3];--G5;}while(G5>0);G7+=G4[4]*G6[4];G3
-[0]=(G7+G9)+(G8+G_);G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EZ(float*Gw,///
-unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2
-=Gw+Gx*1;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*1;int G5=((Gz->B-Gz->A+
-1)-6+3)>>2;float const*G6=G0;float G7,G8,G9,G_;G7=G4[0]*G6[0];G8=G4[1]*G6[1];G9=
-G4[2]*G6[2];G_=G4[3]*G6[3];do{G6+=4;G4+=4;G7+=G4[0]*G6[0];G8+=G4[1]*G6[1];G9+=G4
-[2]*G6[2];G_+=G4[3]*G6[3];--G5;}while(G5>0);G7+=G4[4]*G6[4];G8+=G4[5]*G6[5];G3[0
-]=(G7+G9)+(G8+G_);G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void Ea(float*Gw,/////
-unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2
-=Gw+Gx*1;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*1;int G5=((Gz->B-Gz->A+
-1)-7+3)>>2;float const*G6=G0;float G7,G8,G9,G_;G7=G4[0]*G6[0];G8=G4[1]*G6[1];G9=
-G4[2]*G6[2];G_=G4[3]*G6[3];do{G6+=4;G4+=4;G7+=G4[0]*G6[0];G8+=G4[1]*G6[1];G9+=G4
-[2]*G6[2];G_+=G4[3]*G6[3];--G5;}while(G5>0);G7+=G4[4]*G6[4];G8+=G4[5]*G6[5];G9+=
-G4[6]*G6[6];G3[0]=(G7+G9)+(G8+G_);G0+=G1;++Gz;G3+=1;}while(G3<G2);}static CC*Eb[
-4]={EX,EY,EZ,Ea,};static CC*Ec[12]={EL,EM,EN,EO,EP,EQ,ER,ES,ET,EU,EV,EW,};static
-void Ed(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int//
-G1){float const*G2=Gw+Gx*2;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*2;///
-float const*G5=G0;float G6,G7,G8;G8=G5[0];G6=G4[0]*G8;G7=G4[1]*G8;G3[0]=G6;G3[1]
-=G7;G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Ee(float*Gw,unsigned int Gx,///
-float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*2;float*
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*2;float const*G5=G0;float G6,G7,G8;G8=
-G5[0];G6=G4[0]*G8;G7=G4[1]*G8;G8=G5[1];G6+=G4[2]*G8;G7+=G4[3]*G8;G3[0]=G6;G3[1]=
-G7;G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Ef(float*Gw,unsigned int Gx,////
-float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*2;float*
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*2;float const*G5=G0;float G6,G7,G8;G8=
-G5[0];G6=G4[0]*G8;G7=G4[1]*G8;G8=G5[2];G6+=G4[4]*G8;G7+=G4[5]*G8;G8=G5[1];G6+=G4
-[2]*G8;G7+=G4[3]*G8;G3[0]=G6;G3[1]=G7;G0+=G1;++Gz;G3+=2;}while(G3<G2);}static///
-void Eg(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int//
-G1){float const*G2=Gw+Gx*2;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*2;///
-float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G_=G4[1]
-*HD;HD=G5[1];G7=G4[2]*HD;HA=G4[3]*HD;HD=G5[2];G8=G4[4]*HD;HB=G4[5]*HD;HD=G5[3];
-G9=G4[6]*HD;HC=G4[7]*HD;G3[0]=(G6+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;
-G3+=2;}while(G3<G2);}static void Eh(float*Gw,unsigned int Gx,float const*Gy,B4//
-const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*2;float*restrict G3=Gw;do{
-float const*G4=Gy+Gz->A*2;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=
-G5[0];G6=G4[0]*HD;G_=G4[1]*HD;HD=G5[1];G7=G4[2]*HD;HA=G4[3]*HD;HD=G5[2];G8=G4[4]
-*HD;HB=G4[5]*HD;HD=G5[3];G9=G4[6]*HD;HC=G4[7]*HD;HD=G5[4];G6+=G4[8]*HD;G_+=G4[9]
-*HD;G3[0]=(G6+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);
-}static void Ei(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*
-G0,int G1){float const*G2=Gw+Gx*2;float*restrict G3=Gw;do{float const*G4=Gy+Gz->
-A*2;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G_=
-G4[1]*HD;HD=G5[1];G7=G4[2]*HD;HA=G4[3]*HD;HD=G5[2];G8=G4[4]*HD;HB=G4[5]*HD;HD=G5
-[3];G9=G4[6]*HD;HC=G4[7]*HD;HD=G5[4];G6+=G4[8]*HD;G_+=G4[9]*HD;HD=G5[5];G7+=G4[
-10]*HD;HA+=G4[11]*HD;G3[0]=(G6+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3
-+=2;}while(G3<G2);}static void Ej(float*Gw,unsigned int Gx,float const*Gy,B4////
-const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*2;float*restrict G3=Gw;do{
-float const*G4=Gy+Gz->A*2;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=
-G5[0];G6=G4[0]*HD;G_=G4[1]*HD;HD=G5[1];G7=G4[2]*HD;HA=G4[3]*HD;HD=G5[2];G8=G4[4]
-*HD;HB=G4[5]*HD;HD=G5[3];G9=G4[6]*HD;HC=G4[7]*HD;HD=G5[4];G6+=G4[8]*HD;G_+=G4[9]
-*HD;HD=G5[5];G7+=G4[10]*HD;HA+=G4[11]*HD;HD=G5[6];G8+=G4[12]*HD;HB+=G4[13]*HD;G3
-[0]=(G6+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);}/////
-static void Ek(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*
-G0,int G1){float const*G2=Gw+Gx*2;float*restrict G3=Gw;do{float const*G4=Gy+Gz->
-A*2;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G_=
-G4[1]*HD;HD=G5[1];G7=G4[2]*HD;HA=G4[3]*HD;HD=G5[2];G8=G4[4]*HD;HB=G4[5]*HD;HD=G5
-[3];G9=G4[6]*HD;HC=G4[7]*HD;HD=G5[4];G6+=G4[8]*HD;G_+=G4[9]*HD;HD=G5[5];G7+=G4[
-10]*HD;HA+=G4[11]*HD;HD=G5[6];G8+=G4[12]*HD;HB+=G4[13]*HD;HD=G5[7];G9+=G4[14]*HD
-;HC+=G4[15]*HD;G3[0]=(G6+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}//
-while(G3<G2);}static void El(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz
-,float const*G0,int G1){float const*G2=Gw+Gx*2;float*restrict G3=Gw;do{float////
-const*G4=Gy+Gz->A*2;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];
-G6=G4[0]*HD;G_=G4[1]*HD;HD=G5[1];G7=G4[2]*HD;HA=G4[3]*HD;HD=G5[2];G8=G4[4]*HD;HB
-=G4[5]*HD;HD=G5[3];G9=G4[6]*HD;HC=G4[7]*HD;HD=G5[4];G6+=G4[8]*HD;G_+=G4[9]*HD;HD
-=G5[5];G7+=G4[10]*HD;HA+=G4[11]*HD;HD=G5[6];G8+=G4[12]*HD;HB+=G4[13]*HD;HD=G5[7]
-;G9+=G4[14]*HD;HC+=G4[15]*HD;HD=G5[8];G6+=G4[16]*HD;G_+=G4[17]*HD;G3[0]=(G6+G8)+
-(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Em(//
-float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float
-const*G2=Gw+Gx*2;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*2;float const*
-G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G_=G4[1]*HD;HD=G5[1]
-;G7=G4[2]*HD;HA=G4[3]*HD;HD=G5[2];G8=G4[4]*HD;HB=G4[5]*HD;HD=G5[3];G9=G4[6]*HD;
-HC=G4[7]*HD;HD=G5[4];G6+=G4[8]*HD;G_+=G4[9]*HD;HD=G5[5];G7+=G4[10]*HD;HA+=G4[11]
-*HD;HD=G5[6];G8+=G4[12]*HD;HB+=G4[13]*HD;HD=G5[7];G9+=G4[14]*HD;HC+=G4[15]*HD;HD
-=G5[8];G6+=G4[16]*HD;G_+=G4[17]*HD;HD=G5[9];G7+=G4[18]*HD;HA+=G4[19]*HD;G3[0]=(
-G6+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static////
-void En(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int//
-G1){float const*G2=Gw+Gx*2;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*2;///
-float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G_=G4[1]
-*HD;HD=G5[1];G7=G4[2]*HD;HA=G4[3]*HD;HD=G5[2];G8=G4[4]*HD;HB=G4[5]*HD;HD=G5[3];
-G9=G4[6]*HD;HC=G4[7]*HD;HD=G5[4];G6+=G4[8]*HD;G_+=G4[9]*HD;HD=G5[5];G7+=G4[10]*
-HD;HA+=G4[11]*HD;HD=G5[6];G8+=G4[12]*HD;HB+=G4[13]*HD;HD=G5[7];G9+=G4[14]*HD;HC
-+=G4[15]*HD;HD=G5[8];G6+=G4[16]*HD;G_+=G4[17]*HD;HD=G5[9];G7+=G4[18]*HD;HA+=G4[
-19]*HD;HD=G5[10];G8+=G4[20]*HD;HB+=G4[21]*HD;G3[0]=(G6+G8)+(G7+G9);G3[1]=(G_+HB)
-+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Eo(float*Gw,unsigned int//
-Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*2;////
-float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*2;float const*G5=G0;float G6,G7,
-G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G_=G4[1]*HD;HD=G5[1];G7=G4[2]*HD;HA=G4
-[3]*HD;HD=G5[2];G8=G4[4]*HD;HB=G4[5]*HD;HD=G5[3];G9=G4[6]*HD;HC=G4[7]*HD;HD=G5[4
-];G6+=G4[8]*HD;G_+=G4[9]*HD;HD=G5[5];G7+=G4[10]*HD;HA+=G4[11]*HD;HD=G5[6];G8+=G4
-[12]*HD;HB+=G4[13]*HD;HD=G5[7];G9+=G4[14]*HD;HC+=G4[15]*HD;HD=G5[8];G6+=G4[16]*
-HD;G_+=G4[17]*HD;HD=G5[9];G7+=G4[18]*HD;HA+=G4[19]*HD;HD=G5[10];G8+=G4[20]*HD;HB
-+=G4[21]*HD;HD=G5[11];G9+=G4[22]*HD;HC+=G4[23]*HD;G3[0]=(G6+G8)+(G7+G9);G3[1]=(
-G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Ep(float*Gw,unsigned
-int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*2;
-float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*2;int G5=((Gz->B-Gz->A+1)-4+3)>>
-2;float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC,HD,HE;HE=G6[0];G7=G4[0]*HE;HA=G4[
-1]*HE;HE=G6[1];G8=G4[2]*HE;HB=G4[3]*HE;HE=G6[2];G9=G4[4]*HE;HC=G4[5]*HE;HE=G6[3]
-;G_=G4[6]*HE;HD=G4[7]*HE;do{G6+=4;G4+=8;HE=G6[0];G7+=G4[0]*HE;HA+=G4[1]*HE;HE=G6
-[1];G8+=G4[2]*HE;HB+=G4[3]*HE;HE=G6[2];G9+=G4[4]*HE;HC+=G4[5]*HE;HE=G6[3];G_+=G4
-[6]*HE;HD+=G4[7]*HE;--G5;}while(G5>0);G3[0]=(G7+G9)+(G8+G_);G3[1]=(HA+HC)+(HB+HD
-);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Eq(float*Gw,unsigned int Gx,float
-const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*2;float* //////
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*2;int G5=((Gz->B-Gz->A+1)-5+3)>>2;////
-float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC,HD,HE;HE=G6[0];G7=G4[0]*HE;HA=G4[1]
-*HE;HE=G6[1];G8=G4[2]*HE;HB=G4[3]*HE;HE=G6[2];G9=G4[4]*HE;HC=G4[5]*HE;HE=G6[3];
-G_=G4[6]*HE;HD=G4[7]*HE;do{G6+=4;G4+=8;HE=G6[0];G7+=G4[0]*HE;HA+=G4[1]*HE;HE=G6[
-1];G8+=G4[2]*HE;HB+=G4[3]*HE;HE=G6[2];G9+=G4[4]*HE;HC+=G4[5]*HE;HE=G6[3];G_+=G4[
-6]*HE;HD+=G4[7]*HE;--G5;}while(G5>0);HE=G6[4];G7+=G4[8]*HE;HA+=G4[9]*HE;G3[0]=(
-G7+G9)+(G8+G_);G3[1]=(HA+HC)+(HB+HD);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static////
-void Er(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int//
-G1){float const*G2=Gw+Gx*2;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*2;int
-G5=((Gz->B-Gz->A+1)-6+3)>>2;float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC,HD,HE;
-HE=G6[0];G7=G4[0]*HE;HA=G4[1]*HE;HE=G6[1];G8=G4[2]*HE;HB=G4[3]*HE;HE=G6[2];G9=G4
-[4]*HE;HC=G4[5]*HE;HE=G6[3];G_=G4[6]*HE;HD=G4[7]*HE;do{G6+=4;G4+=8;HE=G6[0];G7+=
-G4[0]*HE;HA+=G4[1]*HE;HE=G6[1];G8+=G4[2]*HE;HB+=G4[3]*HE;HE=G6[2];G9+=G4[4]*HE;
-HC+=G4[5]*HE;HE=G6[3];G_+=G4[6]*HE;HD+=G4[7]*HE;--G5;}while(G5>0);HE=G6[4];G7+=
+0]);Gz[-2]=CN(Gy[3]);Gz[-1]=CN(Gy[2]);Gz+=4;Gy+=4;}Gz-=4;while(Gz<G0){Gz[0]=CN(
+Gy[1]);Gz[1]=CN(Gy[0]);Gz+=2;Gy+=2;}}static Z1*D_(Z1*Gw,int Gx,void const*Gy){Z1
+*RESTRICT Gz=Gw;Z1*G0=(Z1*)Gz+Gx;Z1 const*G1=(Z1 const*)Gy;Gz+=4;while(Gz<=G0){
+Gz[-4]=G1[1];Gz[-3]=G1[0];Gz[-2]=G1[3];Gz[-1]=G1[2];Gz+=4;G1+=4;}Gz-=4;while(Gz<
+G0){Gz[0]=G1[1];Gz[1]=G1[0];Gz+=2;G1+=2;}return G0;}static void EA(void*Gw,int//
+Gx,Z1 const*Gy){Z1*RESTRICT Gz=(Z1*)Gw;Z1*G0=((Z1*)Gz)+Gx;Gz+=4;while(Gz<=G0){Z1
+G1;G1=Gy[1];Gz[-4]=G1;G1=Gy[0];Gz[-3]=G1;G1=Gy[3];Gz[-2]=G1;G1=Gy[2];Gz[-1]=G1;
+Gz+=4;Gy+=4;}Gz-=4;while(Gz<G0){Z1 G1;G1=Gy[1];Gz[0]=G1;G1=Gy[0];Gz[1]=G1;Gz+=2;
+Gy+=2;}}static void EB(Z1*Gw,int Gx){Z1*RESTRICT Gy=Gw;Z1 const*Gz=Gw+(Gx/4)*7;
+Z1*RESTRICT G0=(Z1*)Gz-Gx;while(G0<Gz){Z1 G1=G0[0],G2=G0[1],G3=G0[2],G4=G0[3];Gy
+[0]=G1;Gy[1]=G2;Gy[2]=G3;Gy[3]=G4;Gy[4]=G1*G4;Gy[5]=G2*G4;Gy[6]=G3*G4;Gy+=7;G0+=
+4;}}static void EC(Z1*Gw,int Gx){Z1*RESTRICT Gy=Gw;Z1 const*Gz=Gw+(Gx/2)*3;Z1*//
+RESTRICT G0=(Z1*)Gz-Gx;while(G0<Gz){Z1 G1=G0[0],G2=G0[1];Gy[0]=G1;Gy[1]=G2;Gy[2]
+=G1*G2;Gy+=3;G0+=2;}}static void ED(Z1*Gw,int Gx){Z1*RESTRICT Gy=Gw;Z1*RESTRICT
+Gz=Gw;Z1 const*G0=Gw+Gx;do{Z1 G1=Gz[3];if(G1<7.523e-37){Gy[0]=Gz[0];Gy[1]=Gz[1];
+Gy[2]=Gz[2];}else{Z1 G2=1.0f/G1;Gy[0]=Gz[4]*G2;Gy[1]=Gz[5]*G2;Gy[2]=Gz[6]*G2;}Gy
+[3]=G1;Gz+=7;Gy+=4;}while(Gy<G0);}static void EE(Z1*Gw,int Gx){Z1*RESTRICT Gy=Gw
+;Z1*RESTRICT Gz=Gw;Z1 const*G0=Gw+Gx;do{Z1 G1=Gz[1];Gy[0]=Gz[0];if(G1>=7.523e-37
+)Gy[0]=Gz[2]/G1;Gy[1]=G1;Gz+=3;Gy+=2;}while(Gy<G0);}static void EF(Z1*Gw,int Gx)
+{Z1*RESTRICT Gy=Gw;Z1 const*Gz=Gw+Gx;while(Gy<Gz){Z1 G0=Gy[3];Gy[0]*=G0;Gy[1]*=
+G0;Gy[2]*=G0;Gy+=4;}}static void EG(Z1*Gw,int Gx){Z1*RESTRICT Gy=Gw;Z1 const*Gz=
+Gw+Gx;while(Gy<Gz){Z1 G0=Gy[1];Gy[0]*=G0;Gy+=2;}}static void EH(Z1*Gw,int Gx){Z1
+*RESTRICT Gy=Gw;Z1 const*Gz=Gw+Gx;do{Z1 G0=Gy[3];if(G0>=7.523e-37){Z1 G1=1.0f/G0
+;Gy[0]*=G1;Gy[1]*=G1;Gy[2]*=G1;}Gy+=4;}while(Gy<Gz);}static void EI(Z1*Gw,int Gx
+){Z1*RESTRICT Gy=Gw;Z1 const*Gz=Gw+Gx;do{Z1 G0=Gy[1];if(G0>=7.523e-37)Gy[0]/=G0;
+Gy+=2;}while(Gy<Gz);}static void EJ(Z1*Gw,int Gx){Z1*RESTRICT Gy=Gw;Z1 const*Gz=
+Gw+Gx;Gz-=12;while(Gy<=Gz){Z1 G0,G1,G2,G3;G0=Gy[0];G1=Gy[3];G2=Gy[6];G3=Gy[9];Gy
+[0]=Gy[2];Gy[3]=Gy[5];Gy[6]=Gy[8];Gy[9]=Gy[11];Gy[2]=G0;Gy[5]=G1;Gy[8]=G2;Gy[11]
+=G3;Gy+=12;}Gz+=12;while(Gy<Gz){Z1 G0=Gy[0];Gy[0]=Gy[2];Gy[2]=G0;Gy+=3;}}static
+void EK(B0 const*Gw,int Gx,Z1*Gy){int Gz=Gw->d;int G0=Gw->e;int G1=B3[Gw->I]*Gz;
+Bt G2=Gw->A.J;Bt G3=Gw->B.J;int G4=Cj(G3,Gx,Gw->B.E.A);const void*G5=((char*)Gw
+->C)+(size_t)G4*(size_t)Gw->E;B6 const*G6=Gw->N.C;Z1*G7=Gy-Gw->N.A.A*G0;Z1*G8=0;
+do{Z1*G9;void const*G_;Z1*HA;int HB;int HC;if(G6->B<G6->A)break;HC=G6->B+1-G6->A
+;G9=G7+G6->A*G0;HA=G7+(G6->B+1)*G0;HB=HC*Gz;G_=((char*)G5)+G6->C*G1;if(Gw->K)G_=
+Gw->K(((char*)HA)-(HC*G1)+((Gw->I!=STBIR_TYPE_Z1)?12:0),G5,HC,G6->C,G4,Gw->L);G8
+=Gw->Q((Z1*)HA-HB,HB,G_);if(Gw->R)Gw->R(G9,HB);++G6;}while(G6<=(&Gw->N.C[1]));if
+((G2==STBIR_EDGE_WRAP)&&(Gw->N.B[0]|Gw->N.B[1])){int G9,G_[2];int HA=Gw->A.E.A;
+G_[0]=-Gw->N.B[0];G_[1]=HA;for(G9=0;G9<2;G9++){int HB=Gw->N.B[G9];if(HB){int HC=
+G_[G9];Z1*HD=G7+HC*G0;Z1 const*HE=G7+Cj(G2,HC,HA)*G0;memcpy(HD,HE,HB*G0*4);if(G9
+==1)G8=HD+HB*G0;}}}G8[0]=0.0f;G8[1]=0.0f;}static void EL Zf Z1 const*G5=G0;Z1 G6
+;G6=G4[0]*G5[0];G3[0]=G6;G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EM Zf Z1//
+const*G5=G0;Z1 G6;G6=G4[0]*G5[0];G6+=G4[1]*G5[1];G3[0]=G6;G0+=G1;++Gz;G3+=1;}///
+while(G3<G2);}static void EN Zf Z1 const*G5=G0;Z1 G6;G6=G4[0]*G5[0];G6+=G4[1]*G5
+[1];G6+=G4[2]*G5[2];G3[0]=G6;G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EO Zf
+Z1 const*G5=G0;Z1 G6,G7,G8,G9;G6=G4[0]*G5[0];G7=G4[1]*G5[1];G8=G4[2]*G5[2];G9=G4
+[3]*G5[3];G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EP
+Zf Z1 const*G5=G0;Z1 G6,G7,G8,G9;G6=G4[0]*G5[0];G7=G4[1]*G5[1];G8=G4[2]*G5[2];G9
+=G4[3]*G5[3];G6+=G4[4]*G5[4];G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3+=1;}while(G3<
+G2);}static void EQ Zt G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3+=1;}while(G3<G2);}//
+static void ER Zt G8+=G4[6]*G5[6];G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3+=1;}while
+(G3<G2);}static void ES Zt G8+=G4[6]*G5[6];G9+=G4[7]*G5[7];G3[0]=(G6+G8)+(G7+G9)
+;G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void ET Zt G8+=G4[6]*G5[6];G9+=G4[7]*G5
+[7];G6+=G4[8]*G5[8];G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3+=1;}while(G3<G2);}/////
+static void EU Zt G8+=G4[6]*G5[6];G9+=G4[7]*G5[7];G6+=G4[8]*G5[8];G7+=G4[9]*G5[9
+];G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EV Zt G8+=
+G4[6]*G5[6];G9+=G4[7]*G5[7];G6+=G4[8]*G5[8];G7+=G4[9]*G5[9];G8+=G4[10]*G5[10];G3
+[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EW Zt G8+=G4[6]
+*G5[6];G9+=G4[7]*G5[7];G6+=G4[8]*G5[8];G7+=G4[9]*G5[9];G8+=G4[10]*G5[10];G9+=G4[
+11]*G5[11];G3[0]=(G6+G8)+(G7+G9);G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EX
+Zf int G5=((Gz->B-Gz->A+1)-4 Zw G3[0]=(G7+G9)+(G8+G_);G0+=G1;++Gz;G3+=1;}while(
+G3<G2);}static void EY Zf int G5=((Gz->B-Gz->A+1)-5 Zw G7+=G4[4]*G6[4];G3[0]=(G7
++G9)+(G8+G_);G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EZ Zf int G5=((Gz->B-
+Gz->A+1)-6 Zw G7+=G4[4]*G6[4];G8+=G4[5]*G6[5];G3[0]=(G7+G9)+(G8+G_);G0+=G1;++Gz;
+G3+=1;}while(G3<G2);}static void Ea Zf int G5=((Gz->B-Gz->A+1)-7 Zw G7+=G4[4]*G6
+[4];G8+=G4[5]*G6[5];G9+=G4[6]*G6[6];G3[0]=(G7+G9)+(G8+G_);G0+=G1;++Gz;G3+=1;}///
+while(G3<G2);}static CC*Eb[4]={EX,EY,EZ,Ea,};static CC*Ec[12]={EL,EM,EN,EO,EP,EQ
+,ER,ES,ET,EU,EV,EW,};static void Ed Zs Z1 const*G5=G0;Z1 G6,G7,G8;G8=G5[0];G6=G4
+[0]*G8;G7=G4[1]*G8;G3[0]=G6;G3[1]=G7;G0+=G1;++Gz;G3+=2;}while(G3<G2);}static////
+void Ee Zs Z1 const*G5=G0;Z1 G6,G7,G8;G8=G5[0];G6=G4[0]*G8;G7=G4[1]*G8;G8=G5[1];
+G6+=G4[2]*G8;G7+=G4[3]*G8;G3[0]=G6;G3[1]=G7;G0+=G1;++Gz;G3+=2;}while(G3<G2);}///
+static void Ef Zs Z1 const*G5=G0;Z1 G6,G7,G8;G8=G5[0];G6=G4[0]*G8;G7=G4[1]*G8;G8
+=G5[2];G6+=G4[4]*G8;G7+=G4[5]*G8;G8=G5[1];G6+=G4[2]*G8;G7+=G4[3]*G8;G3[0]=G6;G3[
+1]=G7;G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Eg Zc G3[0]=(G6+G8)+(G7+G9);
+G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Eh Zc HD=G5[4
+];G6+=G4[8]*HD;G_+=G4[9]*HD;G3[0]=(G6+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;
+++Gz;G3+=2;}while(G3<G2);}static void Ei Zc HD=G5[4];G6+=G4[8]*HD;G_+=G4[9]*HD;
+HD=G5[5];G7+=G4[10]*HD;HA+=G4[11]*HD;G3[0]=(G6+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC)
+;G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Ej Zc HD=G5[4];G6+=G4[8]*HD;G_+=G4
+[9]*HD;HD=G5[5];G7+=G4[10]*HD;HA+=G4[11]*HD;HD=G5[6];G8+=G4[12]*HD;HB+=G4[13]*HD
+;G3[0]=(G6+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);}//
+static void Ek Zx G3[0]=(G6+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;
+}while(G3<G2);}static void El Zx HD=G5[8];G6+=G4[16]*HD;G_+=G4[17]*HD;G3[0]=(G6+
+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void//
+Em Zx HD=G5[8];G6+=G4[16]*HD;G_+=G4[17]*HD;HD=G5[9];G7+=G4[18]*HD;HA+=G4[19]*HD;
+G3[0]=(G6+G8)+(G7+G9);G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);}///
+static void En Zx HD=G5[8];G6+=G4[16]*HD;G_+=G4[17]*HD;HD=G5[9];G7+=G4[18]*HD;HA
++=G4[19]*HD;HD=G5[10];G8+=G4[20]*HD;HB+=G4[21]*HD;G3[0]=(G6+G8)+(G7+G9);G3[1]=(
+G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Eo Zx HD=G5[8];G6+=
+G4[16]*HD;G_+=G4[17]*HD;HD=G5[9];G7+=G4[18]*HD;HA+=G4[19]*HD;HD=G5[10];G8+=G4[20
+]*HD;HB+=G4[21]*HD;HD=G5[11];G9+=G4[22]*HD;HC+=G4[23]*HD;G3[0]=(G6+G8)+(G7+G9);
+G3[1]=(G_+HB)+(HA+HC);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Ep Zs int G5=
+((Gz->B-Gz->A+1)-4 Zk G3[0]=(G7+G9)+(G8+G_);G3[1]=(HA+HC)+(HB+HD);G0+=G1;++Gz;G3
++=2;}while(G3<G2);}static void Eq Zs int G5=((Gz->B-Gz->A+1)-5 Zk HE=G6[4];G7+=
+G4[8]*HE;HA+=G4[9]*HE;G3[0]=(G7+G9)+(G8+G_);G3[1]=(HA+HC)+(HB+HD);G0+=G1;++Gz;G3
++=2;}while(G3<G2);}static void Er Zs int G5=((Gz->B-Gz->A+1)-6 Zk HE=G6[4];G7+=
 G4[8]*HE;HA+=G4[9]*HE;HE=G6[5];G8+=G4[10]*HE;HB+=G4[11]*HE;G3[0]=(G7+G9)+(G8+G_)
-;G3[1]=(HA+HC)+(HB+HD);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Es(float*Gw,
-unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2
-=Gw+Gx*2;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*2;int G5=((Gz->B-Gz->A+
-1)-7+3)>>2;float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC,HD,HE;HE=G6[0];G7=G4[0]*
-HE;HA=G4[1]*HE;HE=G6[1];G8=G4[2]*HE;HB=G4[3]*HE;HE=G6[2];G9=G4[4]*HE;HC=G4[5]*HE
-;HE=G6[3];G_=G4[6]*HE;HD=G4[7]*HE;do{G6+=4;G4+=8;HE=G6[0];G7+=G4[0]*HE;HA+=G4[1]
-*HE;HE=G6[1];G8+=G4[2]*HE;HB+=G4[3]*HE;HE=G6[2];G9+=G4[4]*HE;HC+=G4[5]*HE;HE=G6[
-3];G_+=G4[6]*HE;HD+=G4[7]*HE;--G5;}while(G5>0);HE=G6[4];G7+=G4[8]*HE;HA+=G4[9]*
-HE;HE=G6[5];G8+=G4[10]*HE;HB+=G4[11]*HE;HE=G6[6];G9+=G4[12]*HE;HC+=G4[13]*HE;G3[
-0]=(G7+G9)+(G8+G_);G3[1]=(HA+HC)+(HB+HD);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static
-CC*Et[4]={Ep,Eq,Er,Es,};static CC*Eu[12]={Ed,Ee,Ef,Eg,Eh,Ei,Ej,Ek,El,Em,En,Eo,};
-static void Ev(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*
-G0,int G1){float const*G2=Gw+Gx*3;float*restrict G3=Gw;do{float const*G4=Gy+Gz->
-A*3;float const*G5=G0;float G6,G7,G8,G9;G9=G5[0];G6=G4[0]*G9;G7=G4[1]*G9;G8=G4[2
-]*G9;G3[0]=G6;G3[1]=G7;G3[2]=G8;G0+=G1;++Gz;G3+=3;}while(G3<G2);}static void Ew(
-float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float
-const*G2=Gw+Gx*3;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*3;float const*
-G5=G0;float G6,G7,G8,G9;G9=G5[0];G6=G4[0]*G9;G7=G4[1]*G9;G8=G4[2]*G9;G9=G5[1];G6
-+=G4[3]*G9;G7+=G4[4]*G9;G8+=G4[5]*G9;G3[0]=G6;G3[1]=G7;G3[2]=G8;G0+=G1;++Gz;G3+=
-3;}while(G3<G2);}static void Ex(float*Gw,unsigned int Gx,float const*Gy,B4 const
-*Gz,float const*G0,int G1){float const*G2=Gw+Gx*3;float*restrict G3=Gw;do{float
-const*G4=Gy+Gz->A*3;float const*G5=G0;float G6,G7,G8,G9;G9=G5[0];G6=G4[0]*G9;G7=
-G4[1]*G9;G8=G4[2]*G9;G9=G5[1];G6+=G4[3]*G9;G7+=G4[4]*G9;G8+=G4[5]*G9;G9=G5[2];G6
-+=G4[6]*G9;G7+=G4[7]*G9;G8+=G4[8]*G9;G3[0]=G6;G3[1]=G7;G3[2]=G8;G0+=G1;++Gz;G3+=
-3;}while(G3<G2);}static void Ey(float*Gw,unsigned int Gx,float const*Gy,B4 const
-*Gz,float const*G0,int G1){float const*G2=Gw+Gx*3;float*restrict G3=Gw;do{float
-const*G4=Gy+Gz->A*3;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,
-HH;HH=G5[0];G6=G4[0]*HH;G7=G4[1]*HH;G8=G4[2]*HH;HH=G5[1];G9=G4[3]*HH;G_=G4[4]*HH
-;HA=G4[5]*HH;HH=G5[2];HB=G4[6]*HH;HC=G4[7]*HH;HD=G4[8]*HH;HH=G5[3];HE=G4[9]*HH;
-HF=G4[10]*HH;HG=G4[11]*HH;G3[0]=(G6+HB)+(G9+HE);G3[1]=(G7+HC)+(G_+HF);G3[2]=(G8+
-HD)+(HA+HG);G0+=G1;++Gz;G3+=3;}while(G3<G2);}static void Ez(float*Gw,unsigned///
-int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*3;
-float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*3;float const*G5=G0;float G6,G7,
-G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH;HH=G5[0];G6=G4[0]*HH;G7=G4[1]*HH;G8=G4[2]*HH;HH
-=G5[1];G9=G4[3]*HH;G_=G4[4]*HH;HA=G4[5]*HH;HH=G5[2];HB=G4[6]*HH;HC=G4[7]*HH;HD=
-G4[8]*HH;HH=G5[3];HE=G4[9]*HH;HF=G4[10]*HH;HG=G4[11]*HH;HH=G5[4];G6+=G4[12]*HH;
-G7+=G4[13]*HH;G8+=G4[14]*HH;G3[0]=(G6+HB)+(G9+HE);G3[1]=(G7+HC)+(G_+HF);G3[2]=(
-G8+HD)+(HA+HG);G0+=G1;++Gz;G3+=3;}while(G3<G2);}static void E0(float*Gw,unsigned
-int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*3;
-float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*3;float const*G5=G0;float G6,G7,
-G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH;HH=G5[0];G6=G4[0]*HH;G7=G4[1]*HH;G8=G4[2]*HH;HH
-=G5[1];G9=G4[3]*HH;G_=G4[4]*HH;HA=G4[5]*HH;HH=G5[2];HB=G4[6]*HH;HC=G4[7]*HH;HD=
-G4[8]*HH;HH=G5[3];HE=G4[9]*HH;HF=G4[10]*HH;HG=G4[11]*HH;HH=G5[4];G6+=G4[12]*HH;
-G7+=G4[13]*HH;G8+=G4[14]*HH;HH=G5[5];G9+=G4[15]*HH;G_+=G4[16]*HH;HA+=G4[17]*HH;
-G3[0]=(G6+HB)+(G9+HE);G3[1]=(G7+HC)+(G_+HF);G3[2]=(G8+HD)+(HA+HG);G0+=G1;++Gz;G3
-+=3;}while(G3<G2);}static void E1(float*Gw,unsigned int Gx,float const*Gy,B4////
-const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*3;float*restrict G3=Gw;do{
-float const*G4=Gy+Gz->A*3;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,
-HF,HG,HH;HH=G5[0];G6=G4[0]*HH;G7=G4[1]*HH;G8=G4[2]*HH;HH=G5[1];G9=G4[3]*HH;G_=G4
-[4]*HH;HA=G4[5]*HH;HH=G5[2];HB=G4[6]*HH;HC=G4[7]*HH;HD=G4[8]*HH;HH=G5[3];HE=G4[9
-]*HH;HF=G4[10]*HH;HG=G4[11]*HH;HH=G5[4];G6+=G4[12]*HH;G7+=G4[13]*HH;G8+=G4[14]*
-HH;HH=G5[5];G9+=G4[15]*HH;G_+=G4[16]*HH;HA+=G4[17]*HH;HH=G5[6];HB+=G4[18]*HH;HC
-+=G4[19]*HH;HD+=G4[20]*HH;G3[0]=(G6+HB)+(G9+HE);G3[1]=(G7+HC)+(G_+HF);G3[2]=(G8+
-HD)+(HA+HG);G0+=G1;++Gz;G3+=3;}while(G3<G2);}static void E2(float*Gw,unsigned///
-int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*3;
-float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*3;float const*G5=G0;float G6,G7,
-G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH;HH=G5[0];G6=G4[0]*HH;G7=G4[1]*HH;G8=G4[2]*HH;HH
-=G5[1];G9=G4[3]*HH;G_=G4[4]*HH;HA=G4[5]*HH;HH=G5[2];HB=G4[6]*HH;HC=G4[7]*HH;HD=
-G4[8]*HH;HH=G5[3];HE=G4[9]*HH;HF=G4[10]*HH;HG=G4[11]*HH;HH=G5[4];G6+=G4[12]*HH;
-G7+=G4[13]*HH;G8+=G4[14]*HH;HH=G5[5];G9+=G4[15]*HH;G_+=G4[16]*HH;HA+=G4[17]*HH;
-HH=G5[6];HB+=G4[18]*HH;HC+=G4[19]*HH;HD+=G4[20]*HH;HH=G5[7];HE+=G4[21]*HH;HF+=G4
-[22]*HH;HG+=G4[23]*HH;G3[0]=(G6+HB)+(G9+HE);G3[1]=(G7+HC)+(G_+HF);G3[2]=(G8+HD)+
-(HA+HG);G0+=G1;++Gz;G3+=3;}while(G3<G2);}static void E3(float*Gw,unsigned int Gx
-,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*3;float*
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*3;float const*G5=G0;float G6,G7,G8,G9,
-G_,HA,HB,HC,HD,HE,HF,HG,HH;HH=G5[0];G6=G4[0]*HH;G7=G4[1]*HH;G8=G4[2]*HH;HH=G5[1]
-;G9=G4[3]*HH;G_=G4[4]*HH;HA=G4[5]*HH;HH=G5[2];HB=G4[6]*HH;HC=G4[7]*HH;HD=G4[8]*
-HH;HH=G5[3];HE=G4[9]*HH;HF=G4[10]*HH;HG=G4[11]*HH;HH=G5[4];G6+=G4[12]*HH;G7+=G4[
-13]*HH;G8+=G4[14]*HH;HH=G5[5];G9+=G4[15]*HH;G_+=G4[16]*HH;HA+=G4[17]*HH;HH=G5[6]
-;HB+=G4[18]*HH;HC+=G4[19]*HH;HD+=G4[20]*HH;HH=G5[7];HE+=G4[21]*HH;HF+=G4[22]*HH;
-HG+=G4[23]*HH;HH=G5[8];G6+=G4[24]*HH;G7+=G4[25]*HH;G8+=G4[26]*HH;G3[0]=(G6+HB)+(
-G9+HE);G3[1]=(G7+HC)+(G_+HF);G3[2]=(G8+HD)+(HA+HG);G0+=G1;++Gz;G3+=3;}while(G3<
-G2);}static void E4(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float///
-const*G0,int G1){float const*G2=Gw+Gx*3;float*restrict G3=Gw;do{float const*G4=
-Gy+Gz->A*3;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH;HH=G5[
-0];G6=G4[0]*HH;G7=G4[1]*HH;G8=G4[2]*HH;HH=G5[1];G9=G4[3]*HH;G_=G4[4]*HH;HA=G4[5]
-*HH;HH=G5[2];HB=G4[6]*HH;HC=G4[7]*HH;HD=G4[8]*HH;HH=G5[3];HE=G4[9]*HH;HF=G4[10]*
-HH;HG=G4[11]*HH;HH=G5[4];G6+=G4[12]*HH;G7+=G4[13]*HH;G8+=G4[14]*HH;HH=G5[5];G9+=
-G4[15]*HH;G_+=G4[16]*HH;HA+=G4[17]*HH;HH=G5[6];HB+=G4[18]*HH;HC+=G4[19]*HH;HD+=
-G4[20]*HH;HH=G5[7];HE+=G4[21]*HH;HF+=G4[22]*HH;HG+=G4[23]*HH;HH=G5[8];G6+=G4[24]
-*HH;G7+=G4[25]*HH;G8+=G4[26]*HH;HH=G5[9];G9+=G4[27]*HH;G_+=G4[28]*HH;HA+=G4[29]*
-HH;G3[0]=(G6+HB)+(G9+HE);G3[1]=(G7+HC)+(G_+HF);G3[2]=(G8+HD)+(HA+HG);G0+=G1;++Gz
-;G3+=3;}while(G3<G2);}static void E5(float*Gw,unsigned int Gx,float const*Gy,B4
-const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*3;float*restrict G3=Gw;do{
-float const*G4=Gy+Gz->A*3;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,
-HF,HG,HH;HH=G5[0];G6=G4[0]*HH;G7=G4[1]*HH;G8=G4[2]*HH;HH=G5[1];G9=G4[3]*HH;G_=G4
-[4]*HH;HA=G4[5]*HH;HH=G5[2];HB=G4[6]*HH;HC=G4[7]*HH;HD=G4[8]*HH;HH=G5[3];HE=G4[9
-]*HH;HF=G4[10]*HH;HG=G4[11]*HH;HH=G5[4];G6+=G4[12]*HH;G7+=G4[13]*HH;G8+=G4[14]*
-HH;HH=G5[5];G9+=G4[15]*HH;G_+=G4[16]*HH;HA+=G4[17]*HH;HH=G5[6];HB+=G4[18]*HH;HC
-+=G4[19]*HH;HD+=G4[20]*HH;HH=G5[7];HE+=G4[21]*HH;HF+=G4[22]*HH;HG+=G4[23]*HH;HH=
-G5[8];G6+=G4[24]*HH;G7+=G4[25]*HH;G8+=G4[26]*HH;HH=G5[9];G9+=G4[27]*HH;G_+=G4[28
-]*HH;HA+=G4[29]*HH;HH=G5[10];HB+=G4[30]*HH;HC+=G4[31]*HH;HD+=G4[32]*HH;G3[0]=(G6
-+HB)+(G9+HE);G3[1]=(G7+HC)+(G_+HF);G3[2]=(G8+HD)+(HA+HG);G0+=G1;++Gz;G3+=3;}////
-while(G3<G2);}static void E6(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz
-,float const*G0,int G1){float const*G2=Gw+Gx*3;float*restrict G3=Gw;do{float////
-const*G4=Gy+Gz->A*3;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,
-HH;HH=G5[0];G6=G4[0]*HH;G7=G4[1]*HH;G8=G4[2]*HH;HH=G5[1];G9=G4[3]*HH;G_=G4[4]*HH
-;HA=G4[5]*HH;HH=G5[2];HB=G4[6]*HH;HC=G4[7]*HH;HD=G4[8]*HH;HH=G5[3];HE=G4[9]*HH;
-HF=G4[10]*HH;HG=G4[11]*HH;HH=G5[4];G6+=G4[12]*HH;G7+=G4[13]*HH;G8+=G4[14]*HH;HH=
-G5[5];G9+=G4[15]*HH;G_+=G4[16]*HH;HA+=G4[17]*HH;HH=G5[6];HB+=G4[18]*HH;HC+=G4[19
-]*HH;HD+=G4[20]*HH;HH=G5[7];HE+=G4[21]*HH;HF+=G4[22]*HH;HG+=G4[23]*HH;HH=G5[8];
-G6+=G4[24]*HH;G7+=G4[25]*HH;G8+=G4[26]*HH;HH=G5[9];G9+=G4[27]*HH;G_+=G4[28]*HH;
-HA+=G4[29]*HH;HH=G5[10];HB+=G4[30]*HH;HC+=G4[31]*HH;HD+=G4[32]*HH;HH=G5[11];HE+=
-G4[33]*HH;HF+=G4[34]*HH;HG+=G4[35]*HH;G3[0]=(G6+HB)+(G9+HE);G3[1]=(G7+HC)+(G_+HF
-);G3[2]=(G8+HD)+(HA+HG);G0+=G1;++Gz;G3+=3;}while(G3<G2);}static void E7(float*Gw
-,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*
-G2=Gw+Gx*3;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*3;int G5=((Gz->B-Gz->
-A+1)-4+3)>>2;float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI;HI=
-G6[0];G7=G4[0]*HI;G8=G4[1]*HI;G9=G4[2]*HI;HI=G6[1];G_=G4[3]*HI;HA=G4[4]*HI;HB=G4
-[5]*HI;HI=G6[2];HC=G4[6]*HI;HD=G4[7]*HI;HE=G4[8]*HI;HI=G6[3];HF=G4[9]*HI;HG=G4[
-10]*HI;HH=G4[11]*HI;do{G6+=4;G4+=12;HI=G6[0];G7+=G4[0]*HI;G8+=G4[1]*HI;G9+=G4[2]
-*HI;HI=G6[1];G_+=G4[3]*HI;HA+=G4[4]*HI;HB+=G4[5]*HI;HI=G6[2];HC+=G4[6]*HI;HD+=G4
-[7]*HI;HE+=G4[8]*HI;HI=G6[3];HF+=G4[9]*HI;HG+=G4[10]*HI;HH+=G4[11]*HI;--G5;}////
-while(G5>0);G3[0]=(G7+HC)+(G_+HF);G3[1]=(G8+HD)+(HA+HG);G3[2]=(G9+HE)+(HB+HH);G0
-+=G1;++Gz;G3+=3;}while(G3<G2);}static void E8(float*Gw,unsigned int Gx,float////
-const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*3;float* //////
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*3;int G5=((Gz->B-Gz->A+1)-5+3)>>2;////
-float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI;HI=G6[0];G7=G4[0]
-*HI;G8=G4[1]*HI;G9=G4[2]*HI;HI=G6[1];G_=G4[3]*HI;HA=G4[4]*HI;HB=G4[5]*HI;HI=G6[2
-];HC=G4[6]*HI;HD=G4[7]*HI;HE=G4[8]*HI;HI=G6[3];HF=G4[9]*HI;HG=G4[10]*HI;HH=G4[11
-]*HI;do{G6+=4;G4+=12;HI=G6[0];G7+=G4[0]*HI;G8+=G4[1]*HI;G9+=G4[2]*HI;HI=G6[1];G_
-+=G4[3]*HI;HA+=G4[4]*HI;HB+=G4[5]*HI;HI=G6[2];HC+=G4[6]*HI;HD+=G4[7]*HI;HE+=G4[8
-]*HI;HI=G6[3];HF+=G4[9]*HI;HG+=G4[10]*HI;HH+=G4[11]*HI;--G5;}while(G5>0);HI=G6[4
-];G7+=G4[12]*HI;G8+=G4[13]*HI;G9+=G4[14]*HI;G3[0]=(G7+HC)+(G_+HF);G3[1]=(G8+HD)+
-(HA+HG);G3[2]=(G9+HE)+(HB+HH);G0+=G1;++Gz;G3+=3;}while(G3<G2);}static void E9(//
-float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float
-const*G2=Gw+Gx*3;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*3;int G5=((Gz->
-B-Gz->A+1)-6+3)>>2;float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,
-HI;HI=G6[0];G7=G4[0]*HI;G8=G4[1]*HI;G9=G4[2]*HI;HI=G6[1];G_=G4[3]*HI;HA=G4[4]*HI
-;HB=G4[5]*HI;HI=G6[2];HC=G4[6]*HI;HD=G4[7]*HI;HE=G4[8]*HI;HI=G6[3];HF=G4[9]*HI;
-HG=G4[10]*HI;HH=G4[11]*HI;do{G6+=4;G4+=12;HI=G6[0];G7+=G4[0]*HI;G8+=G4[1]*HI;G9
-+=G4[2]*HI;HI=G6[1];G_+=G4[3]*HI;HA+=G4[4]*HI;HB+=G4[5]*HI;HI=G6[2];HC+=G4[6]*HI
-;HD+=G4[7]*HI;HE+=G4[8]*HI;HI=G6[3];HF+=G4[9]*HI;HG+=G4[10]*HI;HH+=G4[11]*HI;--
-G5;}while(G5>0);HI=G6[4];G7+=G4[12]*HI;G8+=G4[13]*HI;G9+=G4[14]*HI;HI=G6[5];G_+=
-G4[15]*HI;HA+=G4[16]*HI;HB+=G4[17]*HI;G3[0]=(G7+HC)+(G_+HF);G3[1]=(G8+HD)+(HA+HG
-);G3[2]=(G9+HE)+(HB+HH);G0+=G1;++Gz;G3+=3;}while(G3<G2);}static void E_(float*Gw
-,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*
-G2=Gw+Gx*3;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*3;int G5=((Gz->B-Gz->
-A+1)-7+3)>>2;float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI;HI=
-G6[0];G7=G4[0]*HI;G8=G4[1]*HI;G9=G4[2]*HI;HI=G6[1];G_=G4[3]*HI;HA=G4[4]*HI;HB=G4
-[5]*HI;HI=G6[2];HC=G4[6]*HI;HD=G4[7]*HI;HE=G4[8]*HI;HI=G6[3];HF=G4[9]*HI;HG=G4[
-10]*HI;HH=G4[11]*HI;do{G6+=4;G4+=12;HI=G6[0];G7+=G4[0]*HI;G8+=G4[1]*HI;G9+=G4[2]
-*HI;HI=G6[1];G_+=G4[3]*HI;HA+=G4[4]*HI;HB+=G4[5]*HI;HI=G6[2];HC+=G4[6]*HI;HD+=G4
-[7]*HI;HE+=G4[8]*HI;HI=G6[3];HF+=G4[9]*HI;HG+=G4[10]*HI;HH+=G4[11]*HI;--G5;}////
-while(G5>0);HI=G6[4];G7+=G4[12]*HI;G8+=G4[13]*HI;G9+=G4[14]*HI;HI=G6[5];G_+=G4[
-15]*HI;HA+=G4[16]*HI;HB+=G4[17]*HI;HI=G6[6];HC+=G4[18]*HI;HD+=G4[19]*HI;HE+=G4[
-20]*HI;G3[0]=(G7+HC)+(G_+HF);G3[1]=(G8+HD)+(HA+HG);G3[2]=(G9+HE)+(HB+HH);G0+=G1;
-++Gz;G3+=3;}while(G3<G2);}static CC*FA[4]={E7,E8,E9,E_,};static CC*FB[12]={Ev,Ew
-,Ex,Ey,Ez,E0,E1,E2,E3,E4,E5,E6,};static void FC(float*Gw,unsigned int Gx,float//
-const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*4;float* //////
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*4;float const*G5=G0;float G6,G7,G8,G9,
-G_;G_=G5[0];G6=G4[0]*G_;G7=G4[1]*G_;G8=G4[2]*G_;G9=G4[3]*G_;G3[0]=G6;G3[1]=G7;G3
-[2]=G8;G3[3]=G9;G0+=G1;++Gz;G3+=4;}while(G3<G2);}static void FD(float*Gw,///////
-unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2
-=Gw+Gx*4;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*4;float const*G5=G0;///
-float G6,G7,G8,G9,G_;G_=G5[0];G6=G4[0]*G_;G7=G4[1]*G_;G8=G4[2]*G_;G9=G4[3]*G_;G_
-=G5[1];G6+=G4[4]*G_;G7+=G4[5]*G_;G8+=G4[6]*G_;G9+=G4[7]*G_;G3[0]=G6;G3[1]=G7;G3[
-2]=G8;G3[3]=G9;G0+=G1;++Gz;G3+=4;}while(G3<G2);}static void FE(float*Gw,unsigned
-int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*4;
-float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*4;float const*G5=G0;float G6,G7,
-G8,G9,G_;G_=G5[0];G6=G4[0]*G_;G7=G4[1]*G_;G8=G4[2]*G_;G9=G4[3]*G_;G_=G5[1];G6+=
-G4[4]*G_;G7+=G4[5]*G_;G8+=G4[6]*G_;G9+=G4[7]*G_;G_=G5[2];G6+=G4[8]*G_;G7+=G4[9]*
-G_;G8+=G4[10]*G_;G9+=G4[11]*G_;G3[0]=G6;G3[1]=G7;G3[2]=G8;G3[3]=G9;G0+=G1;++Gz;
-G3+=4;}while(G3<G2);}static void FF(float*Gw,unsigned int Gx,float const*Gy,B4//
-const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*4;float*restrict G3=Gw;do{
-float const*G4=Gy+Gz->A*4;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=
-G5[0];G6=G4[0]*HD;G7=G4[1]*HD;G8=G4[2]*HD;G9=G4[3]*HD;HD=G5[1];G_=G4[4]*HD;HA=G4
-[5]*HD;HB=G4[6]*HD;HC=G4[7]*HD;HD=G5[2];G6+=G4[8]*HD;G7+=G4[9]*HD;G8+=G4[10]*HD;
-G9+=G4[11]*HD;HD=G5[3];G_+=G4[12]*HD;HA+=G4[13]*HD;HB+=G4[14]*HD;HC+=G4[15]*HD;
-G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1;++Gz;G3+=4;}while(G3<G2);
-}static void FG(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*
-G0,int G1){float const*G2=Gw+Gx*4;float*restrict G3=Gw;do{float const*G4=Gy+Gz->
-A*4;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G7=
-G4[1]*HD;G8=G4[2]*HD;G9=G4[3]*HD;HD=G5[1];G_=G4[4]*HD;HA=G4[5]*HD;HB=G4[6]*HD;HC
-=G4[7]*HD;HD=G5[2];G6+=G4[8]*HD;G7+=G4[9]*HD;G8+=G4[10]*HD;G9+=G4[11]*HD;HD=G5[3
-];G_+=G4[12]*HD;HA+=G4[13]*HD;HB+=G4[14]*HD;HC+=G4[15]*HD;HD=G5[4];G6+=G4[16]*HD
-;G7+=G4[17]*HD;G8+=G4[18]*HD;G9+=G4[19]*HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;
-G3[3]=G9+HC;G0+=G1;++Gz;G3+=4;}while(G3<G2);}static void FH(float*Gw,unsigned///
-int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*4;
-float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*4;float const*G5=G0;float G6,G7,
-G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G7=G4[1]*HD;G8=G4[2]*HD;G9=G4[3]*HD;HD
-=G5[1];G_=G4[4]*HD;HA=G4[5]*HD;HB=G4[6]*HD;HC=G4[7]*HD;HD=G5[2];G6+=G4[8]*HD;G7
-+=G4[9]*HD;G8+=G4[10]*HD;G9+=G4[11]*HD;HD=G5[3];G_+=G4[12]*HD;HA+=G4[13]*HD;HB+=
-G4[14]*HD;HC+=G4[15]*HD;HD=G5[4];G6+=G4[16]*HD;G7+=G4[17]*HD;G8+=G4[18]*HD;G9+=
-G4[19]*HD;HD=G5[5];G_+=G4[20]*HD;HA+=G4[21]*HD;HB+=G4[22]*HD;HC+=G4[23]*HD;G3[0]
-=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1;++Gz;G3+=4;}while(G3<G2);}////
-static void FI(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*
-G0,int G1){float const*G2=Gw+Gx*4;float*restrict G3=Gw;do{float const*G4=Gy+Gz->
-A*4;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G7=
-G4[1]*HD;G8=G4[2]*HD;G9=G4[3]*HD;HD=G5[1];G_=G4[4]*HD;HA=G4[5]*HD;HB=G4[6]*HD;HC
-=G4[7]*HD;HD=G5[2];G6+=G4[8]*HD;G7+=G4[9]*HD;G8+=G4[10]*HD;G9+=G4[11]*HD;HD=G5[3
-];G_+=G4[12]*HD;HA+=G4[13]*HD;HB+=G4[14]*HD;HC+=G4[15]*HD;HD=G5[4];G6+=G4[16]*HD
-;G7+=G4[17]*HD;G8+=G4[18]*HD;G9+=G4[19]*HD;HD=G5[5];G_+=G4[20]*HD;HA+=G4[21]*HD;
-HB+=G4[22]*HD;HC+=G4[23]*HD;HD=G5[6];G6+=G4[24]*HD;G7+=G4[25]*HD;G8+=G4[26]*HD;
-G9+=G4[27]*HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1;++Gz;G3+=4;
-}while(G3<G2);}static void FJ(float*Gw,unsigned int Gx,float const*Gy,B4 const*
-Gz,float const*G0,int G1){float const*G2=Gw+Gx*4;float*restrict G3=Gw;do{float//
-const*G4=Gy+Gz->A*4;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];
-G6=G4[0]*HD;G7=G4[1]*HD;G8=G4[2]*HD;G9=G4[3]*HD;HD=G5[1];G_=G4[4]*HD;HA=G4[5]*HD
-;HB=G4[6]*HD;HC=G4[7]*HD;HD=G5[2];G6+=G4[8]*HD;G7+=G4[9]*HD;G8+=G4[10]*HD;G9+=G4
-[11]*HD;HD=G5[3];G_+=G4[12]*HD;HA+=G4[13]*HD;HB+=G4[14]*HD;HC+=G4[15]*HD;HD=G5[4
-];G6+=G4[16]*HD;G7+=G4[17]*HD;G8+=G4[18]*HD;G9+=G4[19]*HD;HD=G5[5];G_+=G4[20]*HD
-;HA+=G4[21]*HD;HB+=G4[22]*HD;HC+=G4[23]*HD;HD=G5[6];G6+=G4[24]*HD;G7+=G4[25]*HD;
-G8+=G4[26]*HD;G9+=G4[27]*HD;HD=G5[7];G_+=G4[28]*HD;HA+=G4[29]*HD;HB+=G4[30]*HD;
-HC+=G4[31]*HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1;++Gz;G3+=4;
-}while(G3<G2);}static void FK(float*Gw,unsigned int Gx,float const*Gy,B4 const*
-Gz,float const*G0,int G1){float const*G2=Gw+Gx*4;float*restrict G3=Gw;do{float//
-const*G4=Gy+Gz->A*4;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];
-G6=G4[0]*HD;G7=G4[1]*HD;G8=G4[2]*HD;G9=G4[3]*HD;HD=G5[1];G_=G4[4]*HD;HA=G4[5]*HD
-;HB=G4[6]*HD;HC=G4[7]*HD;HD=G5[2];G6+=G4[8]*HD;G7+=G4[9]*HD;G8+=G4[10]*HD;G9+=G4
-[11]*HD;HD=G5[3];G_+=G4[12]*HD;HA+=G4[13]*HD;HB+=G4[14]*HD;HC+=G4[15]*HD;HD=G5[4
-];G6+=G4[16]*HD;G7+=G4[17]*HD;G8+=G4[18]*HD;G9+=G4[19]*HD;HD=G5[5];G_+=G4[20]*HD
-;HA+=G4[21]*HD;HB+=G4[22]*HD;HC+=G4[23]*HD;HD=G5[6];G6+=G4[24]*HD;G7+=G4[25]*HD;
-G8+=G4[26]*HD;G9+=G4[27]*HD;HD=G5[7];G_+=G4[28]*HD;HA+=G4[29]*HD;HB+=G4[30]*HD;
-HC+=G4[31]*HD;HD=G5[8];G6+=G4[32]*HD;G7+=G4[33]*HD;G8+=G4[34]*HD;G9+=G4[35]*HD;
-G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1;++Gz;G3+=4;}while(G3<G2);
-}static void FL(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*
-G0,int G1){float const*G2=Gw+Gx*4;float*restrict G3=Gw;do{float const*G4=Gy+Gz->
-A*4;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G7=
-G4[1]*HD;G8=G4[2]*HD;G9=G4[3]*HD;HD=G5[1];G_=G4[4]*HD;HA=G4[5]*HD;HB=G4[6]*HD;HC
-=G4[7]*HD;HD=G5[2];G6+=G4[8]*HD;G7+=G4[9]*HD;G8+=G4[10]*HD;G9+=G4[11]*HD;HD=G5[3
-];G_+=G4[12]*HD;HA+=G4[13]*HD;HB+=G4[14]*HD;HC+=G4[15]*HD;HD=G5[4];G6+=G4[16]*HD
-;G7+=G4[17]*HD;G8+=G4[18]*HD;G9+=G4[19]*HD;HD=G5[5];G_+=G4[20]*HD;HA+=G4[21]*HD;
-HB+=G4[22]*HD;HC+=G4[23]*HD;HD=G5[6];G6+=G4[24]*HD;G7+=G4[25]*HD;G8+=G4[26]*HD;
-G9+=G4[27]*HD;HD=G5[7];G_+=G4[28]*HD;HA+=G4[29]*HD;HB+=G4[30]*HD;HC+=G4[31]*HD;
-HD=G5[8];G6+=G4[32]*HD;G7+=G4[33]*HD;G8+=G4[34]*HD;G9+=G4[35]*HD;HD=G5[9];G_+=G4
-[36]*HD;HA+=G4[37]*HD;HB+=G4[38]*HD;HC+=G4[39]*HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=
-G8+HB;G3[3]=G9+HC;G0+=G1;++Gz;G3+=4;}while(G3<G2);}static void FM(float*Gw,/////
-unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2
-=Gw+Gx*4;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*4;float const*G5=G0;///
-float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];G6=G4[0]*HD;G7=G4[1]*HD;G8=G4[2]*HD;G9
-=G4[3]*HD;HD=G5[1];G_=G4[4]*HD;HA=G4[5]*HD;HB=G4[6]*HD;HC=G4[7]*HD;HD=G5[2];G6+=
-G4[8]*HD;G7+=G4[9]*HD;G8+=G4[10]*HD;G9+=G4[11]*HD;HD=G5[3];G_+=G4[12]*HD;HA+=G4[
-13]*HD;HB+=G4[14]*HD;HC+=G4[15]*HD;HD=G5[4];G6+=G4[16]*HD;G7+=G4[17]*HD;G8+=G4[
-18]*HD;G9+=G4[19]*HD;HD=G5[5];G_+=G4[20]*HD;HA+=G4[21]*HD;HB+=G4[22]*HD;HC+=G4[
-23]*HD;HD=G5[6];G6+=G4[24]*HD;G7+=G4[25]*HD;G8+=G4[26]*HD;G9+=G4[27]*HD;HD=G5[7]
-;G_+=G4[28]*HD;HA+=G4[29]*HD;HB+=G4[30]*HD;HC+=G4[31]*HD;HD=G5[8];G6+=G4[32]*HD;
-G7+=G4[33]*HD;G8+=G4[34]*HD;G9+=G4[35]*HD;HD=G5[9];G_+=G4[36]*HD;HA+=G4[37]*HD;
-HB+=G4[38]*HD;HC+=G4[39]*HD;HD=G5[10];G6+=G4[40]*HD;G7+=G4[41]*HD;G8+=G4[42]*HD;
-G9+=G4[43]*HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1;++Gz;G3+=4;
-}while(G3<G2);}static void FN(float*Gw,unsigned int Gx,float const*Gy,B4 const*
-Gz,float const*G0,int G1){float const*G2=Gw+Gx*4;float*restrict G3=Gw;do{float//
-const*G4=Gy+Gz->A*4;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD;HD=G5[0];
-G6=G4[0]*HD;G7=G4[1]*HD;G8=G4[2]*HD;G9=G4[3]*HD;HD=G5[1];G_=G4[4]*HD;HA=G4[5]*HD
-;HB=G4[6]*HD;HC=G4[7]*HD;HD=G5[2];G6+=G4[8]*HD;G7+=G4[9]*HD;G8+=G4[10]*HD;G9+=G4
-[11]*HD;HD=G5[3];G_+=G4[12]*HD;HA+=G4[13]*HD;HB+=G4[14]*HD;HC+=G4[15]*HD;HD=G5[4
-];G6+=G4[16]*HD;G7+=G4[17]*HD;G8+=G4[18]*HD;G9+=G4[19]*HD;HD=G5[5];G_+=G4[20]*HD
-;HA+=G4[21]*HD;HB+=G4[22]*HD;HC+=G4[23]*HD;HD=G5[6];G6+=G4[24]*HD;G7+=G4[25]*HD;
-G8+=G4[26]*HD;G9+=G4[27]*HD;HD=G5[7];G_+=G4[28]*HD;HA+=G4[29]*HD;HB+=G4[30]*HD;
-HC+=G4[31]*HD;HD=G5[8];G6+=G4[32]*HD;G7+=G4[33]*HD;G8+=G4[34]*HD;G9+=G4[35]*HD;
-HD=G5[9];G_+=G4[36]*HD;HA+=G4[37]*HD;HB+=G4[38]*HD;HC+=G4[39]*HD;HD=G5[10];G6+=
-G4[40]*HD;G7+=G4[41]*HD;G8+=G4[42]*HD;G9+=G4[43]*HD;HD=G5[11];G_+=G4[44]*HD;HA+=
-G4[45]*HD;HB+=G4[46]*HD;HC+=G4[47]*HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=
-G9+HC;G0+=G1;++Gz;G3+=4;}while(G3<G2);}static void FO(float*Gw,unsigned int Gx,
-float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*4;float*
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*4;int G5=((Gz->B-Gz->A+1)-4+3)>>2;////
-float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC,HD,HE;HE=G6[0];G7=G4[0]*HE;G8=G4[1]
-*HE;G9=G4[2]*HE;G_=G4[3]*HE;HE=G6[1];HA=G4[4]*HE;HB=G4[5]*HE;HC=G4[6]*HE;HD=G4[7
-]*HE;HE=G6[2];G7+=G4[8]*HE;G8+=G4[9]*HE;G9+=G4[10]*HE;G_+=G4[11]*HE;HE=G6[3];HA
-+=G4[12]*HE;HB+=G4[13]*HE;HC+=G4[14]*HE;HD+=G4[15]*HE;do{G6+=4;G4+=16;HE=G6[0];
-G7+=G4[0]*HE;G8+=G4[1]*HE;G9+=G4[2]*HE;G_+=G4[3]*HE;HE=G6[1];HA+=G4[4]*HE;HB+=G4
-[5]*HE;HC+=G4[6]*HE;HD+=G4[7]*HE;HE=G6[2];G7+=G4[8]*HE;G8+=G4[9]*HE;G9+=G4[10]*
-HE;G_+=G4[11]*HE;HE=G6[3];HA+=G4[12]*HE;HB+=G4[13]*HE;HC+=G4[14]*HE;HD+=G4[15]*
-HE;--G5;}while(G5>0);G3[0]=G7+HA;G3[1]=G8+HB;G3[2]=G9+HC;G3[3]=G_+HD;G0+=G1;++Gz
-;G3+=4;}while(G3<G2);}static void FP(float*Gw,unsigned int Gx,float const*Gy,B4
-const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*4;float*restrict G3=Gw;do{
-float const*G4=Gy+Gz->A*4;int G5=((Gz->B-Gz->A+1)-5+3)>>2;float const*G6=G0;////
-float G7,G8,G9,G_,HA,HB,HC,HD,HE;HE=G6[0];G7=G4[0]*HE;G8=G4[1]*HE;G9=G4[2]*HE;G_
-=G4[3]*HE;HE=G6[1];HA=G4[4]*HE;HB=G4[5]*HE;HC=G4[6]*HE;HD=G4[7]*HE;HE=G6[2];G7+=
-G4[8]*HE;G8+=G4[9]*HE;G9+=G4[10]*HE;G_+=G4[11]*HE;HE=G6[3];HA+=G4[12]*HE;HB+=G4[
-13]*HE;HC+=G4[14]*HE;HD+=G4[15]*HE;do{G6+=4;G4+=16;HE=G6[0];G7+=G4[0]*HE;G8+=G4[
-1]*HE;G9+=G4[2]*HE;G_+=G4[3]*HE;HE=G6[1];HA+=G4[4]*HE;HB+=G4[5]*HE;HC+=G4[6]*HE;
-HD+=G4[7]*HE;HE=G6[2];G7+=G4[8]*HE;G8+=G4[9]*HE;G9+=G4[10]*HE;G_+=G4[11]*HE;HE=
-G6[3];HA+=G4[12]*HE;HB+=G4[13]*HE;HC+=G4[14]*HE;HD+=G4[15]*HE;--G5;}while(G5>0);
-HE=G6[4];G7+=G4[16]*HE;G8+=G4[17]*HE;G9+=G4[18]*HE;G_+=G4[19]*HE;G3[0]=G7+HA;G3[
-1]=G8+HB;G3[2]=G9+HC;G3[3]=G_+HD;G0+=G1;++Gz;G3+=4;}while(G3<G2);}static void FQ
-(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){////
-float const*G2=Gw+Gx*4;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*4;int G5=
-((Gz->B-Gz->A+1)-6+3)>>2;float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC,HD,HE;HE=
-G6[0];G7=G4[0]*HE;G8=G4[1]*HE;G9=G4[2]*HE;G_=G4[3]*HE;HE=G6[1];HA=G4[4]*HE;HB=G4
-[5]*HE;HC=G4[6]*HE;HD=G4[7]*HE;HE=G6[2];G7+=G4[8]*HE;G8+=G4[9]*HE;G9+=G4[10]*HE;
-G_+=G4[11]*HE;HE=G6[3];HA+=G4[12]*HE;HB+=G4[13]*HE;HC+=G4[14]*HE;HD+=G4[15]*HE;
-do{G6+=4;G4+=16;HE=G6[0];G7+=G4[0]*HE;G8+=G4[1]*HE;G9+=G4[2]*HE;G_+=G4[3]*HE;HE=
-G6[1];HA+=G4[4]*HE;HB+=G4[5]*HE;HC+=G4[6]*HE;HD+=G4[7]*HE;HE=G6[2];G7+=G4[8]*HE;
-G8+=G4[9]*HE;G9+=G4[10]*HE;G_+=G4[11]*HE;HE=G6[3];HA+=G4[12]*HE;HB+=G4[13]*HE;HC
-+=G4[14]*HE;HD+=G4[15]*HE;--G5;}while(G5>0);HE=G6[4];G7+=G4[16]*HE;G8+=G4[17]*HE
-;G9+=G4[18]*HE;G_+=G4[19]*HE;HE=G6[5];HA+=G4[20]*HE;HB+=G4[21]*HE;HC+=G4[22]*HE;
-HD+=G4[23]*HE;G3[0]=G7+HA;G3[1]=G8+HB;G3[2]=G9+HC;G3[3]=G_+HD;G0+=G1;++Gz;G3+=4;
-}while(G3<G2);}static void FR(float*Gw,unsigned int Gx,float const*Gy,B4 const*
-Gz,float const*G0,int G1){float const*G2=Gw+Gx*4;float*restrict G3=Gw;do{float//
-const*G4=Gy+Gz->A*4;int G5=((Gz->B-Gz->A+1)-7+3)>>2;float const*G6=G0;float G7,
-G8,G9,G_,HA,HB,HC,HD,HE;HE=G6[0];G7=G4[0]*HE;G8=G4[1]*HE;G9=G4[2]*HE;G_=G4[3]*HE
-;HE=G6[1];HA=G4[4]*HE;HB=G4[5]*HE;HC=G4[6]*HE;HD=G4[7]*HE;HE=G6[2];G7+=G4[8]*HE;
-G8+=G4[9]*HE;G9+=G4[10]*HE;G_+=G4[11]*HE;HE=G6[3];HA+=G4[12]*HE;HB+=G4[13]*HE;HC
-+=G4[14]*HE;HD+=G4[15]*HE;do{G6+=4;G4+=16;HE=G6[0];G7+=G4[0]*HE;G8+=G4[1]*HE;G9
-+=G4[2]*HE;G_+=G4[3]*HE;HE=G6[1];HA+=G4[4]*HE;HB+=G4[5]*HE;HC+=G4[6]*HE;HD+=G4[7
-]*HE;HE=G6[2];G7+=G4[8]*HE;G8+=G4[9]*HE;G9+=G4[10]*HE;G_+=G4[11]*HE;HE=G6[3];HA
-+=G4[12]*HE;HB+=G4[13]*HE;HC+=G4[14]*HE;HD+=G4[15]*HE;--G5;}while(G5>0);HE=G6[4]
-;G7+=G4[16]*HE;G8+=G4[17]*HE;G9+=G4[18]*HE;G_+=G4[19]*HE;HE=G6[5];HA+=G4[20]*HE;
-HB+=G4[21]*HE;HC+=G4[22]*HE;HD+=G4[23]*HE;HE=G6[6];G7+=G4[24]*HE;G8+=G4[25]*HE;
-G9+=G4[26]*HE;G_+=G4[27]*HE;G3[0]=G7+HA;G3[1]=G8+HB;G3[2]=G9+HC;G3[3]=G_+HD;G0+=
-G1;++Gz;G3+=4;}while(G3<G2);}static CC*FS[4]={FO,FP,FQ,FR,};static CC*FT[12]={FC
-,FD,FE,FF,FG,FH,FI,FJ,FK,FL,FM,FN,};static void FU(float*Gw,unsigned int Gx,////
-float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*7;float*
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*7;float const*G5=G0;float G6,G7,G8,G9,
-G_,HA,HB,HC;HC=G5[0];G6=G4[0]*HC;G7=G4[1]*HC;G8=G4[2]*HC;G9=G4[3]*HC;G_=G4[4]*HC
-;HA=G4[5]*HC;HB=G4[6]*HC;G3[0]=G6;G3[1]=G7;G3[2]=G8;G3[3]=G9;G3[4]=G_;G3[5]=HA;
-G3[6]=HB;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static void FV(float*Gw,unsigned int//
-Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*7;////
-float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*7;float const*G5=G0;float G6,G7,
-G8,G9,G_,HA,HB,HC;HC=G5[0];G6=G4[0]*HC;G7=G4[1]*HC;G8=G4[2]*HC;G9=G4[3]*HC;G_=G4
-[4]*HC;HA=G4[5]*HC;HB=G4[6]*HC;HC=G5[1];G6+=G4[7]*HC;G7+=G4[8]*HC;G8+=G4[9]*HC;
-G9+=G4[10]*HC;G_+=G4[11]*HC;HA+=G4[12]*HC;HB+=G4[13]*HC;G3[0]=G6;G3[1]=G7;G3[2]=
-G8;G3[3]=G9;G3[4]=G_;G3[5]=HA;G3[6]=HB;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static//
-void FW(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int//
-G1){float const*G2=Gw+Gx*7;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*7;///
-float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC;HC=G5[0];G6=G4[0]*HC;G7=G4[1]*HC
-;G8=G4[2]*HC;G9=G4[3]*HC;G_=G4[4]*HC;HA=G4[5]*HC;HB=G4[6]*HC;HC=G5[1];G6+=G4[7]*
-HC;G7+=G4[8]*HC;G8+=G4[9]*HC;G9+=G4[10]*HC;G_+=G4[11]*HC;HA+=G4[12]*HC;HB+=G4[13
-]*HC;HC=G5[2];G6+=G4[14]*HC;G7+=G4[15]*HC;G8+=G4[16]*HC;G9+=G4[17]*HC;G_+=G4[18]
-*HC;HA+=G4[19]*HC;HB+=G4[20]*HC;G3[0]=G6;G3[1]=G7;G3[2]=G8;G3[3]=G9;G3[4]=G_;G3[
-5]=HA;G3[6]=HB;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static void FX(float*Gw,unsigned
-int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*7;
-float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*7;float const*G5=G0;float G6,G7,
-G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI,HJ;HJ=G5[0];G6=G4[0]*HJ;G7=G4[1]*HJ;G8=G4[2]
-*HJ;G9=G4[3]*HJ;G_=G4[4]*HJ;HA=G4[5]*HJ;HB=G4[6]*HJ;HJ=G5[1];HC=G4[7]*HJ;HD=G4[8
-]*HJ;HE=G4[9]*HJ;HF=G4[10]*HJ;HG=G4[11]*HJ;HH=G4[12]*HJ;HI=G4[13]*HJ;HJ=G5[2];G6
-+=G4[14]*HJ;G7+=G4[15]*HJ;G8+=G4[16]*HJ;G9+=G4[17]*HJ;G_+=G4[18]*HJ;HA+=G4[19]*
-HJ;HB+=G4[20]*HJ;HJ=G5[3];HC+=G4[21]*HJ;HD+=G4[22]*HJ;HE+=G4[23]*HJ;HF+=G4[24]*
-HJ;HG+=G4[25]*HJ;HH+=G4[26]*HJ;HI+=G4[27]*HJ;G3[0]=G6+HC;G3[1]=G7+HD;G3[2]=G8+HE
-;G3[3]=G9+HF;G3[4]=G_+HG;G3[5]=HA+HH;G3[6]=HB+HI;G0+=G1;++Gz;G3+=7;}while(G3<G2)
-;}static void FY(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const
-*G0,int G1){float const*G2=Gw+Gx*7;float*restrict G3=Gw;do{float const*G4=Gy+Gz
-->A*7;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI,HJ;HJ=G5
-[0];G6=G4[0]*HJ;G7=G4[1]*HJ;G8=G4[2]*HJ;G9=G4[3]*HJ;G_=G4[4]*HJ;HA=G4[5]*HJ;HB=
-G4[6]*HJ;HJ=G5[1];HC=G4[7]*HJ;HD=G4[8]*HJ;HE=G4[9]*HJ;HF=G4[10]*HJ;HG=G4[11]*HJ;
-HH=G4[12]*HJ;HI=G4[13]*HJ;HJ=G5[2];G6+=G4[14]*HJ;G7+=G4[15]*HJ;G8+=G4[16]*HJ;G9
-+=G4[17]*HJ;G_+=G4[18]*HJ;HA+=G4[19]*HJ;HB+=G4[20]*HJ;HJ=G5[3];HC+=G4[21]*HJ;HD
-+=G4[22]*HJ;HE+=G4[23]*HJ;HF+=G4[24]*HJ;HG+=G4[25]*HJ;HH+=G4[26]*HJ;HI+=G4[27]*
-HJ;HJ=G5[4];G6+=G4[28]*HJ;G7+=G4[29]*HJ;G8+=G4[30]*HJ;G9+=G4[31]*HJ;G_+=G4[32]*
-HJ;HA+=G4[33]*HJ;HB+=G4[34]*HJ;G3[0]=G6+HC;G3[1]=G7+HD;G3[2]=G8+HE;G3[3]=G9+HF;
-G3[4]=G_+HG;G3[5]=HA+HH;G3[6]=HB+HI;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static void
-FZ(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){//
-float const*G2=Gw+Gx*7;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*7;float//
-const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI,HJ;HJ=G5[0];G6=G4[0]
-*HJ;G7=G4[1]*HJ;G8=G4[2]*HJ;G9=G4[3]*HJ;G_=G4[4]*HJ;HA=G4[5]*HJ;HB=G4[6]*HJ;HJ=
-G5[1];HC=G4[7]*HJ;HD=G4[8]*HJ;HE=G4[9]*HJ;HF=G4[10]*HJ;HG=G4[11]*HJ;HH=G4[12]*HJ
-;HI=G4[13]*HJ;HJ=G5[2];G6+=G4[14]*HJ;G7+=G4[15]*HJ;G8+=G4[16]*HJ;G9+=G4[17]*HJ;
-G_+=G4[18]*HJ;HA+=G4[19]*HJ;HB+=G4[20]*HJ;HJ=G5[3];HC+=G4[21]*HJ;HD+=G4[22]*HJ;
-HE+=G4[23]*HJ;HF+=G4[24]*HJ;HG+=G4[25]*HJ;HH+=G4[26]*HJ;HI+=G4[27]*HJ;HJ=G5[4];
-G6+=G4[28]*HJ;G7+=G4[29]*HJ;G8+=G4[30]*HJ;G9+=G4[31]*HJ;G_+=G4[32]*HJ;HA+=G4[33]
-*HJ;HB+=G4[34]*HJ;HJ=G5[5];HC+=G4[35]*HJ;HD+=G4[36]*HJ;HE+=G4[37]*HJ;HF+=G4[38]*
-HJ;HG+=G4[39]*HJ;HH+=G4[40]*HJ;HI+=G4[41]*HJ;G3[0]=G6+HC;G3[1]=G7+HD;G3[2]=G8+HE
-;G3[3]=G9+HF;G3[4]=G_+HG;G3[5]=HA+HH;G3[6]=HB+HI;G0+=G1;++Gz;G3+=7;}while(G3<G2)
-;}static void Fa(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const
-*G0,int G1){float const*G2=Gw+Gx*7;float*restrict G3=Gw;do{float const*G4=Gy+Gz
-->A*7;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI,HJ;HJ=G5
-[0];G6=G4[0]*HJ;G7=G4[1]*HJ;G8=G4[2]*HJ;G9=G4[3]*HJ;G_=G4[4]*HJ;HA=G4[5]*HJ;HB=
-G4[6]*HJ;HJ=G5[1];HC=G4[7]*HJ;HD=G4[8]*HJ;HE=G4[9]*HJ;HF=G4[10]*HJ;HG=G4[11]*HJ;
-HH=G4[12]*HJ;HI=G4[13]*HJ;HJ=G5[2];G6+=G4[14]*HJ;G7+=G4[15]*HJ;G8+=G4[16]*HJ;G9
-+=G4[17]*HJ;G_+=G4[18]*HJ;HA+=G4[19]*HJ;HB+=G4[20]*HJ;HJ=G5[3];HC+=G4[21]*HJ;HD
-+=G4[22]*HJ;HE+=G4[23]*HJ;HF+=G4[24]*HJ;HG+=G4[25]*HJ;HH+=G4[26]*HJ;HI+=G4[27]*
-HJ;HJ=G5[4];G6+=G4[28]*HJ;G7+=G4[29]*HJ;G8+=G4[30]*HJ;G9+=G4[31]*HJ;G_+=G4[32]*
-HJ;HA+=G4[33]*HJ;HB+=G4[34]*HJ;HJ=G5[5];HC+=G4[35]*HJ;HD+=G4[36]*HJ;HE+=G4[37]*
-HJ;HF+=G4[38]*HJ;HG+=G4[39]*HJ;HH+=G4[40]*HJ;HI+=G4[41]*HJ;HJ=G5[6];G6+=G4[42]*
+;G3[1]=(HA+HC)+(HB+HD);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static void Es Zs int G5
+=((Gz->B-Gz->A+1)-7 Zk HE=G6[4];G7+=G4[8]*HE;HA+=G4[9]*HE;HE=G6[5];G8+=G4[10]*HE
+;HB+=G4[11]*HE;HE=G6[6];G9+=G4[12]*HE;HC+=G4[13]*HE;G3[0]=(G7+G9)+(G8+G_);G3[1]=
+(HA+HC)+(HB+HD);G0+=G1;++Gz;G3+=2;}while(G3<G2);}static CC*Et[4]={Ep,Eq,Er,Es,};
+static CC*Eu[12]={Ed,Ee,Ef,Eg,Eh,Ei,Ej,Ek,El,Em,En,Eo,};static void Ev Zo Z1////
+const*G5=G0;Z1 G6,G7,G8,G9;G9=G5[0];G6=G4[0]*G9;G7=G4[1]*G9;G8=G4[2]*G9;G3[0]=G6
+;G3[1]=G7;G3[2]=G8;G0+=G1;++Gz;G3+=3;}while(G3<G2);}static void Ew Zo Z1 const*
+G5=G0;Z1 G6,G7,G8,G9;G9=G5[0];G6=G4[0]*G9;G7=G4[1]*G9;G8=G4[2]*G9;G9=G5[1];G6+=
+G4[3]*G9;G7+=G4[4]*G9;G8+=G4[5]*G9;G3[0]=G6;G3[1]=G7;G3[2]=G8;G0+=G1;++Gz;G3+=3;
+}while(G3<G2);}static void Ex Zo Z1 const*G5=G0;Z1 G6,G7,G8,G9;G9=G5[0];G6=G4[0]
+*G9;G7=G4[1]*G9;G8=G4[2]*G9;G9=G5[1];G6+=G4[3]*G9;G7+=G4[4]*G9;G8+=G4[5]*G9;G9=
+G5[2];G6+=G4[6]*G9;G7+=G4[7]*G9;G8+=G4[8]*G9;G3[0]=G6;G3[1]=G7;G3[2]=G8;G0+=G1;
+++Gz;G3+=3;}while(G3<G2);}static void Ey Zo Z1 const*G5=G0;Z1 G6,G7,G8,G9,G_,HA,
+HB,HC,HD,HE,HF,HG,HH;HH=G5[0];G6=G4[0]*HH;G7=G4[1]*HH;G8=G4[2]*HH;HH=G5[1];G9=G4
+[3]*HH;G_=G4[4]*HH;HA=G4[5]*HH;HH=G5[2];HB=G4[6]*HH;HC=G4[7]*HH;HD=G4[8]*HH;HH=
+G5[3];HE=G4[9]*HH;HF=G4[10]*HH;HG=G4[11]*HH;Zq Ez Zb Zq E0 Zb HH=G5[5];G9+=G4[15
+]*HH;G_+=G4[16]*HH;HA+=G4[17]*HH;Zq E1 Zb HH=G5[5];G9+=G4[15]*HH;G_+=G4[16]*HH;
+HA+=G4[17]*HH;HH=G5[6];HB+=G4[18]*HH;HC+=G4[19]*HH;HD+=G4[20]*HH;Zq E2 Zb HH=G5[
+5];G9+=G4[15]*HH;G_+=G4[16]*HH;HA+=G4[17]*HH;HH=G5[6];HB+=G4[18]*HH;HC+=G4[19]*
+HH;HD+=G4[20]*HH;HH=G5[7];HE+=G4[21]*HH;HF+=G4[22]*HH;HG+=G4[23]*HH;Zq E3 Zv Zq
+E4 Zv HH=G5[9];G9+=G4[27]*HH;G_+=G4[28]*HH;HA+=G4[29]*HH;Zq E5 Zv HH=G5[9];G9+=
+G4[27]*HH;G_+=G4[28]*HH;HA+=G4[29]*HH;HH=G5[10];HB+=G4[30]*HH;HC+=G4[31]*HH;HD+=
+G4[32]*HH;Zq E6 Zv HH=G5[9];G9+=G4[27]*HH;G_+=G4[28]*HH;HA+=G4[29]*HH;HH=G5[10];
+HB+=G4[30]*HH;HC+=G4[31]*HH;HD+=G4[32]*HH;HH=G5[11];HE+=G4[33]*HH;HF+=G4[34]*HH;
+HG+=G4[35]*HH;Zq E7 Zo int G5=((Gz->B-Gz->A+1)-4 Zg G3[0]=(G7+HC)+(G_+HF);G3[1]=
+(G8+HD)+(HA+HG);G3[2]=(G9+HE)+(HB+HH);G0+=G1;++Gz;G3+=3;}while(G3<G2);}static///
+void E8 Zo int G5=((Gz->B-Gz->A+1)-5 Zg HI=G6[4];G7+=G4[12]*HI;G8+=G4[13]*HI;G9
++=G4[14]*HI;G3[0]=(G7+HC)+(G_+HF);G3[1]=(G8+HD)+(HA+HG);G3[2]=(G9+HE)+(HB+HH);G0
++=G1;++Gz;G3+=3;}while(G3<G2);}static void E9 Zo int G5=((Gz->B-Gz->A+1)-6 Zg HI
+=G6[4];G7+=G4[12]*HI;G8+=G4[13]*HI;G9+=G4[14]*HI;HI=G6[5];G_+=G4[15]*HI;HA+=G4[
+16]*HI;HB+=G4[17]*HI;G3[0]=(G7+HC)+(G_+HF);G3[1]=(G8+HD)+(HA+HG);G3[2]=(G9+HE)+(
+HB+HH);G0+=G1;++Gz;G3+=3;}while(G3<G2);}static void E_ Zo int G5=((Gz->B-Gz->A+1
+)-7 Zg HI=G6[4];G7+=G4[12]*HI;G8+=G4[13]*HI;G9+=G4[14]*HI;HI=G6[5];G_+=G4[15]*HI
+;HA+=G4[16]*HI;HB+=G4[17]*HI;HI=G6[6];HC+=G4[18]*HI;HD+=G4[19]*HI;HE+=G4[20]*HI;
+G3[0]=(G7+HC)+(G_+HF);G3[1]=(G8+HD)+(HA+HG);G3[2]=(G9+HE)+(HB+HH);G0+=G1;++Gz;G3
++=3;}while(G3<G2);}static CC*FA[4]={E7,E8,E9,E_,};static CC*FB[12]={Ev,Ew,Ex,Ey,
+Ez,E0,E1,E2,E3,E4,E5,E6,};static void FC Zp Z1 const*G5=G0;Z1 G6,G7,G8,G9,G_;G_=
+G5[0];G6=G4[0]*G_;G7=G4[1]*G_;G8=G4[2]*G_;G9=G4[3]*G_;G3[0]=G6;G3[1]=G7;G3[2]=G8
+;G3[3]=G9;G0+=G1;++Gz;G3+=4;}while(G3<G2);}static void FD Zp Z1 const*G5=G0;Z1//
+G6,G7,G8,G9,G_;G_=G5[0];G6=G4[0]*G_;G7=G4[1]*G_;G8=G4[2]*G_;G9=G4[3]*G_;G_=G5[1]
+;G6+=G4[4]*G_;G7+=G4[5]*G_;G8+=G4[6]*G_;G9+=G4[7]*G_;G3[0]=G6;G3[1]=G7;G3[2]=G8;
+G3[3]=G9;G0+=G1;++Gz;G3+=4;}while(G3<G2);}static void FE Zp Z1 const*G5=G0;Z1 G6
+,G7,G8,G9,G_;G_=G5[0];G6=G4[0]*G_;G7=G4[1]*G_;G8=G4[2]*G_;G9=G4[3]*G_;G_=G5[1];
+G6+=G4[4]*G_;G7+=G4[5]*G_;G8+=G4[6]*G_;G9+=G4[7]*G_;G_=G5[2];G6+=G4[8]*G_;G7+=G4
+[9]*G_;G8+=G4[10]*G_;G9+=G4[11]*G_;G3[0]=G6;G3[1]=G7;G3[2]=G8;G3[3]=G9;G0+=G1;++
+Gz;G3+=4;}while(G3<G2);}static void FF Zp Z1 const*G5=G0;Z1 G6,G7,G8,G9,G_,HA,HB
+,HC,HD;HD=G5[0];G6=G4[0]*HD;G7=G4[1]*HD;G8=G4[2]*HD;G9=G4[3]*HD;HD=G5[1];G_=G4[4
+]*HD;HA=G4[5]*HD;HB=G4[6]*HD;HC=G4[7]*HD;HD=G5[2];G6+=G4[8]*HD;G7+=G4[9]*HD;G8+=
+G4[10]*HD;G9+=G4[11]*HD;HD=G5[3];G_+=G4[12]*HD;HA+=G4[13]*HD;HB+=G4[14]*HD;HC+=
+G4[15]*HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1;++Gz;G3+=4;}///
+while(G3<G2);}static void FG Za G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;
+G0+=G1;++Gz;G3+=4;}while(G3<G2);}static void FH Za HD=G5[5];G_+=G4[20]*HD;HA+=G4
+[21]*HD;HB+=G4[22]*HD;HC+=G4[23]*HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9
++HC;G0+=G1;++Gz;G3+=4;}while(G3<G2);}static void FI Za HD=G5[5];G_+=G4[20]*HD;HA
++=G4[21]*HD;HB+=G4[22]*HD;HC+=G4[23]*HD;HD=G5[6];G6+=G4[24]*HD;G7+=G4[25]*HD;G8
++=G4[26]*HD;G9+=G4[27]*HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1
+;++Gz;G3+=4;}while(G3<G2);}static void FJ Za HD=G5[5];G_+=G4[20]*HD;HA+=G4[21]*
+HD;HB+=G4[22]*HD;HC+=G4[23]*HD;HD=G5[6];G6+=G4[24]*HD;G7+=G4[25]*HD;G8+=G4[26]*
+HD;G9+=G4[27]*HD;HD=G5[7];G_+=G4[28]*HD;HA+=G4[29]*HD;HB+=G4[30]*HD;HC+=G4[31]*
+HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1;++Gz;G3+=4;}while(G3<
+G2);}static void FK Zn G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1;++
+Gz;G3+=4;}while(G3<G2);}static void FL Zn HD=G5[9];G_+=G4[36]*HD;HA+=G4[37]*HD;
+HB+=G4[38]*HD;HC+=G4[39]*HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=
+G1;++Gz;G3+=4;}while(G3<G2);}static void FM Zn HD=G5[9];G_+=G4[36]*HD;HA+=G4[37]
+*HD;HB+=G4[38]*HD;HC+=G4[39]*HD;HD=G5[10];G6+=G4[40]*HD;G7+=G4[41]*HD;G8+=G4[42]
+*HD;G9+=G4[43]*HD;G3[0]=G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1;++Gz;G3
++=4;}while(G3<G2);}static void FN Zn HD=G5[9];G_+=G4[36]*HD;HA+=G4[37]*HD;HB+=G4
+[38]*HD;HC+=G4[39]*HD;HD=G5[10];G6+=G4[40]*HD;G7+=G4[41]*HD;G8+=G4[42]*HD;G9+=G4
+[43]*HD;HD=G5[11];G_+=G4[44]*HD;HA+=G4[45]*HD;HB+=G4[46]*HD;HC+=G4[47]*HD;G3[0]=
+G6+G_;G3[1]=G7+HA;G3[2]=G8+HB;G3[3]=G9+HC;G0+=G1;++Gz;G3+=4;}while(G3<G2);}/////
+static void FO Zp int G5=((Gz->B-Gz->A+1)-4 Ze G3[0]=G7+HA;G3[1]=G8+HB;G3[2]=G9+
+HC;G3[3]=G_+HD;G0+=G1;++Gz;G3+=4;}while(G3<G2);}static void FP Zp int G5=((Gz->B
+-Gz->A+1)-5 Ze HE=G6[4];G7+=G4[16]*HE;G8+=G4[17]*HE;G9+=G4[18]*HE;G_+=G4[19]*HE;
+G3[0]=G7+HA;G3[1]=G8+HB;G3[2]=G9+HC;G3[3]=G_+HD;G0+=G1;++Gz;G3+=4;}while(G3<G2);
+}static void FQ Zp int G5=((Gz->B-Gz->A+1)-6 Ze HE=G6[4];G7+=G4[16]*HE;G8+=G4[17
+]*HE;G9+=G4[18]*HE;G_+=G4[19]*HE;HE=G6[5];HA+=G4[20]*HE;HB+=G4[21]*HE;HC+=G4[22]
+*HE;HD+=G4[23]*HE;G3[0]=G7+HA;G3[1]=G8+HB;G3[2]=G9+HC;G3[3]=G_+HD;G0+=G1;++Gz;G3
++=4;}while(G3<G2);}static void FR Zp int G5=((Gz->B-Gz->A+1)-7 Ze HE=G6[4];G7+=
+G4[16]*HE;G8+=G4[17]*HE;G9+=G4[18]*HE;G_+=G4[19]*HE;HE=G6[5];HA+=G4[20]*HE;HB+=
+G4[21]*HE;HC+=G4[22]*HE;HD+=G4[23]*HE;HE=G6[6];G7+=G4[24]*HE;G8+=G4[25]*HE;G9+=
+G4[26]*HE;G_+=G4[27]*HE;G3[0]=G7+HA;G3[1]=G8+HB;G3[2]=G9+HC;G3[3]=G_+HD;G0+=G1;
+++Gz;G3+=4;}while(G3<G2);}static CC*FS[4]={FO,FP,FQ,FR,};static CC*FT[12]={FC,FD
+,FE,FF,FG,FH,FI,FJ,FK,FL,FM,FN,};static void FU Z5;HC=G5[0];G6=G4[0]*HC;G7=G4[1]
+*HC;G8=G4[2]*HC;G9=G4[3]*HC;G_=G4[4]*HC;HA=G4[5]*HC;HB=G4[6]*HC;G3[0]=G6;G3[1]=
+G7;G3[2]=G8;G3[3]=G9;G3[4]=G_;G3[5]=HA;G3[6]=HB;G0+=G1;++Gz;G3+=7;}while(G3<G2);
+}static void FV Z5;HC=G5[0];G6=G4[0]*HC;G7=G4[1]*HC;G8=G4[2]*HC;G9=G4[3]*HC;G_=
+G4[4]*HC;HA=G4[5]*HC;HB=G4[6]*HC;HC=G5[1];G6+=G4[7]*HC;G7+=G4[8]*HC;G8+=G4[9]*HC
+;G9+=G4[10]*HC;G_+=G4[11]*HC;HA+=G4[12]*HC;HB+=G4[13]*HC;G3[0]=G6;G3[1]=G7;G3[2]
+=G8;G3[3]=G9;G3[4]=G_;G3[5]=HA;G3[6]=HB;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static
+void FW Z5;HC=G5[0];G6=G4[0]*HC;G7=G4[1]*HC;G8=G4[2]*HC;G9=G4[3]*HC;G_=G4[4]*HC;
+HA=G4[5]*HC;HB=G4[6]*HC;HC=G5[1];G6+=G4[7]*HC;G7+=G4[8]*HC;G8+=G4[9]*HC;G9+=G4[
+10]*HC;G_+=G4[11]*HC;HA+=G4[12]*HC;HB+=G4[13]*HC;HC=G5[2];G6+=G4[14]*HC;G7+=G4[
+15]*HC;G8+=G4[16]*HC;G9+=G4[17]*HC;G_+=G4[18]*HC;HA+=G4[19]*HC;HB+=G4[20]*HC;G3[
+0]=G6;G3[1]=G7;G3[2]=G8;G3[3]=G9;G3[4]=G_;G3[5]=HA;G3[6]=HB;G0+=G1;++Gz;G3+=7;}
+while(G3<G2);}static void FX Z7 Zq FY Z8 Zq FZ Z9 Zq Fa Z9 HJ=G5[6];G6+=G4[42]*
 HJ;G7+=G4[43]*HJ;G8+=G4[44]*HJ;G9+=G4[45]*HJ;G_+=G4[46]*HJ;HA+=G4[47]*HJ;HB+=G4[
-48]*HJ;G3[0]=G6+HC;G3[1]=G7+HD;G3[2]=G8+HE;G3[3]=G9+HF;G3[4]=G_+HG;G3[5]=HA+HH;
-G3[6]=HB+HI;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static void Fb(float*Gw,unsigned///
-int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*7;
-float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*7;float const*G5=G0;float G6,G7,
-G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI,HJ;HJ=G5[0];G6=G4[0]*HJ;G7=G4[1]*HJ;G8=G4[2]
-*HJ;G9=G4[3]*HJ;G_=G4[4]*HJ;HA=G4[5]*HJ;HB=G4[6]*HJ;HJ=G5[1];HC=G4[7]*HJ;HD=G4[8
-]*HJ;HE=G4[9]*HJ;HF=G4[10]*HJ;HG=G4[11]*HJ;HH=G4[12]*HJ;HI=G4[13]*HJ;HJ=G5[2];G6
-+=G4[14]*HJ;G7+=G4[15]*HJ;G8+=G4[16]*HJ;G9+=G4[17]*HJ;G_+=G4[18]*HJ;HA+=G4[19]*
-HJ;HB+=G4[20]*HJ;HJ=G5[3];HC+=G4[21]*HJ;HD+=G4[22]*HJ;HE+=G4[23]*HJ;HF+=G4[24]*
-HJ;HG+=G4[25]*HJ;HH+=G4[26]*HJ;HI+=G4[27]*HJ;HJ=G5[4];G6+=G4[28]*HJ;G7+=G4[29]*
-HJ;G8+=G4[30]*HJ;G9+=G4[31]*HJ;G_+=G4[32]*HJ;HA+=G4[33]*HJ;HB+=G4[34]*HJ;HJ=G5[5
-];HC+=G4[35]*HJ;HD+=G4[36]*HJ;HE+=G4[37]*HJ;HF+=G4[38]*HJ;HG+=G4[39]*HJ;HH+=G4[
-40]*HJ;HI+=G4[41]*HJ;HJ=G5[6];G6+=G4[42]*HJ;G7+=G4[43]*HJ;G8+=G4[44]*HJ;G9+=G4[
-45]*HJ;G_+=G4[46]*HJ;HA+=G4[47]*HJ;HB+=G4[48]*HJ;HJ=G5[7];HC+=G4[49]*HJ;HD+=G4[
-50]*HJ;HE+=G4[51]*HJ;HF+=G4[52]*HJ;HG+=G4[53]*HJ;HH+=G4[54]*HJ;HI+=G4[55]*HJ;G3[
-0]=G6+HC;G3[1]=G7+HD;G3[2]=G8+HE;G3[3]=G9+HF;G3[4]=G_+HG;G3[5]=HA+HH;G3[6]=HB+HI
-;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static void Fc(float*Gw,unsigned int Gx,float
-const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*7;float* //////
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*7;float const*G5=G0;float G6,G7,G8,G9,
-G_,HA,HB,HC,HD,HE,HF,HG,HH,HI,HJ;HJ=G5[0];G6=G4[0]*HJ;G7=G4[1]*HJ;G8=G4[2]*HJ;G9
-=G4[3]*HJ;G_=G4[4]*HJ;HA=G4[5]*HJ;HB=G4[6]*HJ;HJ=G5[1];HC=G4[7]*HJ;HD=G4[8]*HJ;
-HE=G4[9]*HJ;HF=G4[10]*HJ;HG=G4[11]*HJ;HH=G4[12]*HJ;HI=G4[13]*HJ;HJ=G5[2];G6+=G4[
-14]*HJ;G7+=G4[15]*HJ;G8+=G4[16]*HJ;G9+=G4[17]*HJ;G_+=G4[18]*HJ;HA+=G4[19]*HJ;HB
-+=G4[20]*HJ;HJ=G5[3];HC+=G4[21]*HJ;HD+=G4[22]*HJ;HE+=G4[23]*HJ;HF+=G4[24]*HJ;HG
-+=G4[25]*HJ;HH+=G4[26]*HJ;HI+=G4[27]*HJ;HJ=G5[4];G6+=G4[28]*HJ;G7+=G4[29]*HJ;G8
-+=G4[30]*HJ;G9+=G4[31]*HJ;G_+=G4[32]*HJ;HA+=G4[33]*HJ;HB+=G4[34]*HJ;HJ=G5[5];HC
-+=G4[35]*HJ;HD+=G4[36]*HJ;HE+=G4[37]*HJ;HF+=G4[38]*HJ;HG+=G4[39]*HJ;HH+=G4[40]*
-HJ;HI+=G4[41]*HJ;HJ=G5[6];G6+=G4[42]*HJ;G7+=G4[43]*HJ;G8+=G4[44]*HJ;G9+=G4[45]*
-HJ;G_+=G4[46]*HJ;HA+=G4[47]*HJ;HB+=G4[48]*HJ;HJ=G5[7];HC+=G4[49]*HJ;HD+=G4[50]*
-HJ;HE+=G4[51]*HJ;HF+=G4[52]*HJ;HG+=G4[53]*HJ;HH+=G4[54]*HJ;HI+=G4[55]*HJ;HJ=G5[8
-];G6+=G4[56]*HJ;G7+=G4[57]*HJ;G8+=G4[58]*HJ;G9+=G4[59]*HJ;G_+=G4[60]*HJ;HA+=G4[
-61]*HJ;HB+=G4[62]*HJ;G3[0]=G6+HC;G3[1]=G7+HD;G3[2]=G8+HE;G3[3]=G9+HF;G3[4]=G_+HG
-;G3[5]=HA+HH;G3[6]=HB+HI;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static void Fd(float*
-Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*G0,int G1){float const
-*G2=Gw+Gx*7;float*restrict G3=Gw;do{float const*G4=Gy+Gz->A*7;float const*G5=G0;
-float G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI,HJ;HJ=G5[0];G6=G4[0]*HJ;G7=G4[1]
-*HJ;G8=G4[2]*HJ;G9=G4[3]*HJ;G_=G4[4]*HJ;HA=G4[5]*HJ;HB=G4[6]*HJ;HJ=G5[1];HC=G4[7
-]*HJ;HD=G4[8]*HJ;HE=G4[9]*HJ;HF=G4[10]*HJ;HG=G4[11]*HJ;HH=G4[12]*HJ;HI=G4[13]*HJ
-;HJ=G5[2];G6+=G4[14]*HJ;G7+=G4[15]*HJ;G8+=G4[16]*HJ;G9+=G4[17]*HJ;G_+=G4[18]*HJ;
-HA+=G4[19]*HJ;HB+=G4[20]*HJ;HJ=G5[3];HC+=G4[21]*HJ;HD+=G4[22]*HJ;HE+=G4[23]*HJ;
-HF+=G4[24]*HJ;HG+=G4[25]*HJ;HH+=G4[26]*HJ;HI+=G4[27]*HJ;HJ=G5[4];G6+=G4[28]*HJ;
-G7+=G4[29]*HJ;G8+=G4[30]*HJ;G9+=G4[31]*HJ;G_+=G4[32]*HJ;HA+=G4[33]*HJ;HB+=G4[34]
-*HJ;HJ=G5[5];HC+=G4[35]*HJ;HD+=G4[36]*HJ;HE+=G4[37]*HJ;HF+=G4[38]*HJ;HG+=G4[39]*
-HJ;HH+=G4[40]*HJ;HI+=G4[41]*HJ;HJ=G5[6];G6+=G4[42]*HJ;G7+=G4[43]*HJ;G8+=G4[44]*
-HJ;G9+=G4[45]*HJ;G_+=G4[46]*HJ;HA+=G4[47]*HJ;HB+=G4[48]*HJ;HJ=G5[7];HC+=G4[49]*
-HJ;HD+=G4[50]*HJ;HE+=G4[51]*HJ;HF+=G4[52]*HJ;HG+=G4[53]*HJ;HH+=G4[54]*HJ;HI+=G4[
-55]*HJ;HJ=G5[8];G6+=G4[56]*HJ;G7+=G4[57]*HJ;G8+=G4[58]*HJ;G9+=G4[59]*HJ;G_+=G4[
-60]*HJ;HA+=G4[61]*HJ;HB+=G4[62]*HJ;HJ=G5[9];HC+=G4[63]*HJ;HD+=G4[64]*HJ;HE+=G4[
-65]*HJ;HF+=G4[66]*HJ;HG+=G4[67]*HJ;HH+=G4[68]*HJ;HI+=G4[69]*HJ;G3[0]=G6+HC;G3[1]
-=G7+HD;G3[2]=G8+HE;G3[3]=G9+HF;G3[4]=G_+HG;G3[5]=HA+HH;G3[6]=HB+HI;G0+=G1;++Gz;
-G3+=7;}while(G3<G2);}static void Fe(float*Gw,unsigned int Gx,float const*Gy,B4//
-const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*7;float*restrict G3=Gw;do{
-float const*G4=Gy+Gz->A*7;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,
-HF,HG,HH,HI,HJ;HJ=G5[0];G6=G4[0]*HJ;G7=G4[1]*HJ;G8=G4[2]*HJ;G9=G4[3]*HJ;G_=G4[4]
-*HJ;HA=G4[5]*HJ;HB=G4[6]*HJ;HJ=G5[1];HC=G4[7]*HJ;HD=G4[8]*HJ;HE=G4[9]*HJ;HF=G4[
-10]*HJ;HG=G4[11]*HJ;HH=G4[12]*HJ;HI=G4[13]*HJ;HJ=G5[2];G6+=G4[14]*HJ;G7+=G4[15]*
-HJ;G8+=G4[16]*HJ;G9+=G4[17]*HJ;G_+=G4[18]*HJ;HA+=G4[19]*HJ;HB+=G4[20]*HJ;HJ=G5[3
-];HC+=G4[21]*HJ;HD+=G4[22]*HJ;HE+=G4[23]*HJ;HF+=G4[24]*HJ;HG+=G4[25]*HJ;HH+=G4[
-26]*HJ;HI+=G4[27]*HJ;HJ=G5[4];G6+=G4[28]*HJ;G7+=G4[29]*HJ;G8+=G4[30]*HJ;G9+=G4[
-31]*HJ;G_+=G4[32]*HJ;HA+=G4[33]*HJ;HB+=G4[34]*HJ;HJ=G5[5];HC+=G4[35]*HJ;HD+=G4[
-36]*HJ;HE+=G4[37]*HJ;HF+=G4[38]*HJ;HG+=G4[39]*HJ;HH+=G4[40]*HJ;HI+=G4[41]*HJ;HJ=
-G5[6];G6+=G4[42]*HJ;G7+=G4[43]*HJ;G8+=G4[44]*HJ;G9+=G4[45]*HJ;G_+=G4[46]*HJ;HA+=
-G4[47]*HJ;HB+=G4[48]*HJ;HJ=G5[7];HC+=G4[49]*HJ;HD+=G4[50]*HJ;HE+=G4[51]*HJ;HF+=
-G4[52]*HJ;HG+=G4[53]*HJ;HH+=G4[54]*HJ;HI+=G4[55]*HJ;HJ=G5[8];G6+=G4[56]*HJ;G7+=
-G4[57]*HJ;G8+=G4[58]*HJ;G9+=G4[59]*HJ;G_+=G4[60]*HJ;HA+=G4[61]*HJ;HB+=G4[62]*HJ;
-HJ=G5[9];HC+=G4[63]*HJ;HD+=G4[64]*HJ;HE+=G4[65]*HJ;HF+=G4[66]*HJ;HG+=G4[67]*HJ;
-HH+=G4[68]*HJ;HI+=G4[69]*HJ;HJ=G5[10];G6+=G4[70]*HJ;G7+=G4[71]*HJ;G8+=G4[72]*HJ;
-G9+=G4[73]*HJ;G_+=G4[74]*HJ;HA+=G4[75]*HJ;HB+=G4[76]*HJ;G3[0]=G6+HC;G3[1]=G7+HD;
-G3[2]=G8+HE;G3[3]=G9+HF;G3[4]=G_+HG;G3[5]=HA+HH;G3[6]=HB+HI;G0+=G1;++Gz;G3+=7;}
-while(G3<G2);}static void Ff(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz
-,float const*G0,int G1){float const*G2=Gw+Gx*7;float*restrict G3=Gw;do{float////
-const*G4=Gy+Gz->A*7;float const*G5=G0;float G6,G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,
-HH,HI,HJ;HJ=G5[0];G6=G4[0]*HJ;G7=G4[1]*HJ;G8=G4[2]*HJ;G9=G4[3]*HJ;G_=G4[4]*HJ;HA
-=G4[5]*HJ;HB=G4[6]*HJ;HJ=G5[1];HC=G4[7]*HJ;HD=G4[8]*HJ;HE=G4[9]*HJ;HF=G4[10]*HJ;
-HG=G4[11]*HJ;HH=G4[12]*HJ;HI=G4[13]*HJ;HJ=G5[2];G6+=G4[14]*HJ;G7+=G4[15]*HJ;G8+=
-G4[16]*HJ;G9+=G4[17]*HJ;G_+=G4[18]*HJ;HA+=G4[19]*HJ;HB+=G4[20]*HJ;HJ=G5[3];HC+=
-G4[21]*HJ;HD+=G4[22]*HJ;HE+=G4[23]*HJ;HF+=G4[24]*HJ;HG+=G4[25]*HJ;HH+=G4[26]*HJ;
-HI+=G4[27]*HJ;HJ=G5[4];G6+=G4[28]*HJ;G7+=G4[29]*HJ;G8+=G4[30]*HJ;G9+=G4[31]*HJ;
-G_+=G4[32]*HJ;HA+=G4[33]*HJ;HB+=G4[34]*HJ;HJ=G5[5];HC+=G4[35]*HJ;HD+=G4[36]*HJ;
-HE+=G4[37]*HJ;HF+=G4[38]*HJ;HG+=G4[39]*HJ;HH+=G4[40]*HJ;HI+=G4[41]*HJ;HJ=G5[6];
-G6+=G4[42]*HJ;G7+=G4[43]*HJ;G8+=G4[44]*HJ;G9+=G4[45]*HJ;G_+=G4[46]*HJ;HA+=G4[47]
-*HJ;HB+=G4[48]*HJ;HJ=G5[7];HC+=G4[49]*HJ;HD+=G4[50]*HJ;HE+=G4[51]*HJ;HF+=G4[52]*
-HJ;HG+=G4[53]*HJ;HH+=G4[54]*HJ;HI+=G4[55]*HJ;HJ=G5[8];G6+=G4[56]*HJ;G7+=G4[57]*
-HJ;G8+=G4[58]*HJ;G9+=G4[59]*HJ;G_+=G4[60]*HJ;HA+=G4[61]*HJ;HB+=G4[62]*HJ;HJ=G5[9
-];HC+=G4[63]*HJ;HD+=G4[64]*HJ;HE+=G4[65]*HJ;HF+=G4[66]*HJ;HG+=G4[67]*HJ;HH+=G4[
-68]*HJ;HI+=G4[69]*HJ;HJ=G5[10];G6+=G4[70]*HJ;G7+=G4[71]*HJ;G8+=G4[72]*HJ;G9+=G4[
-73]*HJ;G_+=G4[74]*HJ;HA+=G4[75]*HJ;HB+=G4[76]*HJ;HJ=G5[11];HC+=G4[77]*HJ;HD+=G4[
-78]*HJ;HE+=G4[79]*HJ;HF+=G4[80]*HJ;HG+=G4[81]*HJ;HH+=G4[82]*HJ;HI+=G4[83]*HJ;G3[
-0]=G6+HC;G3[1]=G7+HD;G3[2]=G8+HE;G3[3]=G9+HF;G3[4]=G_+HG;G3[5]=HA+HH;G3[6]=HB+HI
-;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static void Fg(float*Gw,unsigned int Gx,float
-const*Gy,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*7;float* //////
-restrict G3=Gw;do{float const*G4=Gy+Gz->A*7;int G5=((Gz->B-Gz->A+1)-4+3)>>2;////
-float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI,HJ,HK;HK=G6[0];G7
-=G4[0]*HK;G8=G4[1]*HK;G9=G4[2]*HK;G_=G4[3]*HK;HA=G4[4]*HK;HB=G4[5]*HK;HC=G4[6]*
-HK;HK=G6[1];HD=G4[7]*HK;HE=G4[8]*HK;HF=G4[9]*HK;HG=G4[10]*HK;HH=G4[11]*HK;HI=G4[
-12]*HK;HJ=G4[13]*HK;HK=G6[2];G7+=G4[14]*HK;G8+=G4[15]*HK;G9+=G4[16]*HK;G_+=G4[17
-]*HK;HA+=G4[18]*HK;HB+=G4[19]*HK;HC+=G4[20]*HK;HK=G6[3];HD+=G4[21]*HK;HE+=G4[22]
-*HK;HF+=G4[23]*HK;HG+=G4[24]*HK;HH+=G4[25]*HK;HI+=G4[26]*HK;HJ+=G4[27]*HK;do{G6
-+=4;G4+=28;HK=G6[0];G7+=G4[0]*HK;G8+=G4[1]*HK;G9+=G4[2]*HK;G_+=G4[3]*HK;HA+=G4[4
-]*HK;HB+=G4[5]*HK;HC+=G4[6]*HK;HK=G6[1];HD+=G4[7]*HK;HE+=G4[8]*HK;HF+=G4[9]*HK;
-HG+=G4[10]*HK;HH+=G4[11]*HK;HI+=G4[12]*HK;HJ+=G4[13]*HK;HK=G6[2];G7+=G4[14]*HK;
-G8+=G4[15]*HK;G9+=G4[16]*HK;G_+=G4[17]*HK;HA+=G4[18]*HK;HB+=G4[19]*HK;HC+=G4[20]
-*HK;HK=G6[3];HD+=G4[21]*HK;HE+=G4[22]*HK;HF+=G4[23]*HK;HG+=G4[24]*HK;HH+=G4[25]*
-HK;HI+=G4[26]*HK;HJ+=G4[27]*HK;--G5;}while(G5>0);G3[0]=G7+HD;G3[1]=G8+HE;G3[2]=
-G9+HF;G3[3]=G_+HG;G3[4]=HA+HH;G3[5]=HB+HI;G3[6]=HC+HJ;G0+=G1;++Gz;G3+=7;}while(
-G3<G2);}static void Fh(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float
-const*G0,int G1){float const*G2=Gw+Gx*7;float*restrict G3=Gw;do{float const*G4=
-Gy+Gz->A*7;int G5=((Gz->B-Gz->A+1)-5+3)>>2;float const*G6=G0;float G7,G8,G9,G_,
-HA,HB,HC,HD,HE,HF,HG,HH,HI,HJ,HK;HK=G6[0];G7=G4[0]*HK;G8=G4[1]*HK;G9=G4[2]*HK;G_
-=G4[3]*HK;HA=G4[4]*HK;HB=G4[5]*HK;HC=G4[6]*HK;HK=G6[1];HD=G4[7]*HK;HE=G4[8]*HK;
-HF=G4[9]*HK;HG=G4[10]*HK;HH=G4[11]*HK;HI=G4[12]*HK;HJ=G4[13]*HK;HK=G6[2];G7+=G4[
-14]*HK;G8+=G4[15]*HK;G9+=G4[16]*HK;G_+=G4[17]*HK;HA+=G4[18]*HK;HB+=G4[19]*HK;HC
-+=G4[20]*HK;HK=G6[3];HD+=G4[21]*HK;HE+=G4[22]*HK;HF+=G4[23]*HK;HG+=G4[24]*HK;HH
-+=G4[25]*HK;HI+=G4[26]*HK;HJ+=G4[27]*HK;do{G6+=4;G4+=28;HK=G6[0];G7+=G4[0]*HK;G8
-+=G4[1]*HK;G9+=G4[2]*HK;G_+=G4[3]*HK;HA+=G4[4]*HK;HB+=G4[5]*HK;HC+=G4[6]*HK;HK=
-G6[1];HD+=G4[7]*HK;HE+=G4[8]*HK;HF+=G4[9]*HK;HG+=G4[10]*HK;HH+=G4[11]*HK;HI+=G4[
-12]*HK;HJ+=G4[13]*HK;HK=G6[2];G7+=G4[14]*HK;G8+=G4[15]*HK;G9+=G4[16]*HK;G_+=G4[
-17]*HK;HA+=G4[18]*HK;HB+=G4[19]*HK;HC+=G4[20]*HK;HK=G6[3];HD+=G4[21]*HK;HE+=G4[
-22]*HK;HF+=G4[23]*HK;HG+=G4[24]*HK;HH+=G4[25]*HK;HI+=G4[26]*HK;HJ+=G4[27]*HK;--
-G5;}while(G5>0);HK=G6[4];G7+=G4[28]*HK;G8+=G4[29]*HK;G9+=G4[30]*HK;G_+=G4[31]*HK
-;HA+=G4[32]*HK;HB+=G4[33]*HK;HC+=G4[34]*HK;G3[0]=G7+HD;G3[1]=G8+HE;G3[2]=G9+HF;
-G3[3]=G_+HG;G3[4]=HA+HH;G3[5]=HB+HI;G3[6]=HC+HJ;G0+=G1;++Gz;G3+=7;}while(G3<G2);
-}static void Fi(float*Gw,unsigned int Gx,float const*Gy,B4 const*Gz,float const*
-G0,int G1){float const*G2=Gw+Gx*7;float*restrict G3=Gw;do{float const*G4=Gy+Gz->
-A*7;int G5=((Gz->B-Gz->A+1)-6+3)>>2;float const*G6=G0;float G7,G8,G9,G_,HA,HB,HC
-,HD,HE,HF,HG,HH,HI,HJ,HK;HK=G6[0];G7=G4[0]*HK;G8=G4[1]*HK;G9=G4[2]*HK;G_=G4[3]*
-HK;HA=G4[4]*HK;HB=G4[5]*HK;HC=G4[6]*HK;HK=G6[1];HD=G4[7]*HK;HE=G4[8]*HK;HF=G4[9]
-*HK;HG=G4[10]*HK;HH=G4[11]*HK;HI=G4[12]*HK;HJ=G4[13]*HK;HK=G6[2];G7+=G4[14]*HK;
-G8+=G4[15]*HK;G9+=G4[16]*HK;G_+=G4[17]*HK;HA+=G4[18]*HK;HB+=G4[19]*HK;HC+=G4[20]
-*HK;HK=G6[3];HD+=G4[21]*HK;HE+=G4[22]*HK;HF+=G4[23]*HK;HG+=G4[24]*HK;HH+=G4[25]*
-HK;HI+=G4[26]*HK;HJ+=G4[27]*HK;do{G6+=4;G4+=28;HK=G6[0];G7+=G4[0]*HK;G8+=G4[1]*
-HK;G9+=G4[2]*HK;G_+=G4[3]*HK;HA+=G4[4]*HK;HB+=G4[5]*HK;HC+=G4[6]*HK;HK=G6[1];HD
-+=G4[7]*HK;HE+=G4[8]*HK;HF+=G4[9]*HK;HG+=G4[10]*HK;HH+=G4[11]*HK;HI+=G4[12]*HK;
-HJ+=G4[13]*HK;HK=G6[2];G7+=G4[14]*HK;G8+=G4[15]*HK;G9+=G4[16]*HK;G_+=G4[17]*HK;
-HA+=G4[18]*HK;HB+=G4[19]*HK;HC+=G4[20]*HK;HK=G6[3];HD+=G4[21]*HK;HE+=G4[22]*HK;
-HF+=G4[23]*HK;HG+=G4[24]*HK;HH+=G4[25]*HK;HI+=G4[26]*HK;HJ+=G4[27]*HK;--G5;}////
-while(G5>0);HK=G6[4];G7+=G4[28]*HK;G8+=G4[29]*HK;G9+=G4[30]*HK;G_+=G4[31]*HK;HA
-+=G4[32]*HK;HB+=G4[33]*HK;HC+=G4[34]*HK;HK=G6[5];HD+=G4[35]*HK;HE+=G4[36]*HK;HF
-+=G4[37]*HK;HG+=G4[38]*HK;HH+=G4[39]*HK;HI+=G4[40]*HK;HJ+=G4[41]*HK;G3[0]=G7+HD;
-G3[1]=G8+HE;G3[2]=G9+HF;G3[3]=G_+HG;G3[4]=HA+HH;G3[5]=HB+HI;G3[6]=HC+HJ;G0+=G1;
-++Gz;G3+=7;}while(G3<G2);}static void Fj(float*Gw,unsigned int Gx,float const*Gy
-,B4 const*Gz,float const*G0,int G1){float const*G2=Gw+Gx*7;float*restrict G3=Gw;
-do{float const*G4=Gy+Gz->A*7;int G5=((Gz->B-Gz->A+1)-7+3)>>2;float const*G6=G0;
-float G7,G8,G9,G_,HA,HB,HC,HD,HE,HF,HG,HH,HI,HJ,HK;HK=G6[0];G7=G4[0]*HK;G8=G4[1]
-*HK;G9=G4[2]*HK;G_=G4[3]*HK;HA=G4[4]*HK;HB=G4[5]*HK;HC=G4[6]*HK;HK=G6[1];HD=G4[7
-]*HK;HE=G4[8]*HK;HF=G4[9]*HK;HG=G4[10]*HK;HH=G4[11]*HK;HI=G4[12]*HK;HJ=G4[13]*HK
-;HK=G6[2];G7+=G4[14]*HK;G8+=G4[15]*HK;G9+=G4[16]*HK;G_+=G4[17]*HK;HA+=G4[18]*HK;
-HB+=G4[19]*HK;HC+=G4[20]*HK;HK=G6[3];HD+=G4[21]*HK;HE+=G4[22]*HK;HF+=G4[23]*HK;
-HG+=G4[24]*HK;HH+=G4[25]*HK;HI+=G4[26]*HK;HJ+=G4[27]*HK;do{G6+=4;G4+=28;HK=G6[0]
-;G7+=G4[0]*HK;G8+=G4[1]*HK;G9+=G4[2]*HK;G_+=G4[3]*HK;HA+=G4[4]*HK;HB+=G4[5]*HK;
-HC+=G4[6]*HK;HK=G6[1];HD+=G4[7]*HK;HE+=G4[8]*HK;HF+=G4[9]*HK;HG+=G4[10]*HK;HH+=
-G4[11]*HK;HI+=G4[12]*HK;HJ+=G4[13]*HK;HK=G6[2];G7+=G4[14]*HK;G8+=G4[15]*HK;G9+=
-G4[16]*HK;G_+=G4[17]*HK;HA+=G4[18]*HK;HB+=G4[19]*HK;HC+=G4[20]*HK;HK=G6[3];HD+=
-G4[21]*HK;HE+=G4[22]*HK;HF+=G4[23]*HK;HG+=G4[24]*HK;HH+=G4[25]*HK;HI+=G4[26]*HK;
-HJ+=G4[27]*HK;--G5;}while(G5>0);HK=G6[4];G7+=G4[28]*HK;G8+=G4[29]*HK;G9+=G4[30]*
-HK;G_+=G4[31]*HK;HA+=G4[32]*HK;HB+=G4[33]*HK;HC+=G4[34]*HK;HK=G6[5];HD+=G4[35]*
-HK;HE+=G4[36]*HK;HF+=G4[37]*HK;HG+=G4[38]*HK;HH+=G4[39]*HK;HI+=G4[40]*HK;HJ+=G4[
-41]*HK;HK=G6[6];G7+=G4[42]*HK;G8+=G4[43]*HK;G9+=G4[44]*HK;G_+=G4[45]*HK;HA+=G4[
-46]*HK;HB+=G4[47]*HK;HC+=G4[48]*HK;G3[0]=G7+HD;G3[1]=G8+HE;G3[2]=G9+HF;G3[3]=G_+
-HG;G3[4]=HA+HH;G3[5]=HB+HI;G3[6]=HC+HJ;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static//
-CC*Fk[4]={Fg,Fh,Fi,Fj,};static CC*Fl[12]={FU,FV,FW,FX,FY,FZ,Fa,Fb,Fc,Fd,Fe,Ff,};
-static void Fm(float**Gw,float const*Gx,float const*Gy,float const*Gz){float* //
-restrict G0=Gw[0];float G1=Gx[0];_Pragma("GCC unroll 1")_Pragma("GCC novector")
-while(((char*)Gz-(char*)Gy)>=16){float G2,G3,G4,G5;asm(""::"r"(Gy));G2=Gy[0],G3=
-Gy[1],G4=Gy[2],G5=Gy[3];G0[0]=(G2*G1);G0[1]=(G3*G1);G0[2]=(G4*G1);G0[3]=(G5*G1);
-Gy+=4;G0+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gy<Gz){float G2
-=Gy[0];asm(""::"r"(G0));G0[0]=(G2*G1);++Gy;++G0;}}static void Fn(float*Gw,float
-const*Gx,float const**Gy,float const*Gz){float*restrict G0=Gw;float const*G1=Gy[
-0];float G2=Gx[0];if((G2>=1e00)&&(G2<=1e00)){memcpy(G0,G1,(char*)Gz-(char*)G1);
-return;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)G1
-)>=16){float G3,G4,G5,G6;asm(""::"r"(G0));G3=G1[0]*G2;G4=G1[1]*G2;G5=G1[2]*G2;G6
-=G1[3]*G2;G0[0]=G3;G0[1]=G4;G0[2]=G5;G0[3]=G6;G0+=4;G1+=4;}_Pragma(/////////////
-"GCC unroll 1")_Pragma("GCC novector")while(G1<Gz){float G3;asm(""::"r"(G0));G3=
-G1[0]*G2;G0[0]=G3;++G0;++G1;}}static void Fo(float**Gw,float const*Gx,float/////
-const*Gy,float const*Gz){float*restrict G0=Gw[0];float G1=Gx[0];_Pragma(////////
-"GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)Gy)>=16){float G2,
-G3,G4,G5;asm(""::"r"(Gy));G2=Gy[0],G3=Gy[1],G4=Gy[2],G5=Gy[3];G0[0]+=(G2*G1);G0[
-1]+=(G3*G1);G0[2]+=(G4*G1);G0[3]+=(G5*G1);Gy+=4;G0+=4;}_Pragma("GCC unroll 1")//
-_Pragma("GCC novector")while(Gy<Gz){float G2=Gy[0];asm(""::"r"(G0));G0[0]+=(G2*
-G1);++Gy;++G0;}}static void Fp(float*Gw,float const*Gx,float const**Gy,float////
-const*Gz){float*restrict G0=Gw;float const*G1=Gy[0];float G2=Gx[0];_Pragma(/////
-"GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)G1)>=16){float G3,
-G4,G5,G6;asm(""::"r"(G0));G3=G0[0]+G1[0]*G2;G4=G0[1]+G1[1]*G2;G5=G0[2]+G1[2]*G2;
-G6=G0[3]+G1[3]*G2;G0[0]=G3;G0[1]=G4;G0[2]=G5;G0[3]=G6;G0+=4;G1+=4;}_Pragma(/////
-"GCC unroll 1")_Pragma("GCC novector")while(G1<Gz){float G3;asm(""::"r"(G0));G3=
-G0[0]+G1[0]*G2;G0[0]=G3;++G0;++G1;}}static void Fq(float**Gw,float const*Gx,////
-float const*Gy,float const*Gz){float*restrict G0=Gw[0];float G1=Gx[0];float* ///
-restrict G2=Gw[1];float G3=Gx[1];_Pragma("GCC unroll 1")_Pragma("GCC novector")
-while(((char*)Gz-(char*)Gy)>=16){float G4,G5,G6,G7;asm(""::"r"(Gy));G4=Gy[0],G5=
-Gy[1],G6=Gy[2],G7=Gy[3];G0[0]=(G4*G1);G0[1]=(G5*G1);G0[2]=(G6*G1);G0[3]=(G7*G1);
-G2[0]=(G4*G3);G2[1]=(G5*G3);G2[2]=(G6*G3);G2[3]=(G7*G3);Gy+=4;G0+=4;G2+=4;}/////
-_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gy<Gz){float G4=Gy[0];asm(""
-::"r"(G0));G0[0]=(G4*G1);G2[0]=(G4*G3);++Gy;++G0;++G2;}}static void Fr(float*Gw,
-float const*Gx,float const**Gy,float const*Gz){float*restrict G0=Gw;float const*
-G1=Gy[0];float G2=Gx[0];float const*G3=Gy[1];float G4=Gx[1];_Pragma(////////////
-"GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)G1)>=16){float G5,
-G6,G7,G8;asm(""::"r"(G0));G5=G1[0]*G2;G6=G1[1]*G2;G7=G1[2]*G2;G8=G1[3]*G2;G5+=G3
-[0]*G4;G6+=G3[1]*G4;G7+=G3[2]*G4;G8+=G3[3]*G4;G0[0]=G5;G0[1]=G6;G0[2]=G7;G0[3]=
-G8;G0+=4;G1+=4;G3+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(G1<Gz)
-{float G5;asm(""::"r"(G0));G5=G1[0]*G2;G5+=G3[0]*G4;G0[0]=G5;++G0;++G1;++G3;}}//
-static void Fs(float**Gw,float const*Gx,float const*Gy,float const*Gz){float* //
-restrict G0=Gw[0];float G1=Gx[0];float*restrict G2=Gw[1];float G3=Gx[1];_Pragma(
-"GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)Gy)>=16){float G4,
-G5,G6,G7;asm(""::"r"(Gy));G4=Gy[0],G5=Gy[1],G6=Gy[2],G7=Gy[3];G0[0]+=(G4*G1);G0[
-1]+=(G5*G1);G0[2]+=(G6*G1);G0[3]+=(G7*G1);G2[0]+=(G4*G3);G2[1]+=(G5*G3);G2[2]+=(
-G6*G3);G2[3]+=(G7*G3);Gy+=4;G0+=4;G2+=4;}_Pragma("GCC unroll 1")_Pragma(////////
-"GCC novector")while(Gy<Gz){float G4=Gy[0];asm(""::"r"(G0));G0[0]+=(G4*G1);G2[0]
-+=(G4*G3);++Gy;++G0;++G2;}}static void Ft(float*Gw,float const*Gx,float const**
-Gy,float const*Gz){float*restrict G0=Gw;float const*G1=Gy[0];float G2=Gx[0];////
-float const*G3=Gy[1];float G4=Gx[1];_Pragma("GCC unroll 1")_Pragma(/////////////
-"GCC novector")while(((char*)Gz-(char*)G1)>=16){float G5,G6,G7,G8;asm(""::"r"(G0
-));G5=G0[0]+G1[0]*G2;G6=G0[1]+G1[1]*G2;G7=G0[2]+G1[2]*G2;G8=G0[3]+G1[3]*G2;G5+=
-G3[0]*G4;G6+=G3[1]*G4;G7+=G3[2]*G4;G8+=G3[3]*G4;G0[0]=G5;G0[1]=G6;G0[2]=G7;G0[3]
-=G8;G0+=4;G1+=4;G3+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(G1<Gz
-){float G5;asm(""::"r"(G0));G5=G0[0]+G1[0]*G2;G5+=G3[0]*G4;G0[0]=G5;++G0;++G1;++
-G3;}}static void Fu(float**Gw,float const*Gx,float const*Gy,float const*Gz){////
-float*restrict G0=Gw[0];float G1=Gx[0];float*restrict G2=Gw[1];float G3=Gx[1];//
-float*restrict G4=Gw[2];float G5=Gx[2];_Pragma("GCC unroll 1")_Pragma(//////////
-"GCC novector")while(((char*)Gz-(char*)Gy)>=16){float G6,G7,G8,G9;asm(""::"r"(Gy
-));G6=Gy[0],G7=Gy[1],G8=Gy[2],G9=Gy[3];G0[0]=(G6*G1);G0[1]=(G7*G1);G0[2]=(G8*G1)
-;G0[3]=(G9*G1);G2[0]=(G6*G3);G2[1]=(G7*G3);G2[2]=(G8*G3);G2[3]=(G9*G3);G4[0]=(G6
-*G5);G4[1]=(G7*G5);G4[2]=(G8*G5);G4[3]=(G9*G5);Gy+=4;G0+=4;G2+=4;G4+=4;}_Pragma(
-"GCC unroll 1")_Pragma("GCC novector")while(Gy<Gz){float G6=Gy[0];asm(""::"r"(G0
-));G0[0]=(G6*G1);G2[0]=(G6*G3);G4[0]=(G6*G5);++Gy;++G0;++G2;++G4;}}static void//
-Fv(float*Gw,float const*Gx,float const**Gy,float const*Gz){float*restrict G0=Gw;
-float const*G1=Gy[0];float G2=Gx[0];float const*G3=Gy[1];float G4=Gx[1];float///
-const*G5=Gy[2];float G6=Gx[2];_Pragma("GCC unroll 1")_Pragma("GCC novector")////
-while(((char*)Gz-(char*)G1)>=16){float G7,G8,G9,G_;asm(""::"r"(G0));G7=G1[0]*G2;
-G8=G1[1]*G2;G9=G1[2]*G2;G_=G1[3]*G2;G7+=G3[0]*G4;G8+=G3[1]*G4;G9+=G3[2]*G4;G_+=
-G3[3]*G4;G7+=G5[0]*G6;G8+=G5[1]*G6;G9+=G5[2]*G6;G_+=G5[3]*G6;G0[0]=G7;G0[1]=G8;
-G0[2]=G9;G0[3]=G_;G0+=4;G1+=4;G3+=4;G5+=4;}_Pragma("GCC unroll 1")_Pragma(//////
-"GCC novector")while(G1<Gz){float G7;asm(""::"r"(G0));G7=G1[0]*G2;G7+=G3[0]*G4;
-G7+=G5[0]*G6;G0[0]=G7;++G0;++G1;++G3;++G5;}}static void Fw(float**Gw,float const
-*Gx,float const*Gy,float const*Gz){float*restrict G0=Gw[0];float G1=Gx[0];float*
-restrict G2=Gw[1];float G3=Gx[1];float*restrict G4=Gw[2];float G5=Gx[2];_Pragma(
-"GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)Gy)>=16){float G6,
-G7,G8,G9;asm(""::"r"(Gy));G6=Gy[0],G7=Gy[1],G8=Gy[2],G9=Gy[3];G0[0]+=(G6*G1);G0[
-1]+=(G7*G1);G0[2]+=(G8*G1);G0[3]+=(G9*G1);G2[0]+=(G6*G3);G2[1]+=(G7*G3);G2[2]+=(
-G8*G3);G2[3]+=(G9*G3);G4[0]+=(G6*G5);G4[1]+=(G7*G5);G4[2]+=(G8*G5);G4[3]+=(G9*G5
-);Gy+=4;G0+=4;G2+=4;G4+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(
-Gy<Gz){float G6=Gy[0];asm(""::"r"(G0));G0[0]+=(G6*G1);G2[0]+=(G6*G3);G4[0]+=(G6*
-G5);++Gy;++G0;++G2;++G4;}}static void Fx(float*Gw,float const*Gx,float const**Gy
-,float const*Gz){float*restrict G0=Gw;float const*G1=Gy[0];float G2=Gx[0];float
-const*G3=Gy[1];float G4=Gx[1];float const*G5=Gy[2];float G6=Gx[2];_Pragma(//////
-"GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)G1)>=16){float G7,
-G8,G9,G_;asm(""::"r"(G0));G7=G0[0]+G1[0]*G2;G8=G0[1]+G1[1]*G2;G9=G0[2]+G1[2]*G2;
-G_=G0[3]+G1[3]*G2;G7+=G3[0]*G4;G8+=G3[1]*G4;G9+=G3[2]*G4;G_+=G3[3]*G4;G7+=G5[0]*
-G6;G8+=G5[1]*G6;G9+=G5[2]*G6;G_+=G5[3]*G6;G0[0]=G7;G0[1]=G8;G0[2]=G9;G0[3]=G_;G0
-+=4;G1+=4;G3+=4;G5+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(G1<Gz
-){float G7;asm(""::"r"(G0));G7=G0[0]+G1[0]*G2;G7+=G3[0]*G4;G7+=G5[0]*G6;G0[0]=G7
-;++G0;++G1;++G3;++G5;}}static void Fy(float**Gw,float const*Gx,float const*Gy,//
-float const*Gz){float*restrict G0=Gw[0];float G1=Gx[0];float*restrict G2=Gw[1];
-float G3=Gx[1];float*restrict G4=Gw[2];float G5=Gx[2];float*restrict G6=Gw[3];//
-float G7=Gx[3];_Pragma("GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(
-char*)Gy)>=16){float G8,G9,G_,HA;asm(""::"r"(Gy));G8=Gy[0],G9=Gy[1],G_=Gy[2],HA=
-Gy[3];G0[0]=(G8*G1);G0[1]=(G9*G1);G0[2]=(G_*G1);G0[3]=(HA*G1);G2[0]=(G8*G3);G2[1
-]=(G9*G3);G2[2]=(G_*G3);G2[3]=(HA*G3);G4[0]=(G8*G5);G4[1]=(G9*G5);G4[2]=(G_*G5);
-G4[3]=(HA*G5);G6[0]=(G8*G7);G6[1]=(G9*G7);G6[2]=(G_*G7);G6[3]=(HA*G7);Gy+=4;G0+=
-4;G2+=4;G4+=4;G6+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gy<Gz){
-float G8=Gy[0];asm(""::"r"(G0));G0[0]=(G8*G1);G2[0]=(G8*G3);G4[0]=(G8*G5);G6[0]=
-(G8*G7);++Gy;++G0;++G2;++G4;++G6;}}static void Fz(float*Gw,float const*Gx,float
-const**Gy,float const*Gz){float*restrict G0=Gw;float const*G1=Gy[0];float G2=Gx[
-0];float const*G3=Gy[1];float G4=Gx[1];float const*G5=Gy[2];float G6=Gx[2];float
-const*G7=Gy[3];float G8=Gx[3];_Pragma("GCC unroll 1")_Pragma("GCC novector")////
-while(((char*)Gz-(char*)G1)>=16){float G9,G_,HA,HB;asm(""::"r"(G0));G9=G1[0]*G2;
-G_=G1[1]*G2;HA=G1[2]*G2;HB=G1[3]*G2;G9+=G3[0]*G4;G_+=G3[1]*G4;HA+=G3[2]*G4;HB+=
-G3[3]*G4;G9+=G5[0]*G6;G_+=G5[1]*G6;HA+=G5[2]*G6;HB+=G5[3]*G6;G9+=G7[0]*G8;G_+=G7
-[1]*G8;HA+=G7[2]*G8;HB+=G7[3]*G8;G0[0]=G9;G0[1]=G_;G0[2]=HA;G0[3]=HB;G0+=4;G1+=4
-;G3+=4;G5+=4;G7+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(G1<Gz){
-float G9;asm(""::"r"(G0));G9=G1[0]*G2;G9+=G3[0]*G4;G9+=G5[0]*G6;G9+=G7[0]*G8;G0[
-0]=G9;++G0;++G1;++G3;++G5;++G7;}}static void F0(float**Gw,float const*Gx,float//
-const*Gy,float const*Gz){float*restrict G0=Gw[0];float G1=Gx[0];float*restrict//
-G2=Gw[1];float G3=Gx[1];float*restrict G4=Gw[2];float G5=Gx[2];float*restrict G6
-=Gw[3];float G7=Gx[3];_Pragma("GCC unroll 1")_Pragma("GCC novector")while(((char
-*)Gz-(char*)Gy)>=16){float G8,G9,G_,HA;asm(""::"r"(Gy));G8=Gy[0],G9=Gy[1],G_=Gy[
-2],HA=Gy[3];G0[0]+=(G8*G1);G0[1]+=(G9*G1);G0[2]+=(G_*G1);G0[3]+=(HA*G1);G2[0]+=(
-G8*G3);G2[1]+=(G9*G3);G2[2]+=(G_*G3);G2[3]+=(HA*G3);G4[0]+=(G8*G5);G4[1]+=(G9*G5
-);G4[2]+=(G_*G5);G4[3]+=(HA*G5);G6[0]+=(G8*G7);G6[1]+=(G9*G7);G6[2]+=(G_*G7);G6[
-3]+=(HA*G7);Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;}_Pragma("GCC unroll 1")_Pragma(//////
-"GCC novector")while(Gy<Gz){float G8=Gy[0];asm(""::"r"(G0));G0[0]+=(G8*G1);G2[0]
-+=(G8*G3);G4[0]+=(G8*G5);G6[0]+=(G8*G7);++Gy;++G0;++G2;++G4;++G6;}}static void//
-F1(float*Gw,float const*Gx,float const**Gy,float const*Gz){float*restrict G0=Gw;
-float const*G1=Gy[0];float G2=Gx[0];float const*G3=Gy[1];float G4=Gx[1];float///
-const*G5=Gy[2];float G6=Gx[2];float const*G7=Gy[3];float G8=Gx[3];_Pragma(//////
-"GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)G1)>=16){float G9,
-G_,HA,HB;asm(""::"r"(G0));G9=G0[0]+G1[0]*G2;G_=G0[1]+G1[1]*G2;HA=G0[2]+G1[2]*G2;
-HB=G0[3]+G1[3]*G2;G9+=G3[0]*G4;G_+=G3[1]*G4;HA+=G3[2]*G4;HB+=G3[3]*G4;G9+=G5[0]*
-G6;G_+=G5[1]*G6;HA+=G5[2]*G6;HB+=G5[3]*G6;G9+=G7[0]*G8;G_+=G7[1]*G8;HA+=G7[2]*G8
-;HB+=G7[3]*G8;G0[0]=G9;G0[1]=G_;G0[2]=HA;G0[3]=HB;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;
-}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(G1<Gz){float G9;asm(""::"r"
-(G0));G9=G0[0]+G1[0]*G2;G9+=G3[0]*G4;G9+=G5[0]*G6;G9+=G7[0]*G8;G0[0]=G9;++G0;++
-G1;++G3;++G5;++G7;}}static void F2(float**Gw,float const*Gx,float const*Gy,float
-const*Gz){float*restrict G0=Gw[0];float G1=Gx[0];float*restrict G2=Gw[1];float//
-G3=Gx[1];float*restrict G4=Gw[2];float G5=Gx[2];float*restrict G6=Gw[3];float G7
-=Gx[3];float*restrict G8=Gw[4];float G9=Gx[4];_Pragma("GCC unroll 1")_Pragma(///
-"GCC novector")while(((char*)Gz-(char*)Gy)>=16){float G_,HA,HB,HC;asm(""::"r"(Gy
-));G_=Gy[0],HA=Gy[1],HB=Gy[2],HC=Gy[3];G0[0]=(G_*G1);G0[1]=(HA*G1);G0[2]=(HB*G1)
-;G0[3]=(HC*G1);G2[0]=(G_*G3);G2[1]=(HA*G3);G2[2]=(HB*G3);G2[3]=(HC*G3);G4[0]=(G_
-*G5);G4[1]=(HA*G5);G4[2]=(HB*G5);G4[3]=(HC*G5);G6[0]=(G_*G7);G6[1]=(HA*G7);G6[2]
-=(HB*G7);G6[3]=(HC*G7);G8[0]=(G_*G9);G8[1]=(HA*G9);G8[2]=(HB*G9);G8[3]=(HC*G9);
-Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;G8+=4;}_Pragma("GCC unroll 1")_Pragma(////////////
-"GCC novector")while(Gy<Gz){float G_=Gy[0];asm(""::"r"(G0));G0[0]=(G_*G1);G2[0]=
-(G_*G3);G4[0]=(G_*G5);G6[0]=(G_*G7);G8[0]=(G_*G9);++Gy;++G0;++G2;++G4;++G6;++G8;
-}}static void F3(float*Gw,float const*Gx,float const**Gy,float const*Gz){float*
-restrict G0=Gw;float const*G1=Gy[0];float G2=Gx[0];float const*G3=Gy[1];float G4
-=Gx[1];float const*G5=Gy[2];float G6=Gx[2];float const*G7=Gy[3];float G8=Gx[3];
-float const*G9=Gy[4];float G_=Gx[4];_Pragma("GCC unroll 1")_Pragma(/////////////
-"GCC novector")while(((char*)Gz-(char*)G1)>=16){float HA,HB,HC,HD;asm(""::"r"(G0
-));HA=G1[0]*G2;HB=G1[1]*G2;HC=G1[2]*G2;HD=G1[3]*G2;HA+=G3[0]*G4;HB+=G3[1]*G4;HC
-+=G3[2]*G4;HD+=G3[3]*G4;HA+=G5[0]*G6;HB+=G5[1]*G6;HC+=G5[2]*G6;HD+=G5[3]*G6;HA+=
-G7[0]*G8;HB+=G7[1]*G8;HC+=G7[2]*G8;HD+=G7[3]*G8;HA+=G9[0]*G_;HB+=G9[1]*G_;HC+=G9
-[2]*G_;HD+=G9[3]*G_;G0[0]=HA;G0[1]=HB;G0[2]=HC;G0[3]=HD;G0+=4;G1+=4;G3+=4;G5+=4;
-G7+=4;G9+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(G1<Gz){float HA
-;asm(""::"r"(G0));HA=G1[0]*G2;HA+=G3[0]*G4;HA+=G5[0]*G6;HA+=G7[0]*G8;HA+=G9[0]*
-G_;G0[0]=HA;++G0;++G1;++G3;++G5;++G7;++G9;}}static void F4(float**Gw,float const
-*Gx,float const*Gy,float const*Gz){float*restrict G0=Gw[0];float G1=Gx[0];float*
-restrict G2=Gw[1];float G3=Gx[1];float*restrict G4=Gw[2];float G5=Gx[2];float*
-restrict G6=Gw[3];float G7=Gx[3];float*restrict G8=Gw[4];float G9=Gx[4];_Pragma(
-"GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)Gy)>=16){float G_,
-HA,HB,HC;asm(""::"r"(Gy));G_=Gy[0],HA=Gy[1],HB=Gy[2],HC=Gy[3];G0[0]+=(G_*G1);G0[
-1]+=(HA*G1);G0[2]+=(HB*G1);G0[3]+=(HC*G1);G2[0]+=(G_*G3);G2[1]+=(HA*G3);G2[2]+=(
-HB*G3);G2[3]+=(HC*G3);G4[0]+=(G_*G5);G4[1]+=(HA*G5);G4[2]+=(HB*G5);G4[3]+=(HC*G5
-);G6[0]+=(G_*G7);G6[1]+=(HA*G7);G6[2]+=(HB*G7);G6[3]+=(HC*G7);G8[0]+=(G_*G9);G8[
-1]+=(HA*G9);G8[2]+=(HB*G9);G8[3]+=(HC*G9);Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;G8+=4;}
-_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gy<Gz){float G_=Gy[0];asm(""
-::"r"(G0));G0[0]+=(G_*G1);G2[0]+=(G_*G3);G4[0]+=(G_*G5);G6[0]+=(G_*G7);G8[0]+=(
-G_*G9);++Gy;++G0;++G2;++G4;++G6;++G8;}}static void F5(float*Gw,float const*Gx,//
-float const**Gy,float const*Gz){float*restrict G0=Gw;float const*G1=Gy[0];float
-G2=Gx[0];float const*G3=Gy[1];float G4=Gx[1];float const*G5=Gy[2];float G6=Gx[2]
-;float const*G7=Gy[3];float G8=Gx[3];float const*G9=Gy[4];float G_=Gx[4];_Pragma
-("GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)G1)>=16){float HA
-,HB,HC,HD;asm(""::"r"(G0));HA=G0[0]+G1[0]*G2;HB=G0[1]+G1[1]*G2;HC=G0[2]+G1[2]*G2
-;HD=G0[3]+G1[3]*G2;HA+=G3[0]*G4;HB+=G3[1]*G4;HC+=G3[2]*G4;HD+=G3[3]*G4;HA+=G5[0]
-*G6;HB+=G5[1]*G6;HC+=G5[2]*G6;HD+=G5[3]*G6;HA+=G7[0]*G8;HB+=G7[1]*G8;HC+=G7[2]*
-G8;HD+=G7[3]*G8;HA+=G9[0]*G_;HB+=G9[1]*G_;HC+=G9[2]*G_;HD+=G9[3]*G_;G0[0]=HA;G0[
-1]=HB;G0[2]=HC;G0[3]=HD;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;G9+=4;}_Pragma(///////////
-"GCC unroll 1")_Pragma("GCC novector")while(G1<Gz){float HA;asm(""::"r"(G0));HA=
-G0[0]+G1[0]*G2;HA+=G3[0]*G4;HA+=G5[0]*G6;HA+=G7[0]*G8;HA+=G9[0]*G_;G0[0]=HA;++G0
-;++G1;++G3;++G5;++G7;++G9;}}static void F6(float**Gw,float const*Gx,float const*
-Gy,float const*Gz){float*restrict G0=Gw[0];float G1=Gx[0];float*restrict G2=Gw[1
-];float G3=Gx[1];float*restrict G4=Gw[2];float G5=Gx[2];float*restrict G6=Gw[3];
-float G7=Gx[3];float*restrict G8=Gw[4];float G9=Gx[4];float*restrict G_=Gw[5];//
-float HA=Gx[5];_Pragma("GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(
-char*)Gy)>=16){float HB,HC,HD,HE;asm(""::"r"(Gy));HB=Gy[0],HC=Gy[1],HD=Gy[2],HE=
-Gy[3];G0[0]=(HB*G1);G0[1]=(HC*G1);G0[2]=(HD*G1);G0[3]=(HE*G1);G2[0]=(HB*G3);G2[1
-]=(HC*G3);G2[2]=(HD*G3);G2[3]=(HE*G3);G4[0]=(HB*G5);G4[1]=(HC*G5);G4[2]=(HD*G5);
-G4[3]=(HE*G5);G6[0]=(HB*G7);G6[1]=(HC*G7);G6[2]=(HD*G7);G6[3]=(HE*G7);G8[0]=(HB*
-G9);G8[1]=(HC*G9);G8[2]=(HD*G9);G8[3]=(HE*G9);G_[0]=(HB*HA);G_[1]=(HC*HA);G_[2]=
-(HD*HA);G_[3]=(HE*HA);Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;G8+=4;G_+=4;}_Pragma(///////
-"GCC unroll 1")_Pragma("GCC novector")while(Gy<Gz){float HB=Gy[0];asm(""::"r"(G0
-));G0[0]=(HB*G1);G2[0]=(HB*G3);G4[0]=(HB*G5);G6[0]=(HB*G7);G8[0]=(HB*G9);G_[0]=(
-HB*HA);++Gy;++G0;++G2;++G4;++G6;++G8;++G_;}}static void F7(float*Gw,float const*
-Gx,float const**Gy,float const*Gz){float*restrict G0=Gw;float const*G1=Gy[0];///
-float G2=Gx[0];float const*G3=Gy[1];float G4=Gx[1];float const*G5=Gy[2];float G6
-=Gx[2];float const*G7=Gy[3];float G8=Gx[3];float const*G9=Gy[4];float G_=Gx[4];
-float const*HA=Gy[5];float HB=Gx[5];_Pragma("GCC unroll 1")_Pragma(/////////////
-"GCC novector")while(((char*)Gz-(char*)G1)>=16){float HC,HD,HE,HF;asm(""::"r"(G0
-));HC=G1[0]*G2;HD=G1[1]*G2;HE=G1[2]*G2;HF=G1[3]*G2;HC+=G3[0]*G4;HD+=G3[1]*G4;HE
-+=G3[2]*G4;HF+=G3[3]*G4;HC+=G5[0]*G6;HD+=G5[1]*G6;HE+=G5[2]*G6;HF+=G5[3]*G6;HC+=
-G7[0]*G8;HD+=G7[1]*G8;HE+=G7[2]*G8;HF+=G7[3]*G8;HC+=G9[0]*G_;HD+=G9[1]*G_;HE+=G9
-[2]*G_;HF+=G9[3]*G_;HC+=HA[0]*HB;HD+=HA[1]*HB;HE+=HA[2]*HB;HF+=HA[3]*HB;G0[0]=HC
-;G0[1]=HD;G0[2]=HE;G0[3]=HF;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;G9+=4;HA+=4;}_Pragma(
-"GCC unroll 1")_Pragma("GCC novector")while(G1<Gz){float HC;asm(""::"r"(G0));HC=
-G1[0]*G2;HC+=G3[0]*G4;HC+=G5[0]*G6;HC+=G7[0]*G8;HC+=G9[0]*G_;HC+=HA[0]*HB;G0[0]=
-HC;++G0;++G1;++G3;++G5;++G7;++G9;++HA;}}static void F8(float**Gw,float const*Gx,
-float const*Gy,float const*Gz){float*restrict G0=Gw[0];float G1=Gx[0];float* ///
-restrict G2=Gw[1];float G3=Gx[1];float*restrict G4=Gw[2];float G5=Gx[2];float  *
-restrict G6=Gw[3];float G7=Gx[3];float*restrict G8=Gw[4];float G9=Gx[4];float  *
-restrict G_=Gw[5];float HA=Gx[5];_Pragma("GCC unroll 1")_Pragma("GCC novector")
-while(((char*)Gz-(char*)Gy)>=16){float HB,HC,HD,HE;asm(""::"r"(Gy));HB=Gy[0],HC=
-Gy[1],HD=Gy[2],HE=Gy[3];G0[0]+=(HB*G1);G0[1]+=(HC*G1);G0[2]+=(HD*G1);G0[3]+=(HE*
-G1);G2[0]+=(HB*G3);G2[1]+=(HC*G3);G2[2]+=(HD*G3);G2[3]+=(HE*G3);G4[0]+=(HB*G5);
-G4[1]+=(HC*G5);G4[2]+=(HD*G5);G4[3]+=(HE*G5);G6[0]+=(HB*G7);G6[1]+=(HC*G7);G6[2]
-+=(HD*G7);G6[3]+=(HE*G7);G8[0]+=(HB*G9);G8[1]+=(HC*G9);G8[2]+=(HD*G9);G8[3]+=(HE
-*G9);G_[0]+=(HB*HA);G_[1]+=(HC*HA);G_[2]+=(HD*HA);G_[3]+=(HE*HA);Gy+=4;G0+=4;G2
-+=4;G4+=4;G6+=4;G8+=4;G_+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while
-(Gy<Gz){float HB=Gy[0];asm(""::"r"(G0));G0[0]+=(HB*G1);G2[0]+=(HB*G3);G4[0]+=(HB
-*G5);G6[0]+=(HB*G7);G8[0]+=(HB*G9);G_[0]+=(HB*HA);++Gy;++G0;++G2;++G4;++G6;++G8;
-++G_;}}static void F9(float*Gw,float const*Gx,float const**Gy,float const*Gz){//
-float*restrict G0=Gw;float const*G1=Gy[0];float G2=Gx[0];float const*G3=Gy[1];//
-float G4=Gx[1];float const*G5=Gy[2];float G6=Gx[2];float const*G7=Gy[3];float G8
-=Gx[3];float const*G9=Gy[4];float G_=Gx[4];float const*HA=Gy[5];float HB=Gx[5];
-_Pragma("GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)G1)>=16){
-float HC,HD,HE,HF;asm(""::"r"(G0));HC=G0[0]+G1[0]*G2;HD=G0[1]+G1[1]*G2;HE=G0[2]+
-G1[2]*G2;HF=G0[3]+G1[3]*G2;HC+=G3[0]*G4;HD+=G3[1]*G4;HE+=G3[2]*G4;HF+=G3[3]*G4;
-HC+=G5[0]*G6;HD+=G5[1]*G6;HE+=G5[2]*G6;HF+=G5[3]*G6;HC+=G7[0]*G8;HD+=G7[1]*G8;HE
-+=G7[2]*G8;HF+=G7[3]*G8;HC+=G9[0]*G_;HD+=G9[1]*G_;HE+=G9[2]*G_;HF+=G9[3]*G_;HC+=
-HA[0]*HB;HD+=HA[1]*HB;HE+=HA[2]*HB;HF+=HA[3]*HB;G0[0]=HC;G0[1]=HD;G0[2]=HE;G0[3]
-=HF;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;G9+=4;HA+=4;}_Pragma("GCC unroll 1")_Pragma(//
-"GCC novector")while(G1<Gz){float HC;asm(""::"r"(G0));HC=G0[0]+G1[0]*G2;HC+=G3[0
-]*G4;HC+=G5[0]*G6;HC+=G7[0]*G8;HC+=G9[0]*G_;HC+=HA[0]*HB;G0[0]=HC;++G0;++G1;++G3
-;++G5;++G7;++G9;++HA;}}static void F_(float**Gw,float const*Gx,float const*Gy,//
-float const*Gz){float*restrict G0=Gw[0];float G1=Gx[0];float*restrict G2=Gw[1];
-float G3=Gx[1];float*restrict G4=Gw[2];float G5=Gx[2];float*restrict G6=Gw[3];//
-float G7=Gx[3];float*restrict G8=Gw[4];float G9=Gx[4];float*restrict G_=Gw[5];//
-float HA=Gx[5];float*restrict HB=Gw[6];float HC=Gx[6];_Pragma("GCC unroll 1")///
-_Pragma("GCC novector")while(((char*)Gz-(char*)Gy)>=16){float HD,HE,HF,HG;asm(""
-::"r"(Gy));HD=Gy[0],HE=Gy[1],HF=Gy[2],HG=Gy[3];G0[0]=(HD*G1);G0[1]=(HE*G1);G0[2]
-=(HF*G1);G0[3]=(HG*G1);G2[0]=(HD*G3);G2[1]=(HE*G3);G2[2]=(HF*G3);G2[3]=(HG*G3);
-G4[0]=(HD*G5);G4[1]=(HE*G5);G4[2]=(HF*G5);G4[3]=(HG*G5);G6[0]=(HD*G7);G6[1]=(HE*
-G7);G6[2]=(HF*G7);G6[3]=(HG*G7);G8[0]=(HD*G9);G8[1]=(HE*G9);G8[2]=(HF*G9);G8[3]=
-(HG*G9);G_[0]=(HD*HA);G_[1]=(HE*HA);G_[2]=(HF*HA);G_[3]=(HG*HA);HB[0]=(HD*HC);HB
-[1]=(HE*HC);HB[2]=(HF*HC);HB[3]=(HG*HC);Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;G8+=4;G_+=
-4;HB+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gy<Gz){float HD=Gy[
-0];asm(""::"r"(G0));G0[0]=(HD*G1);G2[0]=(HD*G3);G4[0]=(HD*G5);G6[0]=(HD*G7);G8[0
-]=(HD*G9);G_[0]=(HD*HA);HB[0]=(HD*HC);++Gy;++G0;++G2;++G4;++G6;++G8;++G_;++HB;}}
-static void GA(float*Gw,float const*Gx,float const**Gy,float const*Gz){float* //
-restrict G0=Gw;float const*G1=Gy[0];float G2=Gx[0];float const*G3=Gy[1];float G4
-=Gx[1];float const*G5=Gy[2];float G6=Gx[2];float const*G7=Gy[3];float G8=Gx[3];
-float const*G9=Gy[4];float G_=Gx[4];float const*HA=Gy[5];float HB=Gx[5];float///
-const*HC=Gy[6];float HD=Gx[6];_Pragma("GCC unroll 1")_Pragma("GCC novector")////
-while(((char*)Gz-(char*)G1)>=16){float HE,HF,HG,HH;asm(""::"r"(G0));HE=G1[0]*G2;
-HF=G1[1]*G2;HG=G1[2]*G2;HH=G1[3]*G2;HE+=G3[0]*G4;HF+=G3[1]*G4;HG+=G3[2]*G4;HH+=
-G3[3]*G4;HE+=G5[0]*G6;HF+=G5[1]*G6;HG+=G5[2]*G6;HH+=G5[3]*G6;HE+=G7[0]*G8;HF+=G7
-[1]*G8;HG+=G7[2]*G8;HH+=G7[3]*G8;HE+=G9[0]*G_;HF+=G9[1]*G_;HG+=G9[2]*G_;HH+=G9[3
-]*G_;HE+=HA[0]*HB;HF+=HA[1]*HB;HG+=HA[2]*HB;HH+=HA[3]*HB;HE+=HC[0]*HD;HF+=HC[1]*
-HD;HG+=HC[2]*HD;HH+=HC[3]*HD;G0[0]=HE;G0[1]=HF;G0[2]=HG;G0[3]=HH;G0+=4;G1+=4;G3
-+=4;G5+=4;G7+=4;G9+=4;HA+=4;HC+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector"
-)while(G1<Gz){float HE;asm(""::"r"(G0));HE=G1[0]*G2;HE+=G3[0]*G4;HE+=G5[0]*G6;HE
-+=G7[0]*G8;HE+=G9[0]*G_;HE+=HA[0]*HB;HE+=HC[0]*HD;G0[0]=HE;++G0;++G1;++G3;++G5;
-++G7;++G9;++HA;++HC;}}static void GB(float**Gw,float const*Gx,float const*Gy,///
-float const*Gz){float*restrict G0=Gw[0];float G1=Gx[0];float*restrict G2=Gw[1];
-float G3=Gx[1];float*restrict G4=Gw[2];float G5=Gx[2];float*restrict G6=Gw[3];//
-float G7=Gx[3];float*restrict G8=Gw[4];float G9=Gx[4];float*restrict G_=Gw[5];//
-float HA=Gx[5];float*restrict HB=Gw[6];float HC=Gx[6];_Pragma("GCC unroll 1")///
-_Pragma("GCC novector")while(((char*)Gz-(char*)Gy)>=16){float HD,HE,HF,HG;asm(""
-::"r"(Gy));HD=Gy[0],HE=Gy[1],HF=Gy[2],HG=Gy[3];G0[0]+=(HD*G1);G0[1]+=(HE*G1);G0[
-2]+=(HF*G1);G0[3]+=(HG*G1);G2[0]+=(HD*G3);G2[1]+=(HE*G3);G2[2]+=(HF*G3);G2[3]+=(
-HG*G3);G4[0]+=(HD*G5);G4[1]+=(HE*G5);G4[2]+=(HF*G5);G4[3]+=(HG*G5);G6[0]+=(HD*G7
-);G6[1]+=(HE*G7);G6[2]+=(HF*G7);G6[3]+=(HG*G7);G8[0]+=(HD*G9);G8[1]+=(HE*G9);G8[
-2]+=(HF*G9);G8[3]+=(HG*G9);G_[0]+=(HD*HA);G_[1]+=(HE*HA);G_[2]+=(HF*HA);G_[3]+=(
-HG*HA);HB[0]+=(HD*HC);HB[1]+=(HE*HC);HB[2]+=(HF*HC);HB[3]+=(HG*HC);Gy+=4;G0+=4;
-G2+=4;G4+=4;G6+=4;G8+=4;G_+=4;HB+=4;}_Pragma("GCC unroll 1")_Pragma(////////////
-"GCC novector")while(Gy<Gz){float HD=Gy[0];asm(""::"r"(G0));G0[0]+=(HD*G1);G2[0]
+48]*HJ;Zq Fb Z9 HJ=G5[6];G6+=G4[42]*HJ;G7+=G4[43]*HJ;G8+=G4[44]*HJ;G9+=G4[45]*HJ
+;G_+=G4[46]*HJ;HA+=G4[47]*HJ;HB+=G4[48]*HJ;HJ=G5[7];HC+=G4[49]*HJ;HD+=G4[50]*HJ;
+HE+=G4[51]*HJ;HF+=G4[52]*HJ;HG+=G4[53]*HJ;HH+=G4[54]*HJ;HI+=G4[55]*HJ;Zq Fc Zl//
+Zq Fd Zl HJ=G5[9];HC+=G4[63]*HJ;HD+=G4[64]*HJ;HE+=G4[65]*HJ;HF+=G4[66]*HJ;HG+=G4
+[67]*HJ;HH+=G4[68]*HJ;HI+=G4[69]*HJ;Zq Fe Zl HJ=G5[9];HC+=G4[63]*HJ;HD+=G4[64]*
+HJ;HE+=G4[65]*HJ;HF+=G4[66]*HJ;HG+=G4[67]*HJ;HH+=G4[68]*HJ;HI+=G4[69]*HJ;HJ=G5[
+10];G6+=G4[70]*HJ;G7+=G4[71]*HJ;G8+=G4[72]*HJ;G9+=G4[73]*HJ;G_+=G4[74]*HJ;HA+=G4
+[75]*HJ;HB+=G4[76]*HJ;Zq Ff Zl HJ=G5[9];HC+=G4[63]*HJ;HD+=G4[64]*HJ;HE+=G4[65]*
+HJ;HF+=G4[66]*HJ;HG+=G4[67]*HJ;HH+=G4[68]*HJ;HI+=G4[69]*HJ;HJ=G5[10];G6+=G4[70]*
+HJ;G7+=G4[71]*HJ;G8+=G4[72]*HJ;G9+=G4[73]*HJ;G_+=G4[74]*HJ;HA+=G4[75]*HJ;HB+=G4[
+76]*HJ;HJ=G5[11];HC+=G4[77]*HJ;HD+=G4[78]*HJ;HE+=G4[79]*HJ;HF+=G4[80]*HJ;HG+=G4[
+81]*HJ;HH+=G4[82]*HJ;HI+=G4[83]*HJ;Zq Fg(Z1*Gw,unsigned int Gx,Z1 const*Gy,B4///
+const*Gz,Z1 const*G0,int G1){Z1 const*G2=Gw+Gx*7;Z1*RESTRICT G3=Gw;do{Z1 const*
+G4=Gy+Gz->A*7;int G5=((Gz->B-Gz->A+1)-4+3)>>2;Z1 Z0 G3[0]=G7+HD;G3[1]=G8+HE;G3[2
+]=G9+HF;G3[3]=G_+HG;G3[4]=HA+HH;G3[5]=HB+HI;G3[6]=HC+HJ;G0+=G1;++Gz;G3+=7;}while
+(G3<G2);}static void Fh(Z1*Gw,unsigned int Gx,Z1 const*Gy,B4 const*Gz,Z1 const*
+G0,int G1){Z1 const*G2=Gw+Gx*7;Z1*RESTRICT G3=Gw;do{Z1 const*G4=Gy+Gz->A*7;int//
+G5=((Gz->B-Gz->A+1)-5+3)>>2;Z1 Z0 HK=G6[4];G7+=G4[28]*HK;G8+=G4[29]*HK;G9+=G4[30
+]*HK;G_+=G4[31]*HK;HA+=G4[32]*HK;HB+=G4[33]*HK;HC+=G4[34]*HK;G3[0]=G7+HD;G3[1]=
+G8+HE;G3[2]=G9+HF;G3[3]=G_+HG;G3[4]=HA+HH;G3[5]=HB+HI;G3[6]=HC+HJ;G0+=G1;++Gz;G3
++=7;}while(G3<G2);}static void Fi(Z1*Gw,unsigned int Gx,Z1 const*Gy,B4 const*Gz,
+Z1 const*G0,int G1){Z1 const*G2=Gw+Gx*7;Z1*RESTRICT G3=Gw;do{Z1 const*G4=Gy+Gz->
+A*7;int G5=((Gz->B-Gz->A+1)-6+3)>>2;Z1 Z0 HK=G6[4];G7+=G4[28]*HK;G8+=G4[29]*HK;
+G9+=G4[30]*HK;G_+=G4[31]*HK;HA+=G4[32]*HK;HB+=G4[33]*HK;HC+=G4[34]*HK;HK=G6[5];
+HD+=G4[35]*HK;HE+=G4[36]*HK;HF+=G4[37]*HK;HG+=G4[38]*HK;HH+=G4[39]*HK;HI+=G4[40]
+*HK;HJ+=G4[41]*HK;G3[0]=G7+HD;G3[1]=G8+HE;G3[2]=G9+HF;G3[3]=G_+HG;G3[4]=HA+HH;G3
+[5]=HB+HI;G3[6]=HC+HJ;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static void Fj(Z1*Gw,////
+unsigned int Gx,Z1 const*Gy,B4 const*Gz,Z1 const*G0,int G1){Z1 const*G2=Gw+Gx*7;
+Z1*RESTRICT G3=Gw;do{Z1 const*G4=Gy+Gz->A*7;int G5=((Gz->B-Gz->A+1)-7+3)>>2;Z1//
+Z0 HK=G6[4];G7+=G4[28]*HK;G8+=G4[29]*HK;G9+=G4[30]*HK;G_+=G4[31]*HK;HA+=G4[32]*
+HK;HB+=G4[33]*HK;HC+=G4[34]*HK;HK=G6[5];HD+=G4[35]*HK;HE+=G4[36]*HK;HF+=G4[37]*
+HK;HG+=G4[38]*HK;HH+=G4[39]*HK;HI+=G4[40]*HK;HJ+=G4[41]*HK;HK=G6[6];G7+=G4[42]*
+HK;G8+=G4[43]*HK;G9+=G4[44]*HK;G_+=G4[45]*HK;HA+=G4[46]*HK;HB+=G4[47]*HK;HC+=G4[
+48]*HK;G3[0]=G7+HD;G3[1]=G8+HE;G3[2]=G9+HF;G3[3]=G_+HG;G3[4]=HA+HH;G3[5]=HB+HI;
+G3[6]=HC+HJ;G0+=G1;++Gz;G3+=7;}while(G3<G2);}static CC*Fk[4]={Fg,Fh,Fi,Fj,};////
+static CC*Fl[12]={FU,FV,FW,FX,FY,FZ,Fa,Fb,Fc,Fd,Fe,Ff,};static void Fm(Z1**Gw,Z1
+const*Gx,Z1 const*Gy,Z1 const*Gz){Z1*RESTRICT G0=Gw[0];Z1 G1=Gx[0];while(((char*
+)Gz-(char*)Gy)>=16){Z1 G2,G3,G4,G5;G2=Gy[0],G3=Gy[1],G4=Gy[2],G5=Gy[3];G0[0]=(G2
+*G1);G0[1]=(G3*G1);G0[2]=(G4*G1);G0[3]=(G5*G1);Gy+=4;G0+=4;}while(Gy<Gz){Z1 G2=
+Gy[0];G0[0]=(G2*G1);++Gy;++G0;}}static void Fn(Z1*Gw,Z1 const*Gx,Z1 const**Gy,Z1
+const*Gz){Z1*RESTRICT G0=Gw;Z1 const*G1=Gy[0];Z1 G2=Gx[0];if((G2>=1e00)&&(G2<=//
+1e00)){memcpy(G0,G1,(char*)Gz-(char*)G1);return;}while(((char*)Gz-(char*)G1)>=16
+){Z1 G3,G4,G5,G6;G3=G1[0]*G2;G4=G1[1]*G2;G5=G1[2]*G2;G6=G1[3]*G2;G0[0]=G3;G0[1]=
+G4;G0[2]=G5;G0[3]=G6;G0+=4;G1+=4;}while(G1<Gz){Z1 G3;G3=G1[0]*G2;G0[0]=G3;++G0;
+++G1;}}static void Fo(Z1**Gw,Z1 const*Gx,Z1 const*Gy,Z1 const*Gz){Z1*RESTRICT G0
+=Gw[0];Z1 G1=Gx[0];while(((char*)Gz-(char*)Gy)>=16){Z1 G2,G3,G4,G5;G2=Gy[0],G3=
+Gy[1],G4=Gy[2],G5=Gy[3];G0[0]+=(G2*G1);G0[1]+=(G3*G1);G0[2]+=(G4*G1);G0[3]+=(G5*
+G1);Gy+=4;G0+=4;}while(Gy<Gz){Z1 G2=Gy[0];G0[0]+=(G2*G1);++Gy;++G0;}}static void
+Fp(Z1*Gw,Z1 const*Gx,Z1 const**Gy,Z1 const*Gz){Z1*RESTRICT G0=Gw;Z1 const*G1=Gy[
+0];Z1 G2=Gx[0];while(((char*)Gz-(char*)G1)>=16){Z1 G3,G4,G5,G6;G3=G0[0]+G1[0]*G2
+;G4=G0[1]+G1[1]*G2;G5=G0[2]+G1[2]*G2;G6=G0[3]+G1[3]*G2;G0[0]=G3;G0[1]=G4;G0[2]=
+G5;G0[3]=G6;G0+=4;G1+=4;}while(G1<Gz){Z1 G3;G3=G0[0]+G1[0]*G2;G0[0]=G3;++G0;++G1
+;}}static void Fq(Z1**Gw,Z1 const*Gx,Z1 const*Gy,Z1 const*Gz){Z1*RESTRICT G0=Gw[
+0];Z1 G1=Gx[0];Z1*RESTRICT G2=Gw[1];Z1 G3=Gx[1];while(((char*)Gz-(char*)Gy)>=16)
+{Z1 G4,G5,G6,G7;G4=Gy[0],G5=Gy[1],G6=Gy[2],G7=Gy[3];G0[0]=(G4*G1);G0[1]=(G5*G1);
+G0[2]=(G6*G1);G0[3]=(G7*G1);G2[0]=(G4*G3);G2[1]=(G5*G3);G2[2]=(G6*G3);G2[3]=(G7*
+G3);Gy+=4;G0+=4;G2+=4;}while(Gy<Gz){Z1 G4=Gy[0];G0[0]=(G4*G1);G2[0]=(G4*G3);++Gy
+;++G0;++G2;}}static void Fr(Z1*Gw,Z1 const*Gx,Z1 const**Gy,Z1 const*Gz){Z1*/////
+RESTRICT G0=Gw;Z1 const*G1=Gy[0];Z1 G2=Gx[0];Z1 const*G3=Gy[1];Z1 G4=Gx[1];while
+(((char*)Gz-(char*)G1)>=16){Z1 G5,G6,G7,G8;G5=G1[0]*G2;G6=G1[1]*G2;G7=G1[2]*G2;
+G8=G1[3]*G2;G5+=G3[0]*G4;G6+=G3[1]*G4;G7+=G3[2]*G4;G8+=G3[3]*G4;G0[0]=G5;G0[1]=
+G6;G0[2]=G7;G0[3]=G8;G0+=4;G1+=4;G3+=4;}while(G1<Gz){Z1 G5;G5=G1[0]*G2;G5+=G3[0]
+*G4;G0[0]=G5;++G0;++G1;++G3;}}static void Fs(Z1**Gw,Z1 const*Gx,Z1 const*Gy,Z1//
+const*Gz){Z1*RESTRICT G0=Gw[0];Z1 G1=Gx[0];Z1*RESTRICT G2=Gw[1];Z1 G3=Gx[1];////
+while(((char*)Gz-(char*)Gy)>=16){Z1 G4,G5,G6,G7;G4=Gy[0],G5=Gy[1],G6=Gy[2],G7=Gy
+[3];G0[0]+=(G4*G1);G0[1]+=(G5*G1);G0[2]+=(G6*G1);G0[3]+=(G7*G1);G2[0]+=(G4*G3);
+G2[1]+=(G5*G3);G2[2]+=(G6*G3);G2[3]+=(G7*G3);Gy+=4;G0+=4;G2+=4;}while(Gy<Gz){Z1
+G4=Gy[0];G0[0]+=(G4*G1);G2[0]+=(G4*G3);++Gy;++G0;++G2;}}static void Ft(Z1*Gw,Z1
+const*Gx,Z1 const**Gy,Z1 const*Gz){Z1*RESTRICT G0=Gw;Z1 const*G1=Gy[0];Z1 G2=Gx[
+0];Z1 const*G3=Gy[1];Z1 G4=Gx[1];while(((char*)Gz-(char*)G1)>=16){Z1 G5,G6,G7,G8
+;G5=G0[0]+G1[0]*G2;G6=G0[1]+G1[1]*G2;G7=G0[2]+G1[2]*G2;G8=G0[3]+G1[3]*G2;G5+=G3[
+0]*G4;G6+=G3[1]*G4;G7+=G3[2]*G4;G8+=G3[3]*G4;G0[0]=G5;G0[1]=G6;G0[2]=G7;G0[3]=G8
+;G0+=4;G1+=4;G3+=4;}while(G1<Gz){Z1 G5;G5=G0[0]+G1[0]*G2;G5+=G3[0]*G4;G0[0]=G5;
+++G0;++G1;++G3;}}static void Fu(Z1**Gw,Z1 const*Gx,Z1 const*Gy,Z1 const*Gz){Z1*
+RESTRICT G0=Gw[0];Z1 G1=Gx[0];Z1*RESTRICT G2=Gw[1];Z1 G3=Gx[1];Z1*RESTRICT G4=Gw
+[2];Z1 G5=Gx[2];while(((char*)Gz-(char*)Gy)>=16){Z1 G6,G7,G8,G9;G6=Gy[0],G7=Gy[1
+],G8=Gy[2],G9=Gy[3];G0[0]=(G6*G1);G0[1]=(G7*G1);G0[2]=(G8*G1);G0[3]=(G9*G1);G2[0
+]=(G6*G3);G2[1]=(G7*G3);G2[2]=(G8*G3);G2[3]=(G9*G3);G4[0]=(G6*G5);G4[1]=(G7*G5);
+G4[2]=(G8*G5);G4[3]=(G9*G5);Gy+=4;G0+=4;G2+=4;G4+=4;}while(Gy<Gz){Z1 G6=Gy[0];G0
+[0]=(G6*G1);G2[0]=(G6*G3);G4[0]=(G6*G5);++Gy;++G0;++G2;++G4;}}static void Fv(Z1*
+Gw,Z1 const*Gx,Z1 const**Gy,Z1 const*Gz){Z1*RESTRICT G0=Gw;Z1 const*G1=Gy[0];Z1
+G2=Gx[0];Z1 const*G3=Gy[1];Z1 G4=Gx[1];Z1 const*G5=Gy[2];Z1 G6=Gx[2];while(((///
+char*)Gz-(char*)G1)>=16){Z1 G7,G8,G9,G_;G7=G1[0]*G2;G8=G1[1]*G2;G9=G1[2]*G2;G_=
+G1[3]*G2;G7+=G3[0]*G4;G8+=G3[1]*G4;G9+=G3[2]*G4;G_+=G3[3]*G4;G7+=G5[0]*G6;G8+=G5
+[1]*G6;G9+=G5[2]*G6;G_+=G5[3]*G6;G0[0]=G7;G0[1]=G8;G0[2]=G9;G0[3]=G_;G0+=4;G1+=4
+;G3+=4;G5+=4;}while(G1<Gz){Z1 G7;G7=G1[0]*G2;G7+=G3[0]*G4;G7+=G5[0]*G6;G0[0]=G7;
+++G0;++G1;++G3;++G5;}}static void Fw(Z1**Gw,Z1 const*Gx,Z1 const*Gy,Z1 const*Gz)
+{Z1*RESTRICT G0=Gw[0];Z1 G1=Gx[0];Z1*RESTRICT G2=Gw[1];Z1 G3=Gx[1];Z1*RESTRICT//
+G4=Gw[2];Z1 G5=Gx[2];while(((char*)Gz-(char*)Gy)>=16){Z1 G6,G7,G8,G9;G6=Gy[0],G7
+=Gy[1],G8=Gy[2],G9=Gy[3];G0[0]+=(G6*G1);G0[1]+=(G7*G1);G0[2]+=(G8*G1);G0[3]+=(G9
+*G1);G2[0]+=(G6*G3);G2[1]+=(G7*G3);G2[2]+=(G8*G3);G2[3]+=(G9*G3);G4[0]+=(G6*G5);
+G4[1]+=(G7*G5);G4[2]+=(G8*G5);G4[3]+=(G9*G5);Gy+=4;G0+=4;G2+=4;G4+=4;}while(Gy<
+Gz){Z1 G6=Gy[0];G0[0]+=(G6*G1);G2[0]+=(G6*G3);G4[0]+=(G6*G5);++Gy;++G0;++G2;++G4
+;}}static void Fx(Z1*Gw,Z1 const*Gx,Z1 const**Gy,Z1 const*Gz){Z1*RESTRICT G0=Gw;
+Z1 const*G1=Gy[0];Z1 G2=Gx[0];Z1 const*G3=Gy[1];Z1 G4=Gx[1];Z1 const*G5=Gy[2];Z1
+G6=Gx[2];while(((char*)Gz-(char*)G1)>=16){Z1 G7,G8,G9,G_;G7=G0[0]+G1[0]*G2;G8=G0
+[1]+G1[1]*G2;G9=G0[2]+G1[2]*G2;G_=G0[3]+G1[3]*G2;G7+=G3[0]*G4;G8+=G3[1]*G4;G9+=
+G3[2]*G4;G_+=G3[3]*G4;G7+=G5[0]*G6;G8+=G5[1]*G6;G9+=G5[2]*G6;G_+=G5[3]*G6;G0[0]=
+G7;G0[1]=G8;G0[2]=G9;G0[3]=G_;G0+=4;G1+=4;G3+=4;G5+=4;}while(G1<Gz){Z1 G7;G7=G0[
+0]+G1[0]*G2;G7+=G3[0]*G4;G7+=G5[0]*G6;G0[0]=G7;++G0;++G1;++G3;++G5;}}static void
+Fy Zh while(((char*)Gz-(char*)Gy)>=16){Z1 G8,G9,G_,HA;G8=Gy[0],G9=Gy[1],G_=Gy[2]
+,HA=Gy[3];G0[0]=(G8*G1);G0[1]=(G9*G1);G0[2]=(G_*G1);G0[3]=(HA*G1);G2[0]=(G8*G3);
+G2[1]=(G9*G3);G2[2]=(G_*G3);G2[3]=(HA*G3);G4[0]=(G8*G5);G4[1]=(G9*G5);G4[2]=(G_*
+G5);G4[3]=(HA*G5);G6[0]=(G8*G7);G6[1]=(G9*G7);G6[2]=(G_*G7);G6[3]=(HA*G7);Gy+=4;
+G0+=4;G2+=4;G4+=4;G6+=4;}while(Gy<Gz){Z1 G8=Gy[0];G0[0]=(G8*G1);G2[0]=(G8*G3);G4
+[0]=(G8*G5);G6[0]=(G8*G7);++Gy;++G0;++G2;++G4;++G6;}}static void Fz Z6 while(((
+char*)Gz-(char*)G1)>=16){Z1 G9,G_,HA,HB;G9=G1[0]*G2;G_=G1[1]*G2;HA=G1[2]*G2;HB=
+G1[3]*G2;G9+=G3[0]*G4;G_+=G3[1]*G4;HA+=G3[2]*G4;HB+=G3[3]*G4;G9+=G5[0]*G6;G_+=G5
+[1]*G6;HA+=G5[2]*G6;HB+=G5[3]*G6;G9+=G7[0]*G8;G_+=G7[1]*G8;HA+=G7[2]*G8;HB+=G7[3
+]*G8;G0[0]=G9;G0[1]=G_;G0[2]=HA;G0[3]=HB;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;}while(G1
+<Gz){Z1 G9;G9=G1[0]*G2;G9+=G3[0]*G4;G9+=G5[0]*G6;G9+=G7[0]*G8;G0[0]=G9;++G0;++G1
+;++G3;++G5;++G7;}}static void F0 Zh while(((char*)Gz-(char*)Gy)>=16){Z1 G8,G9,G_
+,HA;G8=Gy[0],G9=Gy[1],G_=Gy[2],HA=Gy[3];G0[0]+=(G8*G1);G0[1]+=(G9*G1);G0[2]+=(G_
+*G1);G0[3]+=(HA*G1);G2[0]+=(G8*G3);G2[1]+=(G9*G3);G2[2]+=(G_*G3);G2[3]+=(HA*G3);
+G4[0]+=(G8*G5);G4[1]+=(G9*G5);G4[2]+=(G_*G5);G4[3]+=(HA*G5);G6[0]+=(G8*G7);G6[1]
++=(G9*G7);G6[2]+=(G_*G7);G6[3]+=(HA*G7);Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;}while(Gy<
+Gz){Z1 G8=Gy[0];G0[0]+=(G8*G1);G2[0]+=(G8*G3);G4[0]+=(G8*G5);G6[0]+=(G8*G7);++Gy
+;++G0;++G2;++G4;++G6;}}static void F1 Z6 while(((char*)Gz-(char*)G1)>=16){Z1 G9,
+G_,HA,HB;G9=G0[0]+G1[0]*G2;G_=G0[1]+G1[1]*G2;HA=G0[2]+G1[2]*G2;HB=G0[3]+G1[3]*G2
+;G9+=G3[0]*G4;G_+=G3[1]*G4;HA+=G3[2]*G4;HB+=G3[3]*G4;G9+=G5[0]*G6;G_+=G5[1]*G6;
+HA+=G5[2]*G6;HB+=G5[3]*G6;G9+=G7[0]*G8;G_+=G7[1]*G8;HA+=G7[2]*G8;HB+=G7[3]*G8;G0
+[0]=G9;G0[1]=G_;G0[2]=HA;G0[3]=HB;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;}while(G1<Gz){Z1
+G9;G9=G0[0]+G1[0]*G2;G9+=G3[0]*G4;G9+=G5[0]*G6;G9+=G7[0]*G8;G0[0]=G9;++G0;++G1;
+++G3;++G5;++G7;}}static void F2 Zh Z1*RESTRICT G8=Gw[4];Z1 G9=Gx[4];while(((char
+*)Gz-(char*)Gy)>=16){Z1 G_,HA,HB,HC;G_=Gy[0],HA=Gy[1],HB=Gy[2],HC=Gy[3];G0[0]=(
+G_*G1);G0[1]=(HA*G1);G0[2]=(HB*G1);G0[3]=(HC*G1);G2[0]=(G_*G3);G2[1]=(HA*G3);G2[
+2]=(HB*G3);G2[3]=(HC*G3);G4[0]=(G_*G5);G4[1]=(HA*G5);G4[2]=(HB*G5);G4[3]=(HC*G5)
+;G6[0]=(G_*G7);G6[1]=(HA*G7);G6[2]=(HB*G7);G6[3]=(HC*G7);G8[0]=(G_*G9);G8[1]=(HA
+*G9);G8[2]=(HB*G9);G8[3]=(HC*G9);Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;G8+=4;}while(Gy<
+Gz){Z1 G_=Gy[0];G0[0]=(G_*G1);G2[0]=(G_*G3);G4[0]=(G_*G5);G6[0]=(G_*G7);G8[0]=(
+G_*G9);++Gy;++G0;++G2;++G4;++G6;++G8;}}static void F3 Z6 Z1 const*G9=Gy[4];Z1 G_
+=Gx[4];while(((char*)Gz-(char*)G1)>=16){Z1 HA,HB,HC,HD;HA=G1[0]*G2;HB=G1[1]*G2;
+HC=G1[2]*G2;HD=G1[3]*G2;HA+=G3[0]*G4;HB+=G3[1]*G4;HC+=G3[2]*G4;HD+=G3[3]*G4;HA+=
+G5[0]*G6;HB+=G5[1]*G6;HC+=G5[2]*G6;HD+=G5[3]*G6;HA+=G7[0]*G8;HB+=G7[1]*G8;HC+=G7
+[2]*G8;HD+=G7[3]*G8;HA+=G9[0]*G_;HB+=G9[1]*G_;HC+=G9[2]*G_;HD+=G9[3]*G_;G0[0]=HA
+;G0[1]=HB;G0[2]=HC;G0[3]=HD;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;G9+=4;}while(G1<Gz){Z1
+HA;HA=G1[0]*G2;HA+=G3[0]*G4;HA+=G5[0]*G6;HA+=G7[0]*G8;HA+=G9[0]*G_;G0[0]=HA;++G0
+;++G1;++G3;++G5;++G7;++G9;}}static void F4 Zh Z1*RESTRICT G8=Gw[4];Z1 G9=Gx[4];
+while(((char*)Gz-(char*)Gy)>=16){Z1 G_,HA,HB,HC;G_=Gy[0],HA=Gy[1],HB=Gy[2],HC=Gy
+[3];G0[0]+=(G_*G1);G0[1]+=(HA*G1);G0[2]+=(HB*G1);G0[3]+=(HC*G1);G2[0]+=(G_*G3);
+G2[1]+=(HA*G3);G2[2]+=(HB*G3);G2[3]+=(HC*G3);G4[0]+=(G_*G5);G4[1]+=(HA*G5);G4[2]
++=(HB*G5);G4[3]+=(HC*G5);G6[0]+=(G_*G7);G6[1]+=(HA*G7);G6[2]+=(HB*G7);G6[3]+=(HC
+*G7);G8[0]+=(G_*G9);G8[1]+=(HA*G9);G8[2]+=(HB*G9);G8[3]+=(HC*G9);Gy+=4;G0+=4;G2
++=4;G4+=4;G6+=4;G8+=4;}while(Gy<Gz){Z1 G_=Gy[0];G0[0]+=(G_*G1);G2[0]+=(G_*G3);G4
+[0]+=(G_*G5);G6[0]+=(G_*G7);G8[0]+=(G_*G9);++Gy;++G0;++G2;++G4;++G6;++G8;}}/////
+static void F5 Z6 Z1 const*G9=Gy[4];Z1 G_=Gx[4];while(((char*)Gz-(char*)G1)>=16)
+{Z1 HA,HB,HC,HD;HA=G0[0]+G1[0]*G2;HB=G0[1]+G1[1]*G2;HC=G0[2]+G1[2]*G2;HD=G0[3]+
+G1[3]*G2;HA+=G3[0]*G4;HB+=G3[1]*G4;HC+=G3[2]*G4;HD+=G3[3]*G4;HA+=G5[0]*G6;HB+=G5
+[1]*G6;HC+=G5[2]*G6;HD+=G5[3]*G6;HA+=G7[0]*G8;HB+=G7[1]*G8;HC+=G7[2]*G8;HD+=G7[3
+]*G8;HA+=G9[0]*G_;HB+=G9[1]*G_;HC+=G9[2]*G_;HD+=G9[3]*G_;G0[0]=HA;G0[1]=HB;G0[2]
+=HC;G0[3]=HD;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;G9+=4;}while(G1<Gz){Z1 HA;HA=G0[0]+G1
+[0]*G2;HA+=G3[0]*G4;HA+=G5[0]*G6;HA+=G7[0]*G8;HA+=G9[0]*G_;G0[0]=HA;++G0;++G1;++
+G3;++G5;++G7;++G9;}}static void F6 Zh Z1*RESTRICT G8=Gw[4];Z1 G9=Gx[4];Z1*//////
+RESTRICT G_=Gw[5];Z1 HA=Gx[5];while(((char*)Gz-(char*)Gy)>=16){Z1 HB,HC,HD,HE;HB
+=Gy[0],HC=Gy[1],HD=Gy[2],HE=Gy[3];G0[0]=(HB*G1);G0[1]=(HC*G1);G0[2]=(HD*G1);G0[3
+]=(HE*G1);G2[0]=(HB*G3);G2[1]=(HC*G3);G2[2]=(HD*G3);G2[3]=(HE*G3);G4[0]=(HB*G5);
+G4[1]=(HC*G5);G4[2]=(HD*G5);G4[3]=(HE*G5);G6[0]=(HB*G7);G6[1]=(HC*G7);G6[2]=(HD*
+G7);G6[3]=(HE*G7);G8[0]=(HB*G9);G8[1]=(HC*G9);G8[2]=(HD*G9);G8[3]=(HE*G9);G_[0]=
+(HB*HA);G_[1]=(HC*HA);G_[2]=(HD*HA);G_[3]=(HE*HA);Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;
+G8+=4;G_+=4;}while(Gy<Gz){Z1 HB=Gy[0];G0[0]=(HB*G1);G2[0]=(HB*G3);G4[0]=(HB*G5);
+G6[0]=(HB*G7);G8[0]=(HB*G9);G_[0]=(HB*HA);++Gy;++G0;++G2;++G4;++G6;++G8;++G_;}}
+static void F7 Z6 Z1 const*G9=Gy[4];Z1 G_=Gx[4];Z1 const*HA=Gy[5];Z1 HB=Gx[5];//
+while(((char*)Gz-(char*)G1)>=16){Z1 HC,HD,HE,HF;HC=G1[0]*G2;HD=G1[1]*G2;HE=G1[2]
+*G2;HF=Zy G1[0]*G2;HC+=G3[0]*G4;HC+=G5[0]*G6;HC+=G7[0]*G8;HC+=G9[0]*G_;HC+=HA[0]
+*HB;G0[0]=HC;++G0;++G1;++G3;++G5;++G7;++G9;++HA;}}static void F8 Zh Z1*RESTRICT
+G8=Gw[4];Z1 G9=Gx[4];Z1*RESTRICT G_=Gw[5];Z1 HA=Gx[5];while(((char*)Gz-(char*)Gy
+)>=16){Z1 HB,HC,HD,HE;HB=Gy[0],HC=Gy[1],HD=Gy[2],HE=Gy[3];G0[0]+=(HB*G1);G0[1]+=
+(HC*G1);G0[2]+=(HD*G1);G0[3]+=(HE*G1);G2[0]+=(HB*G3);G2[1]+=(HC*G3);G2[2]+=(HD*
+G3);G2[3]+=(HE*G3);G4[0]+=(HB*G5);G4[1]+=(HC*G5);G4[2]+=(HD*G5);G4[3]+=(HE*G5);
+G6[0]+=(HB*G7);G6[1]+=(HC*G7);G6[2]+=(HD*G7);G6[3]+=(HE*G7);G8[0]+=(HB*G9);G8[1]
++=(HC*G9);G8[2]+=(HD*G9);G8[3]+=(HE*G9);G_[0]+=(HB*HA);G_[1]+=(HC*HA);G_[2]+=(HD
+*HA);G_[3]+=(HE*HA);Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;G8+=4;G_+=4;}while(Gy<Gz){Z1//
+HB=Gy[0];G0[0]+=(HB*G1);G2[0]+=(HB*G3);G4[0]+=(HB*G5);G6[0]+=(HB*G7);G8[0]+=(HB*
+G9);G_[0]+=(HB*HA);++Gy;++G0;++G2;++G4;++G6;++G8;++G_;}}static void F9 Z6 Z1////
+const*G9=Gy[4];Z1 G_=Gx[4];Z1 const*HA=Gy[5];Z1 HB=Gx[5];while(((char*)Gz-(char*
+)G1)>=16){Z1 HC,HD,HE,HF;HC=G0[0]+G1[0]*G2;HD=G0[1]+G1[1]*G2;HE=G0[2]+G1[2]*G2;
+HF=G0[3]+Zy G0[0]+G1[0]*G2;HC+=G3[0]*G4;HC+=G5[0]*G6;HC+=G7[0]*G8;HC+=G9[0]*G_;
+HC+=HA[0]*HB;G0[0]=HC;++G0;++G1;++G3;++G5;++G7;++G9;++HA;}}static void F_ Zh Z1*
+RESTRICT G8=Gw[4];Z1 G9=Gx[4];Z1*RESTRICT G_=Gw[5];Z1 HA=Gx[5];Z1*RESTRICT HB=Gw
+[6];Z1 HC=Gx[6];while(((char*)Gz-(char*)Gy)>=16){Z1 HD,HE,HF,HG;HD=Gy[0],HE=Gy[1
+],HF=Gy[2],HG=Gy[3];G0[0]=(HD*G1);G0[1]=(HE*G1);G0[2]=(HF*G1);G0[3]=(HG*G1);G2[0
+]=(HD*G3);G2[1]=(HE*G3);G2[2]=(HF*G3);G2[3]=(HG*G3);G4[0]=(HD*G5);G4[1]=(HE*G5);
+G4[2]=(HF*G5);G4[3]=(HG*G5);G6[0]=(HD*G7);G6[1]=(HE*G7);G6[2]=(HF*G7);G6[3]=(HG*
+G7);G8[0]=(HD*G9);G8[1]=(HE*G9);G8[2]=(HF*G9);G8[3]=(HG*G9);G_[0]=(HD*HA);G_[1]=
+(HE*HA);G_[2]=(HF*HA);G_[3]=(HG*HA);HB[0]=(HD*HC);HB[1]=(HE*HC);HB[2]=(HF*HC);HB
+[3]=(HG*HC);Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;G8+=4;G_+=4;HB+=4;}while(Gy<Gz){Z1 HD=
+Gy[0];G0[0]=(HD*G1);G2[0]=(HD*G3);G4[0]=(HD*G5);G6[0]=(HD*G7);G8[0]=(HD*G9);G_[0
+]=(HD*HA);HB[0]=(HD*HC);++Gy;++G0;++G2;++G4;++G6;++G8;++G_;++HB;}}static void GA
+Z6 Z1 const*G9=Gy[4];Z1 G_=Gx[4];Z1 const*HA=Gy[5];Z1 HB=Gx[5];Z1 const*HC=Gy[6]
+;Z1 HD=Gx[6];while(((char*)Gz-(char*)G1)>=16){Z1 HE,HF,HG,HH;HE=G1[0]*G2;HF=G1[1
+]*G2;HG=G1[2]*G2;HH=Zu G1[0]*G2;HE+=G3[0]*G4;HE+=G5[0]*G6;HE+=G7[0]*G8;HE+=G9[0]
+*G_;HE+=HA[0]*HB;HE+=HC[0]*HD;G0[0]=HE;++G0;++G1;++G3;++G5;++G7;++G9;++HA;++HC;}
+}static void GB Zh Z1*RESTRICT G8=Gw[4];Z1 G9=Gx[4];Z1*RESTRICT G_=Gw[5];Z1 HA=
+Gx[5];Z1*RESTRICT HB=Gw[6];Z1 HC=Gx[6];while(((char*)Gz-(char*)Gy)>=16){Z1 HD,HE
+,HF,HG;HD=Gy[0],HE=Gy[1],HF=Gy[2],HG=Gy[3];G0[0]+=(HD*G1);G0[1]+=(HE*G1);G0[2]+=
+(HF*G1);G0[3]+=(HG*G1);G2[0]+=(HD*G3);G2[1]+=(HE*G3);G2[2]+=(HF*G3);G2[3]+=(HG*
+G3);G4[0]+=(HD*G5);G4[1]+=(HE*G5);G4[2]+=(HF*G5);G4[3]+=(HG*G5);G6[0]+=(HD*G7);
+G6[1]+=(HE*G7);G6[2]+=(HF*G7);G6[3]+=(HG*G7);G8[0]+=(HD*G9);G8[1]+=(HE*G9);G8[2]
++=(HF*G9);G8[3]+=(HG*G9);G_[0]+=(HD*HA);G_[1]+=(HE*HA);G_[2]+=(HF*HA);G_[3]+=(HG
+*HA);HB[0]+=(HD*HC);HB[1]+=(HE*HC);HB[2]+=(HF*HC);HB[3]+=(HG*HC);Gy+=4;G0+=4;G2
++=4;G4+=4;G6+=4;G8+=4;G_+=4;HB+=4;}while(Gy<Gz){Z1 HD=Gy[0];G0[0]+=(HD*G1);G2[0]
 +=(HD*G3);G4[0]+=(HD*G5);G6[0]+=(HD*G7);G8[0]+=(HD*G9);G_[0]+=(HD*HA);HB[0]+=(HD
-*HC);++Gy;++G0;++G2;++G4;++G6;++G8;++G_;++HB;}}static void GC(float*Gw,float////
-const*Gx,float const**Gy,float const*Gz){float*restrict G0=Gw;float const*G1=Gy[
-0];float G2=Gx[0];float const*G3=Gy[1];float G4=Gx[1];float const*G5=Gy[2];float
-G6=Gx[2];float const*G7=Gy[3];float G8=Gx[3];float const*G9=Gy[4];float G_=Gx[4]
-;float const*HA=Gy[5];float HB=Gx[5];float const*HC=Gy[6];float HD=Gx[6];_Pragma
-("GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)G1)>=16){float HE
-,HF,HG,HH;asm(""::"r"(G0));HE=G0[0]+G1[0]*G2;HF=G0[1]+G1[1]*G2;HG=G0[2]+G1[2]*G2
-;HH=G0[3]+G1[3]*G2;HE+=G3[0]*G4;HF+=G3[1]*G4;HG+=G3[2]*G4;HH+=G3[3]*G4;HE+=G5[0]
-*G6;HF+=G5[1]*G6;HG+=G5[2]*G6;HH+=G5[3]*G6;HE+=G7[0]*G8;HF+=G7[1]*G8;HG+=G7[2]*
-G8;HH+=G7[3]*G8;HE+=G9[0]*G_;HF+=G9[1]*G_;HG+=G9[2]*G_;HH+=G9[3]*G_;HE+=HA[0]*HB
-;HF+=HA[1]*HB;HG+=HA[2]*HB;HH+=HA[3]*HB;HE+=HC[0]*HD;HF+=HC[1]*HD;HG+=HC[2]*HD;
-HH+=HC[3]*HD;G0[0]=HE;G0[1]=HF;G0[2]=HG;G0[3]=HH;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;
-G9+=4;HA+=4;HC+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(G1<Gz){//
-float HE;asm(""::"r"(G0));HE=G0[0]+G1[0]*G2;HE+=G3[0]*G4;HE+=G5[0]*G6;HE+=G7[0]*
-G8;HE+=G9[0]*G_;HE+=HA[0]*HB;HE+=HC[0]*HD;G0[0]=HE;++G0;++G1;++G3;++G5;++G7;++G9
-;++HA;++HC;}}static void GD(float**Gw,float const*Gx,float const*Gy,float const*
-Gz){float*restrict G0=Gw[0];float G1=Gx[0];float*restrict G2=Gw[1];float G3=Gx[1
-];float*restrict G4=Gw[2];float G5=Gx[2];float*restrict G6=Gw[3];float G7=Gx[3];
-float*restrict G8=Gw[4];float G9=Gx[4];float*restrict G_=Gw[5];float HA=Gx[5];//
-float*restrict HB=Gw[6];float HC=Gx[6];float*restrict HD=Gw[7];float HE=Gx[7];//
-_Pragma("GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)Gy)>=16){
-float HF,HG,HH,HI;asm(""::"r"(Gy));HF=Gy[0],HG=Gy[1],HH=Gy[2],HI=Gy[3];G0[0]=(HF
-*G1);G0[1]=(HG*G1);G0[2]=(HH*G1);G0[3]=(HI*G1);G2[0]=(HF*G3);G2[1]=(HG*G3);G2[2]
-=(HH*G3);G2[3]=(HI*G3);G4[0]=(HF*G5);G4[1]=(HG*G5);G4[2]=(HH*G5);G4[3]=(HI*G5);
-G6[0]=(HF*G7);G6[1]=(HG*G7);G6[2]=(HH*G7);G6[3]=(HI*G7);G8[0]=(HF*G9);G8[1]=(HG*
-G9);G8[2]=(HH*G9);G8[3]=(HI*G9);G_[0]=(HF*HA);G_[1]=(HG*HA);G_[2]=(HH*HA);G_[3]=
-(HI*HA);HB[0]=(HF*HC);HB[1]=(HG*HC);HB[2]=(HH*HC);HB[3]=(HI*HC);HD[0]=(HF*HE);HD
-[1]=(HG*HE);HD[2]=(HH*HE);HD[3]=(HI*HE);Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;G8+=4;G_+=
-4;HB+=4;HD+=4;}_Pragma("GCC unroll 1")_Pragma("GCC novector")while(Gy<Gz){float
-HF=Gy[0];asm(""::"r"(G0));G0[0]=(HF*G1);G2[0]=(HF*G3);G4[0]=(HF*G5);G6[0]=(HF*G7
-);G8[0]=(HF*G9);G_[0]=(HF*HA);HB[0]=(HF*HC);HD[0]=(HF*HE);++Gy;++G0;++G2;++G4;++
-G6;++G8;++G_;++HB;++HD;}}static void GE(float*Gw,float const*Gx,float const**Gy,
-float const*Gz){float*restrict G0=Gw;float const*G1=Gy[0];float G2=Gx[0];float//
-const*G3=Gy[1];float G4=Gx[1];float const*G5=Gy[2];float G6=Gx[2];float const*G7
-=Gy[3];float G8=Gx[3];float const*G9=Gy[4];float G_=Gx[4];float const*HA=Gy[5];
-float HB=Gx[5];float const*HC=Gy[6];float HD=Gx[6];float const*HE=Gy[7];float HF
-=Gx[7];_Pragma("GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)G1)
->=16){float HG,HH,HI,HJ;asm(""::"r"(G0));HG=G1[0]*G2;HH=G1[1]*G2;HI=G1[2]*G2;HJ=
-G1[3]*G2;HG+=G3[0]*G4;HH+=G3[1]*G4;HI+=G3[2]*G4;HJ+=G3[3]*G4;HG+=G5[0]*G6;HH+=G5
-[1]*G6;HI+=G5[2]*G6;HJ+=G5[3]*G6;HG+=G7[0]*G8;HH+=G7[1]*G8;HI+=G7[2]*G8;HJ+=G7[3
-]*G8;HG+=G9[0]*G_;HH+=G9[1]*G_;HI+=G9[2]*G_;HJ+=G9[3]*G_;HG+=HA[0]*HB;HH+=HA[1]*
-HB;HI+=HA[2]*HB;HJ+=HA[3]*HB;HG+=HC[0]*HD;HH+=HC[1]*HD;HI+=HC[2]*HD;HJ+=HC[3]*HD
-;HG+=HE[0]*HF;HH+=HE[1]*HF;HI+=HE[2]*HF;HJ+=HE[3]*HF;G0[0]=HG;G0[1]=HH;G0[2]=HI;
-G0[3]=HJ;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;G9+=4;HA+=4;HC+=4;HE+=4;}_Pragma(////////
-"GCC unroll 1")_Pragma("GCC novector")while(G1<Gz){float HG;asm(""::"r"(G0));HG=
-G1[0]*G2;HG+=G3[0]*G4;HG+=G5[0]*G6;HG+=G7[0]*G8;HG+=G9[0]*G_;HG+=HA[0]*HB;HG+=HC
-[0]*HD;HG+=HE[0]*HF;G0[0]=HG;++G0;++G1;++G3;++G5;++G7;++G9;++HA;++HC;++HE;}}////
-static void GF(float**Gw,float const*Gx,float const*Gy,float const*Gz){float* //
-restrict G0=Gw[0];float G1=Gx[0];float*restrict G2=Gw[1];float G3=Gx[1];;;float*
-restrict G4=Gw[2];float G5=Gx[2];float*restrict G6=Gw[3];float G7=Gx[3];;;float*
-restrict G8=Gw[4];float G9=Gx[4];float*restrict G_=Gw[5];float HA=Gx[5];;;float*
-restrict HB=Gw[6];float HC=Gx[6];float*restrict HD=Gw[7];float HE=Gx[7];_Pragma(
-"GCC unroll 1")_Pragma("GCC novector")while(((char*)Gz-(char*)Gy)>=16){float HF,
-HG,HH,HI;asm(""::"r"(Gy));HF=Gy[0],HG=Gy[1],HH=Gy[2],HI=Gy[3];G0[0]+=(HF*G1);G0[
-1]+=(HG*G1);G0[2]+=(HH*G1);G0[3]+=(HI*G1);G2[0]+=(HF*G3);G2[1]+=(HG*G3);G2[2]+=(
-HH*G3);G2[3]+=(HI*G3);G4[0]+=(HF*G5);G4[1]+=(HG*G5);G4[2]+=(HH*G5);G4[3]+=(HI*G5
-);G6[0]+=(HF*G7);G6[1]+=(HG*G7);G6[2]+=(HH*G7);G6[3]+=(HI*G7);G8[0]+=(HF*G9);G8[
-1]+=(HG*G9);G8[2]+=(HH*G9);G8[3]+=(HI*G9);G_[0]+=(HF*HA);G_[1]+=(HG*HA);G_[2]+=(
-HH*HA);G_[3]+=(HI*HA);HB[0]+=(HF*HC);HB[1]+=(HG*HC);HB[2]+=(HH*HC);HB[3]+=(HI*HC
-);HD[0]+=(HF*HE);HD[1]+=(HG*HE);HD[2]+=(HH*HE);HD[3]+=(HI*HE);Gy+=4;G0+=4;G2+=4;
-G4+=4;G6+=4;G8+=4;G_+=4;HB+=4;HD+=4;}_Pragma("GCC unroll 1")_Pragma(////////////
-"GCC novector")while(Gy<Gz){float HF=Gy[0];asm(""::"r"(G0));G0[0]+=(HF*G1);G2[0]
-+=(HF*G3);G4[0]+=(HF*G5);G6[0]+=(HF*G7);G8[0]+=(HF*G9);G_[0]+=(HF*HA);HB[0]+=(HF
-*HC);HD[0]+=(HF*HE);++Gy;++G0;++G2;++G4;++G6;++G8;++G_;++HB;++HD;}}static void//
-GG(float*Gw,float const*Gx,float const**Gy,float const*Gz){float*restrict G0=Gw;
-float const*G1=Gy[0];float G2=Gx[0];float const*G3=Gy[1];float G4=Gx[1];float///
-const*G5=Gy[2];float G6=Gx[2];float const*G7=Gy[3];float G8=Gx[3];float const*G9
-=Gy[4];float G_=Gx[4];float const*HA=Gy[5];float HB=Gx[5];float const*HC=Gy[6];
-float HD=Gx[6];float const*HE=Gy[7];float HF=Gx[7];_Pragma("GCC unroll 1")//////
-_Pragma("GCC novector")while(((char*)Gz-(char*)G1)>=16){float HG,HH,HI,HJ;asm(""
-::"r"(G0));HG=G0[0]+G1[0]*G2;HH=G0[1]+G1[1]*G2;HI=G0[2]+G1[2]*G2;HJ=G0[3]+G1[3]*
-G2;HG+=G3[0]*G4;HH+=G3[1]*G4;HI+=G3[2]*G4;HJ+=G3[3]*G4;HG+=G5[0]*G6;HH+=G5[1]*G6
-;HI+=G5[2]*G6;HJ+=G5[3]*G6;HG+=G7[0]*G8;HH+=G7[1]*G8;HI+=G7[2]*G8;HJ+=G7[3]*G8;
-HG+=G9[0]*G_;HH+=G9[1]*G_;HI+=G9[2]*G_;HJ+=G9[3]*G_;HG+=HA[0]*HB;HH+=HA[1]*HB;HI
-+=HA[2]*HB;HJ+=HA[3]*HB;HG+=HC[0]*HD;HH+=HC[1]*HD;HI+=HC[2]*HD;HJ+=HC[3]*HD;HG+=
-HE[0]*HF;HH+=HE[1]*HF;HI+=HE[2]*HF;HJ+=HE[3]*HF;G0[0]=HG;G0[1]=HH;G0[2]=HI;G0[3]
-=HJ;G0+=4;G1+=4;G3+=4;G5+=4;G7+=4;G9+=4;HA+=4;HC+=4;HE+=4;}_Pragma(/////////////
-"GCC unroll 1")_Pragma("GCC novector")while(G1<Gz){float HG;asm(""::"r"(G0));HG=
-G0[0]+G1[0]*G2;HG+=G3[0]*G4;HG+=G5[0]*G6;HG+=G7[0]*G8;HG+=G9[0]*G_;HG+=HA[0]*HB;
-HG+=HC[0]*HD;HG+=HE[0]*HF;G0[0]=HG;++G0;++G1;++G3;++G5;++G7;++G9;++HA;++HC;++HE;
-}}typedef void GH(float*output,float const*coeffs,float const**inputs,float/////
-const*input0_end);static GH*GI[8]={Fn,Fr,Fv,Fz,F3,F7,GA,GE};static GH*GJ[8]={Fp,
-Ft,Fx,F1,F5,F9,GC,GG};typedef void GK(float**outputs,float const*coeffs,float///
-const*input,float const*input_end);static GK*GL[8]={Fm,Fq,Fu,Fy,F2,F6,F_,GD};///
-static GK*GM[8]={Fo,Fs,Fw,F0,F4,F8,GB,GF};static void GN(B0 const*Gw,void*Gx,///
-float*Gy,int Gz){int G0=Gw->A.E.B;int G1=Gw->d;int G2=G0*G1;void*G3;if(Gw->T)Gw
-->T(Gy,G2);G3=Gx;if(Gw->M)G3=Gy;Gw->U(G3,G2,Gy);if(Gw->M)Gw->M(G3,G0,Gz,Gw->L);}
-static float*GO(B0 const*Gw,B_ const*Gx,int Gy){return(float*)(((char*)Gx->I)+(
-Gy*Gw->G));}static float*GP(B0 const*Gw,B_ const*Gx,int Gy){int Gz=(Gx->D+(Gy-Gx
-->B))%Gw->H;return GO(Gw,Gx,Gz);}static void GQ(B0 const*Gw,float*Gx,float const
-*Gy){float const*Gz=Gy-(Gw->N.A.A*Gw->e);if((Gw->A.G==STBIR_FILTER_POINT_SAMPLE)
-&&(Gw->A.E.C==1.0f))memcpy(Gx,Gy,Gw->A.E.B*4*Gw->e);else Gw->S(Gx,Gw->A.E.B,Gz,
-Gw->A.A,Gw->A.B,Gw->A.K);}static void GR(B0 const*Gw,B_*Gx,int Gy,int Gz,int G0,
-float const*G1){float*G2=Gx->J;float*G3=Gx->A;int G4=Gw->c;int G5=G4?(Gw->N.A.B-
-Gw->N.A.A+1):Gw->A.E.B;int G6=Gw->e*G5;{int G7=0,G8=G0-Gz+1;do{float const*G9[8]
-;int G_,HA=G8;if(HA>8)HA=8;for(G_=0;G_<HA;G_++)G9[G_]=GP(Gw,Gx,G7+G_+Gz);((G7==0
-)?GI:GJ)[HA-1](G4?G3:G2,G1+G7,G9,G9[0]+G6);G7+=HA;G8-=HA;}while(G8);}if(G4){G3[
-G6]=0.0f;G3[G6+1]=0.0f;GQ(Gw,G2,G3);}GN(Gw,((char*)Gw->D)+((size_t)Gy*(size_t)Gw
-->F),G2,Gy);}static void GS(B0 const*Gw,B_*Gx,int Gy){int Gz;float*G0;EK(Gw,Gy,
-Gx->A);Gx->C=Gy;Gz=(Gx->D+(Gx->C-Gx->B))%Gw->H;G0=GO(Gw,Gx,Gz);GQ(Gw,G0,Gx->A);}
-static void GT(B0 const*Gw,B_*Gx,int Gy){int Gz,G0,G1;B4*G2=Gw->B.A;float const*
-G3=Gw->B.B;G0=Gx->E;G1=Gx[Gy-1].F;G2+=G0;G3+=G0*Gw->B.K;Gx->D=0;Gx->B=G2->A;Gx->
-C=Gx->B-1;for(Gz=G0;Gz<G1;Gz++){int G4,G5;G4=G2->A;G5=G2->B;while(G5>Gx->C){if((
-Gx->C-Gx->B+1)==Gw->H){Gx->B++;Gx->D++;}if(Gw->c){float*G6=GP(Gw,Gx,++Gx->C);EK(
-Gw,Gx->C,G6);}else GS(Gw,Gx,Gx->C+1);}GR(Gw,Gx,Gz,G4,G5,G3);++G2;G3+=Gw->B.K;}}
-static void GU(B0 const*Gw,B_*Gx){float*Gy=GO(Gw,Gx,Gx->D);GN(Gw,((char*)Gw->D)+
-((size_t)Gx->B*(size_t)Gw->F),Gy,Gx->B);Gy[0]=3e38;Gx->B++;if(++Gx->D==Gw->H)Gx
-->D=0;}static void GV(B0 const*Gw,B_*Gx){float*Gy=GO(Gw,Gx,Gx->D);GQ(Gw,Gx->J,Gy
-);GN(Gw,((char*)Gw->D)+((size_t)Gx->B*(size_t)Gw->F),Gx->J,Gx->B);Gy[0]=3e38;Gx
-->B++;if(++Gx->D==Gw->H)Gx->D=0;}static void GW(B0 const*Gw,B_*Gx,int Gy,int Gz,
-float const*G0,float const*G1,float const*G2){{int G3=0,G4=Gz-Gy+1;do{float*G5[8
-];int G6,G7=G4;if(G7>8)G7=8;for(G6=0;G6<G7;G6++){G5[G6]=GP(Gw,Gx,G3+G6+Gy);if(G6
-&&((G5[G6][0]==3e38f)!=(G5[0][0]==3e38f))){G7=G6;break;}}(G5[0][0]==3e38f?GL:GM)
-[G7-1](G5,G0+G3,G1,G2);G3+=G7;G4-=G7;}while(G4);}}typedef void GX(B0 const* ////
-stbir_info,B_*split_info);static void GY(B0 const*Gw,B_*Gx,int Gy){int Gz,G0,G1,
-G2,G3;B4*G4=Gw->B.A;float const*G5=Gw->B.B;GX*G6;void*G7;void*G8;int G9,G_;int//
-HA=Gw->c?(Gw->N.A.B-Gw->N.A.A+1):Gw->A.E.B;int HB=Gw->e*HA;G0=Gx->E;G1=Gx[Gy-1].
-F;G2=Gx->G;G3=Gx[Gy-1].H;Gz=G2+Gw->B.M;G4+=Gz;G5+=Gw->B.K*Gz;if(Gw->c){G6=GV;G7=
-Gx->A;G8=((char*)G7)+4*Gw->e*(Gw->N.A.B-Gw->N.A.A+1);}else{G6=GU;G7=Gx->J;G8=((
-char*)G7)+4*Gw->e*Gw->A.E.B;}Gx->B=G0;Gx->C=-1;Gx->D=-1;for(Gz=0;Gz<Gw->H;Gz++){
-float*HC=GO(Gw,Gx,Gz);HC[HB]=0.0f;HC[HB+1]=0.0f;HC[0]=3e38;}G9=1;G_=G2;for(Gz=G2
-;Gz<G3;Gz++){int HC,HD;HC=G4->A;HD=G4->B;if((HD>=HC)&&(((HC>=G0)&&(HC<G1))||((HD
->=G0)&&(HD<G1)))){float const*HE=G5;G_=Gz;if(G9&&(Gz>G2))Gx->G=Gz;G9=0;if(HC<G0)
-{HE+=G0-HC;HC=G0;}if(HD>=G1)HD=G1-1;if(Gx->D<0)Gx->D=HC-G0;EK(Gw,Gz,Gx->A);if(!
-Gw->c)GQ(Gw,Gx->J,Gx->A);if(((Gx->C-Gx->B+1)==Gw->H)&&(HD>Gx->C))G6(Gw,Gx);GW(Gw
-,Gx,HC,HD,HE,(float*)G7,(float*)G8);if(HD>Gx->C)Gx->C=HD;}++G4;G5+=Gw->B.K;}////
-while(Gx->B<G1)G6(Gw,Gx);++G_;for(Gz=0;Gz<Gy;Gz++)if(Gx[Gz].H>G_)Gx[Gz].H=G_;}//
-static By*GZ[]={0,CP,CR,CT,CU,CV,CS};static Bz*Ga[]={0,CQ,CX,CZ,CZ,CZ,CW};static
-void Gb(B8*Gw,Bu Gx,By*Gy,Bz*Gz,Bt G0,B7*G1,int G2,void*G3){if(Gx==0){Gx=///////
-STBIR_FILTER_MITCHELL;if(G1->C>=1.0)if((G1->C<=1.0)&&(((float)ceil((float)G1->E)
-)==G1->E))Gx=STBIR_FILTER_POINT_SAMPLE;else Gx=STBIR_FILTER_CATMULLROM;}Gw->G=Gx
-;Gw->H=GZ[Gx];Gw->I=Ga[Gx];if(Gy&&Gz){Gw->H=Gy;Gw->I=Gz;Gw->G=STBIR_FILTER_OTHER
-;}Gw->J=G0;Gw->L=Ca(Gw->I,G1->C,G3);Gw->R=0;if(G1->C>=1.0)Gw->R=1;else if(G2||(
-Gw->L<=32))Gw->R=2;Gw->K=Cb(Gw,Gw->R,G3);if(G0==STBIR_EDGE_WRAP)if(Gw->L>(G1->A*
-3))Gw->L=G1->A*3;Gw->M=Gw->L/2;if(G0==STBIR_EDGE_WRAP)if(Gw->M>G1->A)Gw->M=G1->A
-;Gw->N=Cc(Gw,Gw->R);Gw->O=Gw->N*8;Gw->P=Gw->N*Gw->K*4+12;Gw->C=0;Gw->D=0;if(Gw->
-R==0){Gw->T=Gw->L;Gw->S=Cc(Gw,2);Gw->U=Gw->S*8;Gw->V=Gw->S*Gw->T*4;}}static void
-Gc(B8*Gw,B4*Gx,void*Gy){float Gz=Gw->E.C;float G0=Gw->E.E;Bz*G1=Gw->I;int G2=Gw
-->E.A;Bt G3=Gw->J;float G4=Gw->E.D;if(Gw->R==1){int G5,G6;float G7=G1(G4,Gy)*Gz;
-Cl(&G5,&G6,0.5,G7,G4,G0,G2,G3);Gx->A=G5;Cl(&G5,&G6,((float)(Gw->E.B-1))+0.5f,G7,
-G4,G0,G2,G3);Gx->B=G6;}else if(Gw->R==2){float G5=G1(Gz,Gy)*G4;int G6=Gw->M;int
-G7=Gw->E.B;int G8;int G9;int G_,HA;Cl(&G_,&HA,0,0,G4,G0,G2,G3);Gx->A=G_;Cl(&G_,&
-HA,(float)G7,0,G4,G0,G2,G3);Gx->B=HA;G9=Gx->A+1;G8=-G6;while(G9>=G8){int HB,HC;
-Co(&HB,&HC,((float)G9)+0.5f,G5,Gz,G0,G7);if(HB>HC)break;if((HB<G7)||(HC>=0))Gx->
-A=G9;--G9;}G9=Gx->B-1;G8=G9+1+G6;while(G9<=G8){int HB,HC;Co(&HB,&HC,((float)G9)+
-0.5f,G5,Gz,G0,G7);if(HB>HC)break;if((HB<G7)||(HC>=0))Gx->B=G9;++G9;}}if(Gw->J==
-STBIR_EDGE_WRAP){if((Gx->A>0)&&(Gx->B>=G2)){int G5=Gx->B-G2+1;if((G5+16)>=Gx->A)
-Gx->A=0;}if((Gx->A<0)&&(Gx->B<(G2-1))){int G5=-Gx->A;if((G2-G5-16-1)<=Gx->B)Gx->
-B=G2-1;}}else{if(Gx->A<0)Gx->A=0;if(Gx->B>=G2)Gx->B=G2-1;}}static void Gd(B_*Gw,
-int Gx,int Gy,int Gz,int G0,int G1,B4*G2){int G3,G4;int G5=Gy;G4=0;for(G3=0;G3<
-Gx;G3++){int G6;Gw[G3].E=G4;G6=G5/(Gx-G3);Gw[G3].F=G4+G6;if(G1&&G3){B4*G7;int G8
-,G9,G_,HA;B4*HB=G2+G4;G_=Gz*3;if(G6<G_)G_=G6;G9=0;G7=HB;HA=G7->A;for(G8=1;G8<=G_
-;G8++){++HB;if(HB->A>HA)break;if(HB->A<G7->A){G7=HB;G9=G8;}}Gw[G3-1].F+=G9;Gw[G3
-].E+=G9;}G4+=G6;G5-=G6;Gw[G3].G=-Gz;Gw[G3].H=G0+Gz;}}static void Ge(B0*Gw){if(Gw
-)if(Gw->O){void*Gx=Gw->O;Gw->O=0;((void)Gw->L,free(Gx));}}static int Gf(int Gw,
-int Gx){int Gy;int Gz=0;for(Gy=0;Gy<Gw;Gy++){int G0=Gx/(Gw-Gy);if(G0>Gz)Gz=G0;Gx
--=G0;}return Gz;}static CC**Gg[8]={0,Eb,Et,FA,FS,0,0,Fk};static CC**Gh[8]={0,Ec,
-Eu,FB,FT,0,0,Fl};static float Gi[5][8][4]={{{1.0,1.0,0.3125,1.0},{0.5625,///////
-0.59375f,0.0,0.96875f},{1.0,0.0625,0.0,1.0},{0.0,0.09375f,1.0,1.0},{1.0,1.0,////
-0.3125,1.0},{0.03125f,0.125,1.0,1.0},{1.0,1.0,0.0625,1.0},{0.0,1.0,0.0,0.03125f}
-,},{{0.0,0.84375f,0.0,0.03125f},{0.09375f,0.9375,0.0,0.78125f},{0.875,0.21875f,
-0.0,0.96875f},{0.09375f,0.09375f,1.0,1.0},{0.0,0.84375f,0.0,0.03125f},{0.03125f,
-0.125,1.0,1.0},{1.0,1.0,0.0625,1.0},{0.0,1.0,0.0,0.53125f},},{{0.0,0.53125f,0.0,
-0.03125f},{0.0625,0.96875f,0.0,0.53125f},{0.875,0.1875,0.0,0.9375},{0.0,0.09375f
-,1.0,1.0},{0.0,0.53125f,0.0,0.03125f},{0.03125f,0.125,1.0,1.0},{1.0,1.0,0.0625,
-1.0},{0.0,1.0,0.0,0.5625},},{{0.0,0.5,0.0,0.71875f},{0.0625,0.84375f,0.0,0.875},
-{1.0,0.5,0.5,0.96875f},{1.0,0.09375f,0.3125,0.5},{0.0,0.5,0.0,0.71875f},{1.0,///
-0.03125f,0.03125f,0.53125f},{1.0,1.0,0.0625,1.0},{0.0,1.0,0.03125f,0.1875},},{{
-0.0,0.59375f,0.0,0.96875f},{0.0625,0.8125,0.0625,0.59375f},{0.75,0.4375,0.125,//
-0.96875f},{0.875,0.0625,0.1875,0.4375},{0.0,0.59375f,0.0,0.96875f},{0.15625f,///
-0.125,1.0,1.0},{1.0,1.0,0.0625,1.0},{0.0,1.0,0.03125f,0.34375f},}};typedef//////
-struct E{double A,B;int C;int D;int E;int F;}Gj;static int Gk(float Gw[8][4],int
-Gx,float Gy,int Gz,int G0,float G1,int G2,int G3,Gj*G4){double G5,G6;float*G7;//
-int G8;int G9;if((G2<=4)||(Gz<=4))G9=(G2<Gz)?6:7;else if((!G3)&&((G2<=16)||(Gz<=
-16)))G9=4;else if(G1<=1.0f)G9=G3?1:0;else if(G1<=2.0f)G9=2;else if(G1<=3.0f)G9=3
-;else G9=5;G7=Gw[G9];G6=(float)Gx*G7[0]+Gy*(float)G0*G7[1];G5=(float)G0*G7[2]+G1
-*(float)Gx*G7[3];G8=(G5<=G6)?1:0;if(G4){G4->B=G6;G4->A=G5;G4->E=G9;G4->D=G8;G4->
-F=G3;}if(G4&&G4->C)G8=(G4->C==2)?1:0;return G8;}static unsigned char Gl[]={1,2,3
-,3,4,4,4,4,4,2,2,4,4,4,4,2,2,};static B2 Gm[]={STBIRI_BGR,STBIRI_1CHANNEL,//////
+*HC);++Gy;++G0;++G2;++G4;++G6;++G8;++G_;++HB;}}static void GC Z6 Z1 const*G9=Gy[
+4];Z1 G_=Gx[4];Z1 const*HA=Gy[5];Z1 HB=Gx[5];Z1 const*HC=Gy[6];Z1 HD=Gx[6];while
+(((char*)Gz-(char*)G1)>=16){Z1 HE,HF,HG,HH;HE=G0[0]+G1[0]*G2;HF=G0[1]+G1[1]*G2;
+HG=G0[2]+G1[2]*G2;HH=G0[3]+Zu G0[0]+G1[0]*G2;HE+=G3[0]*G4;HE+=G5[0]*G6;HE+=G7[0]
+*G8;HE+=G9[0]*G_;HE+=HA[0]*HB;HE+=HC[0]*HD;G0[0]=HE;++G0;++G1;++G3;++G5;++G7;++
+G9;++HA;++HC;}}static void GD Zh Z1*RESTRICT G8=Gw[4];Z1 G9=Gx[4];Z1*RESTRICT G_
+=Gw[5];Z1 HA=Gx[5];Z1*RESTRICT HB=Gw[6];Z1 HC=Gx[6];Z1*RESTRICT HD=Gw[7];Z1 HE=
+Gx[7];while(((char*)Gz-(char*)Gy)>=16){Z1 HF,HG,HH,HI;HF=Gy[0],HG=Gy[1],HH=Gy[2]
+,HI=Gy[3];G0[0]=(HF*G1);G0[1]=(HG*G1);G0[2]=(HH*G1);G0[3]=(HI*G1);G2[0]=(HF*G3);
+G2[1]=(HG*G3);G2[2]=(HH*G3);G2[3]=(HI*G3);G4[0]=(HF*G5);G4[1]=(HG*G5);G4[2]=(HH*
+G5);G4[3]=(HI*G5);G6[0]=(HF*G7);G6[1]=(HG*G7);G6[2]=(HH*G7);G6[3]=(HI*G7);G8[0]=
+(HF*G9);G8[1]=(HG*G9);G8[2]=(HH*G9);G8[3]=(HI*G9);G_[0]=(HF*HA);G_[1]=(HG*HA);G_
+[2]=(HH*HA);G_[3]=(HI*HA);HB[0]=(HF*HC);HB[1]=(HG*HC);HB[2]=(HH*HC);HB[3]=(HI*HC
+);HD[0]=(HF*HE);HD[1]=(HG*HE);HD[2]=(HH*HE);HD[3]=(HI*HE);Gy+=4;G0+=4;G2+=4;G4+=
+4;G6+=4;G8+=4;G_+=4;HB+=4;HD+=4;}while(Gy<Gz){Z1 HF=Gy[0];G0[0]=(HF*G1);G2[0]=(
+HF*G3);G4[0]=(HF*G5);G6[0]=(HF*G7);G8[0]=(HF*G9);G_[0]=(HF*HA);HB[0]=(HF*HC);HD[
+0]=(HF*HE);++Gy;++G0;++G2;++G4;++G6;++G8;++G_;++HB;++HD;}}static void GE Z6 Z1//
+const*G9=Gy[4];Z1 G_=Gx[4];Z1 const*HA=Gy[5];Z1 HB=Gx[5];Z1 const*HC=Gy[6];Z1 HD
+=Gx[6];Z1 const*HE=Gy[7];Z1 HF=Gx[7];while(((char*)Gz-(char*)G1)>=16){Z1 HG,HH,
+HI,HJ;HG=G1[0]*G2;HH=G1[1]*G2;HI=G1[2]*G2;HJ=Zr G1[0]*G2;HG+=G3[0]*G4;HG+=G5[0]*
+G6;HG+=G7[0]*G8;HG+=G9[0]*G_;HG+=HA[0]*HB;HG+=HC[0]*HD;HG+=HE[0]*HF;G0[0]=HG;++
+G0;++G1;++G3;++G5;++G7;++G9;++HA;++HC;++HE;}}static void GF Zh Z1*RESTRICT G8=Gw
+[4];Z1 G9=Gx[4];Z1*RESTRICT G_=Gw[5];Z1 HA=Gx[5];Z1*RESTRICT HB=Gw[6];Z1 HC=Gx[6
+];Z1*RESTRICT HD=Gw[7];Z1 HE=Gx[7];while(((char*)Gz-(char*)Gy)>=16){Z1 HF,HG,HH,
+HI;HF=Gy[0],HG=Gy[1],HH=Gy[2],HI=Gy[3];G0[0]+=(HF*G1);G0[1]+=(HG*G1);G0[2]+=(HH*
+G1);G0[3]+=(HI*G1);G2[0]+=(HF*G3);G2[1]+=(HG*G3);G2[2]+=(HH*G3);G2[3]+=(HI*G3);
+G4[0]+=(HF*G5);G4[1]+=(HG*G5);G4[2]+=(HH*G5);G4[3]+=(HI*G5);G6[0]+=(HF*G7);G6[1]
++=(HG*G7);G6[2]+=(HH*G7);G6[3]+=(HI*G7);G8[0]+=(HF*G9);G8[1]+=(HG*G9);G8[2]+=(HH
+*G9);G8[3]+=(HI*G9);G_[0]+=(HF*HA);G_[1]+=(HG*HA);G_[2]+=(HH*HA);G_[3]+=(HI*HA);
+HB[0]+=(HF*HC);HB[1]+=(HG*HC);HB[2]+=(HH*HC);HB[3]+=(HI*HC);HD[0]+=(HF*HE);HD[1]
++=(HG*HE);HD[2]+=(HH*HE);HD[3]+=(HI*HE);Gy+=4;G0+=4;G2+=4;G4+=4;G6+=4;G8+=4;G_+=
+4;HB+=4;HD+=4;}while(Gy<Gz){Z1 HF=Gy[0];G0[0]+=(HF*G1);G2[0]+=(HF*G3);G4[0]+=(HF
+*G5);G6[0]+=(HF*G7);G8[0]+=(HF*G9);G_[0]+=(HF*HA);HB[0]+=(HF*HC);HD[0]+=(HF*HE);
+++Gy;++G0;++G2;++G4;++G6;++G8;++G_;++HB;++HD;}}static void GG Z6 Z1 const*G9=Gy[
+4];Z1 G_=Gx[4];Z1 const*HA=Gy[5];Z1 HB=Gx[5];Z1 const*HC=Gy[6];Z1 HD=Gx[6];Z1///
+const*HE=Gy[7];Z1 HF=Gx[7];while(((char*)Gz-(char*)G1)>=16){Z1 HG,HH,HI,HJ;HG=G0
+[0]+G1[0]*G2;HH=G0[1]+G1[1]*G2;HI=G0[2]+G1[2]*G2;HJ=G0[3]+Zr G0[0]+G1[0]*G2;HG+=
+G3[0]*G4;HG+=G5[0]*G6;HG+=G7[0]*G8;HG+=G9[0]*G_;HG+=HA[0]*HB;HG+=HC[0]*HD;HG+=HE
+[0]*HF;G0[0]=HG;++G0;++G1;++G3;++G5;++G7;++G9;++HA;++HC;++HE;}}typedef void GH(
+Z1*output,Z1 const*coeffs,Z1 const**inputs,Z1 const*input0_end);static GH*GI[8]=
+{Fn,Fr,Fv,Fz,F3,F7,GA,GE};static GH*GJ[8]={Fp,Ft,Fx,F1,F5,F9,GC,GG};typedef void
+GK(Z1**outputs,Z1 const*coeffs,Z1 const*input,Z1 const*input_end);static GK*GL[8
+]={Fm,Fq,Fu,Fy,F2,F6,F_,GD};static GK*GM[8]={Fo,Fs,Fw,F0,F4,F8,GB,GF};static////
+void GN(B0 const*Gw,void*Gx,Z1*Gy,int Gz){int G0=Gw->A.E.B;int G1=Gw->d;int G2=
+G0*G1;void*G3;if(Gw->T)Gw->T(Gy,G2);G3=Gx;if(Gw->M)G3=Gy;Gw->U(G3,G2,Gy);if(Gw->
+M)Gw->M(G3,G0,Gz,Gw->L);}static Z1*GO(B0 const*Gw,B_ const*Gx,int Gy){return(Z1*
+)(((char*)Gx->I)+(Gy*Gw->G));}static Z1*GP(B0 const*Gw,B_ const*Gx,int Gy){int//
+Gz=(Gx->D+(Gy-Gx->B))%Gw->H;return GO(Gw,Gx,Gz);}static void GQ(B0 const*Gw,Z1*
+Gx,Z1 const*Gy){Z1 const*Gz=Gy-(Gw->N.A.A*Gw->e);if((Gw->A.G==//////////////////
+STBIR_FILTER_POINT_SAMPLE)&&(Gw->A.E.C==1.0f))memcpy(Gx,Gy,Gw->A.E.B*4*Gw->e);//
+else Gw->S(Gx,Gw->A.E.B,Gz,Gw->A.A,Gw->A.B,Gw->A.K);}static void GR(B0 const*Gw,
+B_*Gx,int Gy,int Gz,int G0,Z1 const*G1){Z1*G2=Gx->J;Z1*G3=Gx->A;int G4=Gw->c;int
+G5=G4?(Gw->N.A.B-Gw->N.A.A+1):Gw->A.E.B;int G6=Gw->e*G5;{int G7=0,G8=G0-Gz+1;do{
+Z1 const*G9[8];int G_,HA=G8;if(HA>8)HA=8;for(G_=0;G_<HA;G_++)G9[G_]=GP(Gw,Gx,G7+
+G_+Gz);((G7==0)?GI:GJ)[HA-1](G4?G3:G2,G1+G7,G9,G9[0]+G6);G7+=HA;G8-=HA;}while(G8
+);}if(G4){G3[G6]=0.0f;G3[G6+1]=0.0f;GQ(Gw,G2,G3);}GN(Gw,((char*)Gw->D)+((size_t)
+Gy*(size_t)Gw->F),G2,Gy);}static void GS(B0 const*Gw,B_*Gx,int Gy){int Gz;Z1*G0;
+EK(Gw,Gy,Gx->A);Gx->C=Gy;Gz=(Gx->D+(Gx->C-Gx->B))%Gw->H;G0=GO(Gw,Gx,Gz);GQ(Gw,G0
+,Gx->A);}static void GT(B0 const*Gw,B_*Gx,int Gy){int Gz,G0,G1;B4*G2=Gw->B.A;Z1
+const*G3=Gw->B.B;G0=Gx->E;G1=Gx[Gy-1].F;G2+=G0;G3+=G0*Gw->B.K;Gx->D=0;Gx->B=G2->
+A;Gx->C=Gx->B-1;for(Gz=G0;Gz<G1;Gz++){int G4,G5;G4=G2->A;G5=G2->B;while(G5>Gx->C
+){if((Gx->C-Gx->B+1)==Gw->H){Gx->B++;Gx->D++;}if(Gw->c){Z1*G6=GP(Gw,Gx,++Gx->C);
+EK(Gw,Gx->C,G6);}else GS(Gw,Gx,Gx->C+1);}GR(Gw,Gx,Gz,G4,G5,G3);++G2;G3+=Gw->B.K;
+}}static void GU(B0 const*Gw,B_*Gx){Z1*Gy=GO(Gw,Gx,Gx->D);GN(Gw,((char*)Gw->D)+(
+(size_t)Gx->B*(size_t)Gw->F),Gy,Gx->B);Gy[0]=3e38;Gx->B++;if(++Gx->D==Gw->H)Gx->
+D=0;}static void GV(B0 const*Gw,B_*Gx){Z1*Gy=GO(Gw,Gx,Gx->D);GQ(Gw,Gx->J,Gy);GN(
+Gw,((char*)Gw->D)+((size_t)Gx->B*(size_t)Gw->F),Gx->J,Gx->B);Gy[0]=3e38;Gx->B++;
+if(++Gx->D==Gw->H)Gx->D=0;}static void GW(B0 const*Gw,B_*Gx,int Gy,int Gz,Z1////
+const*G0,Z1 const*G1,Z1 const*G2){{int G3=0,G4=Gz-Gy+1;do{Z1*G5[8];int G6,G7=G4;
+if(G7>8)G7=8;for(G6=0;G6<G7;G6++){G5[G6]=GP(Gw,Gx,G3+G6+Gy);if(G6&&((G5[G6][0]==
+3e38f)!=(G5[0][0]==3e38f))){G7=G6;break;}}(G5[0][0]==3e38f?GL:GM)[G7-1](G5,G0+G3
+,G1,G2);G3+=G7;G4-=G7;}while(G4);}}typedef void GX(B0 const*stbir_info,B_*//////
+split_info);static void GY(B0 const*Gw,B_*Gx,int Gy){int Gz,G0,G1,G2,G3;B4*G4=Gw
+->B.A;Z1 const*G5=Gw->B.B;GX*G6;void*G7;void*G8;int G9,G_;int HA=Gw->c?(Gw->N.A.
+B-Gw->N.A.A+1):Gw->A.E.B;int HB=Gw->e*HA;G0=Gx->E;G1=Gx[Gy-1].F;G2=Gx->G;G3=Gx[
+Gy-1].H;Gz=G2+Gw->B.M;G4+=Gz;G5+=Gw->B.K*Gz;if(Gw->c){G6=GV;G7=Gx->A;G8=((char*)
+G7)+4*Gw->e*(Gw->N.A.B-Gw->N.A.A+1);}else{G6=GU;G7=Gx->J;G8=((char*)G7)+4*Gw->e*
+Gw->A.E.B;}Gx->B=G0;Gx->C=-1;Gx->D=-1;for(Gz=0;Gz<Gw->H;Gz++){Z1*HC=GO(Gw,Gx,Gz)
+;HC[HB]=0.0f;HC[HB+1]=0.0f;HC[0]=3e38;}G9=1;G_=G2;for(Gz=G2;Gz<G3;Gz++){int HC,
+HD;HC=G4->A;HD=G4->B;if((HD>=HC)&&(((HC>=G0)&&(HC<G1))||((HD>=G0)&&(HD<G1)))){Z1
+const*HE=G5;G_=Gz;if(G9&&(Gz>G2))Gx->G=Gz;G9=0;if(HC<G0){HE+=G0-HC;HC=G0;}if(HD
+>=G1)HD=G1-1;if(Gx->D<0)Gx->D=HC-G0;EK(Gw,Gz,Gx->A);if(!Gw->c)GQ(Gw,Gx->J,Gx->A)
+;if(((Gx->C-Gx->B+1)==Gw->H)&&(HD>Gx->C))G6(Gw,Gx);GW(Gw,Gx,HC,HD,HE,(Z1*)G7,(Z1
+*)G8);if(HD>Gx->C)Gx->C=HD;}++G4;G5+=Gw->B.K;}while(Gx->B<G1)G6(Gw,Gx);++G_;for(
+Gz=0;Gz<Gy;Gz++)if(Gx[Gz].H>G_)Gx[Gz].H=G_;}static By*GZ[]={0,CP,CR,CT,CU,CV,CS}
+;static Bz*Ga[]={0,CQ,CX,CZ,CZ,CZ,CW};static void Gb(B8*Gw,Bu Gx,By*Gy,Bz*Gz,Bt
+G0,B7*G1,int G2,void*G3){if(Gx==0){Gx=STBIR_FILTER_MITCHELL;if(G1->C>=1.0)if((G1
+->C<=1.0)&&(((Z1)ceil((Z1)G1->E))==G1->E))Gx=STBIR_FILTER_POINT_SAMPLE;else Gx=
+STBIR_FILTER_CATMULLROM;}Gw->G=Gx;Gw->H=GZ[Gx];Gw->I=Ga[Gx];if(Gy&&Gz){Gw->H=Gy;
+Gw->I=Gz;Gw->G=STBIR_FILTER_OTHER;}Gw->J=G0;Gw->L=Ca(Gw->I,G1->C,G3);Gw->R=0;if(
+G1->C>=1.0)Gw->R=1;else if(G2||(Gw->L<=32))Gw->R=2;Gw->K=Cb(Gw,Gw->R,G3);if(G0==
+STBIR_EDGE_WRAP)if(Gw->L>(G1->A*3))Gw->L=G1->A*3;Gw->M=Gw->L/2;if(G0==//////////
+STBIR_EDGE_WRAP)if(Gw->M>G1->A)Gw->M=G1->A;Gw->N=Cc(Gw,Gw->R);Gw->O=Gw->N*8;Gw->
+P=Gw->N*Gw->K*4+12;Gw->C=0;Gw->D=0;if(Gw->R==0){Gw->T=Gw->L;Gw->S=Cc(Gw,2);Gw->U
+=Gw->S*8;Gw->V=Gw->S*Gw->T*4;}}static void Gc(B8*Gw,B4*Gx,void*Gy){Z1 Gz=Gw->E.C
+;Z1 G0=Gw->E.E;Bz*G1=Gw->I;int G2=Gw->E.A;Bt G3=Gw->J;Z1 G4=Gw->E.D;if(Gw->R==1)
+{int G5,G6;Z1 G7=G1(G4,Gy)*Gz;Cl(&G5,&G6,0.5,G7,G4,G0,G2,G3);Gx->A=G5;Cl(&G5,&G6
+,((Z1)(Gw->E.B-1))+0.5f,G7,G4,G0,G2,G3);Gx->B=G6;}else if(Gw->R==2){Z1 G5=G1(Gz,
+Gy)*G4;int G6=Gw->M;int G7=Gw->E.B;int G8;int G9;int G_,HA;Cl(&G_,&HA,0,0,G4,G0,
+G2,G3);Gx->A=G_;Cl(&G_,&HA,(Z1)G7,0,G4,G0,G2,G3);Gx->B=HA;G9=Gx->A+1;G8=-G6;////
+while(G9>=G8){int HB,HC;Co(&HB,&HC,((Z1)G9)+0.5f,G5,Gz,G0,G7);if(HB>HC)break;if(
+(HB<G7)||(HC>=0))Gx->A=G9;--G9;}G9=Gx->B-1;G8=G9+1+G6;while(G9<=G8){int HB,HC;Co
+(&HB,&HC,((Z1)G9)+0.5f,G5,Gz,G0,G7);if(HB>HC)break;if((HB<G7)||(HC>=0))Gx->B=G9;
+++G9;}}if(Gw->J==STBIR_EDGE_WRAP){if((Gx->A>0)&&(Gx->B>=G2)){int G5=Gx->B-G2+1;
+if((G5+16)>=Gx->A)Gx->A=0;}if((Gx->A<0)&&(Gx->B<(G2-1))){int G5=-Gx->A;if((G2-G5
+-16-1)<=Gx->B)Gx->B=G2-1;}}else{if(Gx->A<0)Gx->A=0;if(Gx->B>=G2)Gx->B=G2-1;}}///
+static void Gd(B_*Gw,int Gx,int Gy,int Gz,int G0,int G1,B4*G2){int G3,G4;int G5=
+Gy;G4=0;for(G3=0;G3<Gx;G3++){int G6;Gw[G3].E=G4;G6=G5/(Gx-G3);Gw[G3].F=G4+G6;if(
+G1&&G3){B4*G7;int G8,G9,G_,HA;B4*HB=G2+G4;G_=Gz*3;if(G6<G_)G_=G6;G9=0;G7=HB;HA=
+G7->A;for(G8=1;G8<=G_;G8++){++HB;if(HB->A>HA)break;if(HB->A<G7->A){G7=HB;G9=G8;}
+}Gw[G3-1].F+=G9;Gw[G3].E+=G9;}G4+=G6;G5-=G6;Gw[G3].G=-Gz;Gw[G3].H=G0+Gz;}}static
+void Ge(B0*Gw){if(Gw)if(Gw->O){void*Gx=Gw->O;Gw->O=0;((void)Gw->L,free(Gx));}}//
+static int Gf(int Gw,int Gx){int Gy;int Gz=0;for(Gy=0;Gy<Gw;Gy++){int G0=Gx/(Gw-
+Gy);if(G0>Gz)Gz=G0;Gx-=G0;}return Gz;}static CC**Gg[8]={0,Eb,Et,FA,FS,0,0,Fk};//
+static CC**Gh[8]={0,Ec,Eu,FB,FT,0,0,Fl};static Z1 Gi[5][8][4]={{{1.0,1.0,0.3125,
+1.0},{0.5625,0.59375f,0.0,0.96875f},{1.0,0.0625,0.0,1.0},{0.0,0.09375f,1.0,1.0},
+{1.0,1.0,0.3125,1.0},{0.03125f,0.125,1.0,1.0},{1.0,1.0,0.0625,1.0},{0.0,1.0,0.0,
+0.03125f},},{{0.0,0.84375f,0.0,0.03125f},{0.09375f,0.9375,0.0,0.78125f},{0.875,
+0.21875f,0.0,0.96875f},{0.09375f,0.09375f,1.0,1.0},{0.0,0.84375f,0.0,0.03125f},{
+0.03125f,0.125,1.0,1.0},{1.0,1.0,0.0625,1.0},{0.0,1.0,0.0,0.53125f},},{{0.0,////
+0.53125f,0.0,0.03125f},{0.0625,0.96875f,0.0,0.53125f},{0.875,0.1875,0.0,0.9375},
+{0.0,0.09375f,1.0,1.0},{0.0,0.53125f,0.0,0.03125f},{0.03125f,0.125,1.0,1.0},{1.0
+,1.0,0.0625,1.0},{0.0,1.0,0.0,0.5625},},{{0.0,0.5,0.0,0.71875f},{0.0625,0.84375f
+,0.0,0.875},{1.0,0.5,0.5,0.96875f},{1.0,0.09375f,0.3125,0.5},{0.0,0.5,0.0,//////
+0.71875f},{1.0,0.03125f,0.03125f,0.53125f},{1.0,1.0,0.0625,1.0},{0.0,1.0,///////
+0.03125f,0.1875},},{{0.0,0.59375f,0.0,0.96875f},{0.0625,0.8125,0.0625,0.59375f},
+{0.75,0.4375,0.125,0.96875f},{0.875,0.0625,0.1875,0.4375},{0.0,0.59375f,0.0,////
+0.96875f},{0.15625f,0.125,1.0,1.0},{1.0,1.0,0.0625,1.0},{0.0,1.0,0.03125f,//////
+0.34375f},}};typedef struct E{double A,B;int C;int D;int E;int F;}Gj;static int
+Gk(Z1 Gw[8][4],int Gx,Z1 Gy,int Gz,int G0,Z1 G1,int G2,int G3,Gj*G4){double G5,
+G6;Z1*G7;int G8;int G9;if((G2<=4)||(Gz<=4))G9=(G2<Gz)?6:7;else if((!G3)&&((G2<=
+16)||(Gz<=16)))G9=4;else if(G1<=1.0f)G9=G3?1:0;else if(G1<=2.0f)G9=2;else if(G1
+<=3.0f)G9=3;else G9=5;G7=Gw[G9];G6=(Z1)Gx*G7[0]+Gy*(Z1)G0*G7[1];G5=(Z1)G0*G7[2]+
+G1*(Z1)Gx*G7[3];G8=(G5<=G6)?1:0;if(G4){G4->B=G6;G4->A=G5;G4->E=G9;G4->D=G8;G4->F
+=G3;}if(G4&&G4->C)G8=(G4->C==2)?1:0;return G8;}static unsigned char Gl[]={1,2,3,
+3,4,4,4,4,4,2,2,4,4,4,4,2,2,};static B2 Gm[]={STBIRI_BGR,STBIRI_1CHANNEL,///////
 STBIRI_2CHANNEL,STBIRI_RGB,STBIRI_RGBA,STBIRI_4CHANNEL,STBIRI_BGRA,STBIRI_ARGB,
 STBIRI_ABGR,STBIRI_RA,STBIRI_AR,STBIRI_RGBA_PM,STBIRI_BGRA_PM,STBIRI_ARGB_PM,///
 STBIRI_ABGR_PM,STBIRI_RA_PM,STBIRI_AR_PM,};static B0*Gn(B8*Gw,B8*Gx,B4*Gy,Bs Gz,
@@ -3069,50 +2332,49 @@ STBIRI_RGBA];}else if(HF==4){G7->R=HR[HH-STBIRI_RGBA];G7->T=HS[HI-STBIRI_RGBA];}
 else if(HF==1)G7->R=HR[HH-STBIRI_RGBA];else if(HF==3)G7->T=HS[HI-STBIRI_RGBA];if
 (((HH==STBIRI_RGB)&&(HI==STBIRI_BGR))||((HH==STBIRI_BGR)&&(HI==STBIRI_RGB)))if(
 Gw->E.C<1.0f)G7->T=EJ;else G7->R=EJ;}for(HL=0;HL<G1;HL++){HM=(void*)((((size_t)
-HM)+15)&~15);if(G8)G7->P[HL].A=(float*)HM;HM=(char*)(((size_t)HM)+HA);HM=(void*)
-((((size_t)HM)+15)&~15);if(G8)G7->P[HL].I=(float*)HM;HM=(char*)(((size_t)HM)+HC)
-;HM=(void*)((((size_t)HM)+15)&~15);if(G8)G7->P[HL].J=(float*)HM;HM=(char*)(((///
-size_t)HM)+HD);}if(Gx->R==0){size_t HP;size_t HQ;HP=(size_t)Gx->U+(size_t)Gx->V;
-HQ=(size_t)(HA+HC+HD)*(size_t)G1;if(HQ>=HP){if(G7){Gx->C=(B4*)G7->P[0].A;Gx->D=(
-float*)(((char*)G7->P[0].A)+Gx->U);}}else{HM=(void*)((((size_t)HM)+15)&~15);if(
-G8)Gx->C=(B4*)HM;HM=(char*)(((size_t)HM)+Gx->U);HM=(void*)((((size_t)HM)+15)&~15
-);if(G8)Gx->D=(float*)HM;HM=(char*)(((size_t)HM)+Gx->V);}}HM=(void*)((((size_t)
-HM)+15)&~15);if(G8)Gw->A=(B4*)HM;HM=(char*)(((size_t)HM)+Gw->O);HM=(void*)((((//
-size_t)HM)+15)&~15);if(G8)Gw->B=(float*)HM;HM=(char*)(((size_t)HM)+Gw->P);if((Gw
-->H==Gx->H)&&(Gw->I==Gx->I)&&(Gw->J==Gx->J)&&(Gw->E.B==Gx->E.B)){float HP=Gw->E.
-C-Gx->E.C;float HQ=Gw->E.E-Gx->E.E;if(HP<0.0f)HP=-HP;if(HQ<0.0f)HQ=-HQ;if((HP<=
-7.523e-37)&&(HQ<=7.523e-37)){if(Gw->R==Gx->R){HN=1;goto no_vert_alloc;}HO=Gw;}}
-HM=(void*)((((size_t)HM)+15)&~15);if(G8)Gx->A=(B4*)HM;HM=(char*)(((size_t)HM)+Gx
-->O);HM=(void*)((((size_t)HM)+15)&~15);if(G8)Gx->B=(float*)HM;HM=(char*)(((/////
-size_t)HM)+Gx->P);no_vert_alloc:if(G7){Cs(Gw,0,G5);G7->S=Gg[HK][Gw->Q.C&3];if(Gw
-->Q.C<=12)G7->S=Gh[HK][Gw->Q.C-1];G7->N.A.A=Gy->A;G7->N.A.B=Gy->B;Ck(Gw,&G7->N);
-Gw->K=Cr(Gw->N,Gw->A,Gw->B,Gw->K,Gw->Q.C,G7->N.A.A,G7->N.A.B);memcpy(&G7->A,Gw,
-152);if(HN)memcpy(&G7->B,Gw,152);else{Cs(Gx,HO,G5);memcpy(&G7->B,Gx,152);}Gd(G7
-->P,G7->W,G7->B.E.B,G7->B.M,G7->B.E.A,G7->B.R,G7->B.A);G7->H=G7->B.Q.C;if((!G7->
-B.R)&&(G7->H>HG))G7->H=HG;}if(G7==0){G9=(15+(size_t)HM);G8=((void)G5,malloc(G9))
-;if(G8==0)return 0;}else return G7;}}static int Go(B0 const*Gw,int Gx,int Gy){B_
-*Gz=Gw->P+Gx;if(Gw->B.R)GT(Gw,Gz,Gy);else GY(Gw,Gz,Gy);return 1;}static void Gp(
-B0*Gw,B1*Gx){static CA*Gy[5]={Cx,Cx,0,C9,C7,};static CA*Gz[6][5]={{Cz,Cx,0,C9,C7
-},{DG,DE,0,DO,DM},{DW,DU,0,De,Dc},{Dm,Dk,0,Du,Ds},{C1,Cx,0,C9,C7},{D2,D0,0,D_,D8
-},};static CA*G0[2][2]={{Ct,Cv},{C3,C5},};static CA*G1[6][2][2]={{{Ct,Cv},{C3,C5
-}},{{DA,DC},{DI,DK}},{{DQ,DS},{DY,Da}},{{Dg,Di},{Do,Dq}},{{Ct,Cv},{C3,C5}},{{Dw,
-Dy},{D4,D6}}};static CE*G2[5]={Cy,Cy,0,C_,C8,};static CE*G3[6][5]={{C0,Cy,0,C_,
-C8},{DH,DF,0,DP,DN},{DX,DV,0,Df,Dd},{Dn,Dl,0,Dv,Dt},{C2,Cy,0,C_,C8},{D3,D1,0,EA,
-D9}};static CE*G4[2][2]={{Cu,Cw},{C4,C6},};static CE*G5[6][2][2]={{{Cu,Cw},{C4,
-C6}},{{DB,DD},{DJ,DL}},{{DR,DT},{DZ,Db}},{{Dh,Dj},{Dp,Dr}},{{Cu,Cw},{C4,C6}},{{
-Dx,Dz},{D5,D7}}};CA*G6=0;CE*G7=0;Bv G8,G9;G8=Gx->Z;G9=Gx->a;Gw->C=Gx->B;Gw->E=Gx
-->R;Gw->F=Gx->S;if((Gw->A.G==STBIR_FILTER_POINT_SAMPLE)&&(Gw->B.G==/////////////
-STBIR_FILTER_POINT_SAMPLE))if(((G8==STBIR_TYPE_UINT8_SRGB)||(G8==///////////////
-STBIR_TYPE_UINT8_SRGB_ALPHA))&&((G9==STBIR_TYPE_UINT8_SRGB)||(G9==//////////////
-STBIR_TYPE_UINT8_SRGB_ALPHA))){G8=STBIR_TYPE_UINT8;G9=STBIR_TYPE_UINT8;}if(Gw->E
-==0)Gw->E=Gw->d*Gw->A.E.A*B3[G8];if(Gw->F==0)Gw->F=Gw->d*Gw->A.E.B*B3[G9];Gw->D=
-((char*)Gx->J)+((size_t)Gw->b*(size_t)Gx->S)+(Gw->a*Gw->d*B3[G9]);Gw->K=Gx->I;Gw
-->L=Gx->A;Gw->M=Gx->Q;if((G8==STBIR_TYPE_UINT8)||(G8==STBIR_TYPE_UINT16)){int G_
-=0;if((!Gw->R)&&(!Gw->T))if(((G8==STBIR_TYPE_UINT8)&&(G9==STBIR_TYPE_UINT8))||((
-G8==STBIR_TYPE_UINT16)&&(G9==STBIR_TYPE_UINT16)))G_=1;if(Gw->X<=STBIRI_4CHANNEL)
-G6=G0[G8==STBIR_TYPE_UINT16][G_];else G6=G1[(Gw->X-STBIRI_RGBA)%6][G8==/////////
-STBIR_TYPE_UINT16][G_];}else if(Gw->X<=STBIRI_4CHANNEL)G6=Gy[G8-////////////////
-STBIR_TYPE_UINT8_SRGB];else G6=Gz[(Gw->X-STBIRI_RGBA)%6][G8-////////////////////
+HM)+15)&~15);if(G8)G7->P[HL].A=(Z1*)HM;HM=(char*)(((size_t)HM)+HA);HM=(void*)(((
+(size_t)HM)+15)&~15);if(G8)G7->P[HL].I=(Z1*)HM;HM=(char*)(((size_t)HM)+HC);HM=(
+void*)((((size_t)HM)+15)&~15);if(G8)G7->P[HL].J=(Z1*)HM;HM=(char*)(((size_t)HM)+
+HD);}if(Gx->R==0){size_t HP;size_t HQ;HP=(size_t)Gx->U+(size_t)Gx->V;HQ=(size_t)
+(HA+HC+HD)*(size_t)G1;if(HQ>=HP){if(G7){Gx->C=(B4*)G7->P[0].A;Gx->D=(Z1*)(((char
+*)G7->P[0].A)+Gx->U);}}else{HM=(void*)((((size_t)HM)+15)&~15);if(G8)Gx->C=(B4*)
+HM;HM=(char*)(((size_t)HM)+Gx->U);HM=(void*)((((size_t)HM)+15)&~15);if(G8)Gx->D=
+(Z1*)HM;HM=(char*)(((size_t)HM)+Gx->V);}}HM=(void*)((((size_t)HM)+15)&~15);if(G8
+)Gw->A=(B4*)HM;HM=(char*)(((size_t)HM)+Gw->O);HM=(void*)((((size_t)HM)+15)&~15);
+if(G8)Gw->B=(Z1*)HM;HM=(char*)(((size_t)HM)+Gw->P);if((Gw->H==Gx->H)&&(Gw->I==Gx
+->I)&&(Gw->J==Gx->J)&&(Gw->E.B==Gx->E.B)){Z1 HP=Gw->E.C-Gx->E.C;Z1 HQ=Gw->E.E-Gx
+->E.E;if(HP<0.0f)HP=-HP;if(HQ<0.0f)HQ=-HQ;if((HP<=7.523e-37)&&(HQ<=7.523e-37)){
+if(Gw->R==Gx->R){HN=1;goto no_vert_alloc;}HO=Gw;}}HM=(void*)((((size_t)HM)+15)&~
+15);if(G8)Gx->A=(B4*)HM;HM=(char*)(((size_t)HM)+Gx->O);HM=(void*)((((size_t)HM)+
+15)&~15);if(G8)Gx->B=(Z1*)HM;HM=(char*)(((size_t)HM)+Gx->P);no_vert_alloc:if(G7)
+{Cs(Gw,0,G5);G7->S=Gg[HK][Gw->Q.C&3];if(Gw->Q.C<=12)G7->S=Gh[HK][Gw->Q.C-1];G7->
+N.A.A=Gy->A;G7->N.A.B=Gy->B;Ck(Gw,&G7->N);Gw->K=Cr(Gw->N,Gw->A,Gw->B,Gw->K,Gw->Q
+.C,G7->N.A.A,G7->N.A.B);memcpy(&G7->A,Gw,152);if(HN)memcpy(&G7->B,Gw,152);else{
+Cs(Gx,HO,G5);memcpy(&G7->B,Gx,152);}Gd(G7->P,G7->W,G7->B.E.B,G7->B.M,G7->B.E.A,
+G7->B.R,G7->B.A);G7->H=G7->B.Q.C;if((!G7->B.R)&&(G7->H>HG))G7->H=HG;}if(G7==0){
+G9=(15+(size_t)HM);G8=((void)G5,malloc(G9));if(G8==0)return 0;}else return G7;}}
+static int Go(B0 const*Gw,int Gx,int Gy){B_*Gz=Gw->P+Gx;if(Gw->B.R)GT(Gw,Gz,Gy);
+else GY(Gw,Gz,Gy);return 1;}static void Gp(B0*Gw,B1*Gx){static CA*Gy[5]={Cx,Cx,0
+,C9,C7,};static CA*Gz[6][5]={{Cz,Cx,0,C9,C7},{DG,DE,0,DO,DM},{DW,DU,0,De,Dc},{Dm
+,Dk,0,Du,Ds},{C1,Cx,0,C9,C7},{D2,D0,0,D_,D8},};static CA*G0[2][2]={{Ct,Cv},{C3,
+C5},};static CA*G1[6][2][2]={{{Ct,Cv},{C3,C5}},{{DA,DC},{DI,DK}},{{DQ,DS},{DY,Da
+}},{{Dg,Di},{Do,Dq}},{{Ct,Cv},{C3,C5}},{{Dw,Dy},{D4,D6}}};static CE*G2[5]={Cy,Cy
+,0,C_,C8,};static CE*G3[6][5]={{C0,Cy,0,C_,C8},{DH,DF,0,DP,DN},{DX,DV,0,Df,Dd},{
+Dn,Dl,0,Dv,Dt},{C2,Cy,0,C_,C8},{D3,D1,0,EA,D9}};static CE*G4[2][2]={{Cu,Cw},{C4,
+C6},};static CE*G5[6][2][2]={{{Cu,Cw},{C4,C6}},{{DB,DD},{DJ,DL}},{{DR,DT},{DZ,Db
+}},{{Dh,Dj},{Dp,Dr}},{{Cu,Cw},{C4,C6}},{{Dx,Dz},{D5,D7}}};CA*G6=0;CE*G7=0;Bv G8,
+G9;G8=Gx->Z;G9=Gx->a;Gw->C=Gx->B;Gw->E=Gx->R;Gw->F=Gx->S;if((Gw->A.G==//////////
+STBIR_FILTER_POINT_SAMPLE)&&(Gw->B.G==STBIR_FILTER_POINT_SAMPLE))if(((G8==//////
+STBIR_TYPE_UINT8_SRGB)||(G8==STBIR_TYPE_UINT8_SRGB_ALPHA))&&((G9==//////////////
+STBIR_TYPE_UINT8_SRGB)||(G9==STBIR_TYPE_UINT8_SRGB_ALPHA))){G8=STBIR_TYPE_UINT8;
+G9=STBIR_TYPE_UINT8;}if(Gw->E==0)Gw->E=Gw->d*Gw->A.E.A*B3[G8];if(Gw->F==0)Gw->F=
+Gw->d*Gw->A.E.B*B3[G9];Gw->D=((char*)Gx->J)+((size_t)Gw->b*(size_t)Gx->S)+(Gw->a
+*Gw->d*B3[G9]);Gw->K=Gx->I;Gw->L=Gx->A;Gw->M=Gx->Q;if((G8==STBIR_TYPE_UINT8)||(
+G8==STBIR_TYPE_UINT16)){int G_=0;if((!Gw->R)&&(!Gw->T))if(((G8==STBIR_TYPE_UINT8
+)&&(G9==STBIR_TYPE_UINT8))||((G8==STBIR_TYPE_UINT16)&&(G9==STBIR_TYPE_UINT16)))
+G_=1;if(Gw->X<=STBIRI_4CHANNEL)G6=G0[G8==STBIR_TYPE_UINT16][G_];else G6=G1[(Gw->
+X-STBIRI_RGBA)%6][G8==STBIR_TYPE_UINT16][G_];}else if(Gw->X<=STBIRI_4CHANNEL)G6=
+Gy[G8-STBIR_TYPE_UINT8_SRGB];else G6=Gz[(Gw->X-STBIRI_RGBA)%6][G8-//////////////
 STBIR_TYPE_UINT8_SRGB];if((G9==STBIR_TYPE_UINT8)||(G9==STBIR_TYPE_UINT16)){int//
 G_=0;if((!Gw->R)&&(!Gw->T))if(((G8==STBIR_TYPE_UINT8)&&(G9==STBIR_TYPE_UINT8))||
 ((G8==STBIR_TYPE_UINT16)&&(G9==STBIR_TYPE_UINT16)))G_=1;if(Gw->Y<=//////////////
@@ -3133,16 +2395,16 @@ G5;G5=G7;G7=G9;G9=G8*G6+G4;G4=G6;G6=G9;}if(G0){G6=(Br)(Gw*(double)Gx+0.5);G7=Gx;
 int Gs(B7*Gw,int Gx,int*Gy,int Gz,int G0,double G1,double G2){double G3,G4,G5,G6
 ,G7,G8;G6=G2-G1;if((Gx==0)||(G0==0)||(Gz==0)||(G6<=7.523e-37))return 0;if((*Gy>=
 Gx)||((*Gy+Gz)<=0)||(G1>=1.0)||(G2<=7.523e-37))return 0;G3=(double)Gx;G4=(double
-)G0;G5=((double)Gz)/G3;G7=G5/G6;G8=(G3/G4)*G7;Gw->C=(float)G8;Gw->D=(float)(1.0/ 
-G8);Gq(Gy,&Gz,Gx,&G1,&G2);G6=G2-G1;if(G6<=7.523e-37)return 0;Gw->E=(float)(G1*G7
-*G3);Gw->F=Gr(G8,(G8<=1.0)?Gx:G0,&Gw->G,&Gw->H,G8>=1.0);Gw->A=G0;Gw->B=Gz;return
-1;}static void Gt(B1*Gw,Bs Gx,Bv Gy){Gw->I=0;Gw->Q=0;Gw->A=Gw;Gw->j=0;Gw->W=0;Gw
-->b=STBIR_FILTER_DEFAULT;Gw->f=0;Gw->g=0;Gw->c=STBIR_FILTER_DEFAULT;Gw->h=0;Gw->
-i=0;Gw->d=STBIR_EDGE_CLAMP;Gw->e=STBIR_EDGE_CLAMP;Gw->E=0;Gw->F=0;Gw->G=1;Gw->H=
-1;Gw->M=0;Gw->N=0;Gw->O=Gw->K;Gw->P=Gw->L;Gw->Z=Gy;Gw->a=Gy;Gw->X=Gx;Gw->Y=Gx;Gw
-->V=1;}extern void stbir_resize_init(B1*Gw,const void*Gx,int Gy,int Gz,int G0,//
-void*G1,int G2,int G3,int G4,Bs G5,Bv G6){Gw->B=Gx;Gw->C=Gy;Gw->D=Gz;Gw->R=G0;Gw
-->J=G1;Gw->K=G2;Gw->L=G3;Gw->S=G4;Gw->U=0;Gt(Gw,G5,G6);}extern void/////////////
+)G0;G5=((double)Gz)/G3;G7=G5/G6;G8=(G3/G4)*G7;Gw->C=(Z1)G8;Gw->D=(Z1)(1.0/G8);Gq
+(Gy,&Gz,Gx,&G1,&G2);G6=G2-G1;if(G6<=7.523e-37)return 0;Gw->E=(Z1)(G1*G7*G3);Gw->
+F=Gr(G8,(G8<=1.0)?Gx:G0,&Gw->G,&Gw->H,G8>=1.0);Gw->A=G0;Gw->B=Gz;return 1;}/////
+static void Gt(B1*Gw,Bs Gx,Bv Gy){Gw->I=0;Gw->Q=0;Gw->A=Gw;Gw->j=0;Gw->W=0;Gw->b
+=STBIR_FILTER_DEFAULT;Gw->f=0;Gw->g=0;Gw->c=STBIR_FILTER_DEFAULT;Gw->h=0;Gw->i=0
+;Gw->d=STBIR_EDGE_CLAMP;Gw->e=STBIR_EDGE_CLAMP;Gw->E=0;Gw->F=0;Gw->G=1;Gw->H=1;
+Gw->M=0;Gw->N=0;Gw->O=Gw->K;Gw->P=Gw->L;Gw->Z=Gy;Gw->a=Gy;Gw->X=Gx;Gw->Y=Gx;Gw->
+V=1;}extern void stbir_resize_init(B1*Gw,const void*Gx,int Gy,int Gz,int G0,void
+*G1,int G2,int G3,int G4,Bs G5,Bv G6){Gw->B=Gx;Gw->C=Gy;Gw->D=Gz;Gw->R=G0;Gw->J=
+G1;Gw->K=G2;Gw->L=G3;Gw->S=G4;Gw->U=0;Gt(Gw,G5,G6);}extern void/////////////////
 stbir_set_datatypes(B1*Gw,Bv Gx,Bv Gy){Gw->Z=Gx;Gw->a=Gy;if(Gw->j&&(!Gw->V))Gp(
 Gw->j,Gw);}extern void stbir_set_pixel_callbacks(B1*Gw,Bw*Gx,Bx*Gy){Gw->I=Gx;Gw
 ->Q=Gy;if(Gw->j&&(!Gw->V)){Gw->j->K=Gx;Gw->j->M=Gy;}}extern void////////////////
@@ -3195,23 +2457,47 @@ if(G0==0){size_t HC;char*HD;HC=(size_t)G_*(size_t)G2;if(HC==0)return 0;HD=(char*
 return 0;}return HB?HB:HA;}extern unsigned char*stbir_resize_uint8_linear(const
 unsigned char*Gw,int Gx,int Gy,int Gz,unsigned char*G0,int G1,int G2,int G3,Bs//
 G4){return(unsigned char*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,STBIR_TYPE_UINT8,///////
-STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern unsigned char* //////////////////
+STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern unsigned char*///////////////////
 stbir_resize_uint8_srgb(const unsigned char*Gw,int Gx,int Gy,int Gz,unsigned////
 char*G0,int G1,int G2,int G3,Bs G4){return(unsigned char*)Gv(Gw,Gx,Gy,Gz,G0,G1,
-G2,G3,G4,STBIR_TYPE_UINT8_SRGB,STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern///
-float*stbir_resize_float_linear(const float*Gw,int Gx,int Gy,int Gz,float*G0,int
-G1,int G2,int G3,Bs G4){return(float*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,////////////
-STBIR_TYPE_FLOAT,STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern void* //////////
-stbir_resize(const void*Gw,int Gx,int Gy,int Gz,void*G0,int G1,int G2,int G3,Bs
-G4,Bv G5,Bt G6,Bu G7){return(void*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,G5,G6,G7);}////
+G2,G3,G4,STBIR_TYPE_UINT8_SRGB,STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern Z1
+*stbir_resize_Z1_linear(const Z1*Gw,int Gx,int Gy,int Gz,Z1*G0,int G1,int G2,int
+G3,Bs G4){return(Z1*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,STBIR_TYPE_Z1,///////////////
+STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern void*stbir_resize(const void*Gw,
+int Gx,int Gy,int Gz,void*G0,int G1,int G2,int G3,Bs G4,Bv G5,Bt G6,Bu G7){/////
+return(void*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,G5,G6,G7);}//////////////////////////
 
-#ifndef _MSC_VER
-#  pragma GCC diagnostic pop
-#else
+#if defined(_MSC_VER)
 #  pragma warning(pop)
+#else
+#  pragma GCC diagnostic pop
 #endif
 // clang-format on
 // NOLINTEND
+
+/* Wrapper for stbi_load to handle utf-8 filenames properly */
+unsigned char* load_image_utf8(
+  const char* utf8_path, int* w, int* h, int* ch, int req_comp)
+{
+#ifdef _WIN32
+  // Windows: convert utf-8 -> utf-16 and open with _wfopen
+  int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, NULL, 0);
+  if (wlen == 0) return NULL;
+
+  wchar_t* wpath = (wchar_t*)malloc(wlen * sizeof(wchar_t));
+  MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, wpath, wlen);
+
+  FILE* f = _wfopen(wpath, L"rb");
+  free(wpath);
+  if (!f) return NULL;
+
+  unsigned char* data = stbi_load_from_file(f, w, h, ch, req_comp);
+  fclose(f);
+  return data;
+#else
+    return stbi_load(utf8_path, w, h, ch, req_comp);
+#endif
+}
 
 // The actual code starts here :D
 
@@ -3252,9 +2538,9 @@ G4,Bv G5,Bt G6,Bu G7){return(void*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,G5,G6,G7);}////
 #define BF16 2
 #define FP32 3
 
-#ifndef DTYPE
+#if !defined(DTYPE)
 // Default dtype
-#  ifdef _MSC_VER
+#  if defined(_MSC_VER)
 #    define DTYPE FP32
 #  else
 #    define DTYPE FP16
@@ -3279,10 +2565,10 @@ G4,Bv G5,Bt G6,Bu G7){return(void*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,G5,G6,G7);}////
 #endif
 // clang-format on
 
-#ifdef min
+#if defined(min)
 #  undef min
 #endif
-#ifdef max
+#if defined(max)
 #  undef max
 #endif
 
@@ -5485,9 +4771,9 @@ quantize_act(int8_t *dst, const floatx *vec, int dim)
  * Q(fpx src (m, n)) ~= int8 dst (m, n) * fpx dst_scales (m,) */
 static void
 quantize_acts(
-  int8_t *restrict       dst,
-  floatx *restrict       dst_scales,
-  const floatx *restrict src,
+  int8_t *RESTRICT       dst,
+  floatx *RESTRICT       dst_scales,
+  const floatx *RESTRICT src,
   int                    src_stride,
   int                    m,
   int                    n,
@@ -5518,7 +4804,7 @@ quantize_acts(
 /* */
 static inline floatx
 gemv_fpx_row(
-  const floatx *restrict vec, const floatx *restrict mat, int n, int i
+  const floatx *RESTRICT vec, const floatx *RESTRICT mat, int n, int i
 )
 {
   float sum = 0;
@@ -5535,9 +4821,9 @@ gemv_fpx_row(
  * fpx vec (n,) @ fpx mat (m, n).T = fpx dst (m,) */
 static void
 gemv_fpx(
-  floatx *restrict       dst,
-  const floatx *restrict mat,
-  const floatx *restrict vec,
+  floatx *RESTRICT       dst,
+  const floatx *RESTRICT mat,
+  const floatx *RESTRICT vec,
   int                    m,
   int                    n,
   bool                   omp
@@ -5562,10 +4848,10 @@ gemv_fpx(
 /* */
 static inline floatx
 gemv_int8_row(
-  const int8_t *restrict vec,
+  const int8_t *RESTRICT vec,
   floatx                 vec_scale,
-  const int8_t *restrict mat,
-  const floatx *restrict mat_scales,
+  const int8_t *RESTRICT mat,
+  const floatx *RESTRICT mat_scales,
   int                    n,
   int                    i
 )
@@ -5585,10 +4871,10 @@ gemv_int8_row(
  * @ (int8 mat (m, n) * fpx mat_scales (m,)).T = fpx dst (m,) */
 static void
 gemv_int8(
-  floatx *restrict       dst,
-  const int8_t *restrict mat,
-  const floatx *restrict mat_scales,
-  const int8_t *restrict vec,
+  floatx *RESTRICT       dst,
+  const int8_t *RESTRICT mat,
+  const floatx *RESTRICT mat_scales,
+  const int8_t *RESTRICT vec,
   floatx                 vec_scale,
   int                    m,
   int                    n,
@@ -5616,9 +4902,9 @@ gemv_int8(
  * fpx vec (n,) @ fpx mat (n, m) = fpx dst (m,) */
 static void
 gemv_fpx_nn(
-  floatx *restrict       dst,
-  const floatx *restrict vec,
-  const floatx *restrict mat,
+  floatx *RESTRICT       dst,
+  const floatx *RESTRICT vec,
+  const floatx *RESTRICT mat,
   int                    mat_stride,
   int                    n,
   int                    m
@@ -5626,7 +4912,7 @@ gemv_fpx_nn(
 {
   if (mat_stride == 0) mat_stride = m;
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER)
   float *acc = (float *)_alloca((size_t)m * sizeof(float));
 #else
   float acc[m];
@@ -5662,8 +4948,8 @@ gemv_fpx_nn(
  * contiguous load instead of `rows` separate strided reads. */
 static inline void
 pack_panel(
-  float *restrict        packed,
-  const floatx *restrict src,
+  float *RESTRICT        packed,
+  const floatx *RESTRICT src,
   int                    row_stride,
   int                    rows,
   int                    k
@@ -5687,8 +4973,8 @@ pack_panel(
  * touches every element of `mat` once. */
 static void
 pack_all(
-  float *restrict        packed_full,
-  const floatx *restrict mat,
+  float *RESTRICT        packed_full,
+  const floatx *RESTRICT mat,
   int                    stride,
   int                    total_rows,
   int                    R,
@@ -5726,10 +5012,10 @@ pack_all(
  * just hardcoded for 8x8. */
 static inline void
 gemm_fpx_kernel(
-  floatx *restrict      dst,
+  floatx *RESTRICT      dst,
   int                   dst_stride,
-  const float *restrict Bp,
-  const float *restrict Ap,
+  const float *RESTRICT Bp,
+  const float *RESTRICT Ap,
   int                   k
 )
 {
@@ -5828,11 +5114,11 @@ gemm_fpx_kernel(
 /* Scalar fallback for the remainder tiles. */
 static inline void
 gemm_fpx_scalar(
-  floatx *restrict       dst,
+  floatx *RESTRICT       dst,
   int                    dst_stride,
-  const floatx *restrict mat,
+  const floatx *RESTRICT mat,
   int                    mat_stride,
-  const floatx *restrict src,
+  const floatx *RESTRICT src,
   int                    src_stride,
   int                    m,
   int                    n,
@@ -5878,11 +5164,11 @@ gemm_pack_scratch_get(size_t needed_floats)
  * fpx src (m, k) @ fpx mat.T (k, n) = fpx dst (m, n) */
 static void
 gemm_fpx(
-  floatx *restrict       dst,
+  floatx *RESTRICT       dst,
   int                    dst_stride,
-  const floatx *restrict mat,
+  const floatx *RESTRICT mat,
   int                    mat_stride,
-  const floatx *restrict src,
+  const floatx *RESTRICT src,
   int                    src_stride,
   int                    m,
   int                    n,
@@ -5962,18 +5248,18 @@ gemm_fpx(
  * re-read/re-converted once per row like the naive version. */
 static inline void
 gemm_fpx_nn_kernel(
-  floatx *restrict       dst,
+  floatx *RESTRICT       dst,
   int                    dst_stride,
-  const floatx *restrict mat,
+  const floatx *RESTRICT mat,
   int                    mat_stride,
-  const floatx *restrict src,
+  const floatx *RESTRICT src,
   int                    src_stride,
   int                    mr,
   int                    n,
   int                    k
 )
 {
-#ifdef _MSC_VER
+#if defined(_MSC_VER)
 #  define ACC(ii, j) acc[(ii) * n + (j)]
   float *acc = (float *)_alloca(8 * (size_t)n * sizeof(float));
   float *row = (float *)_alloca((size_t)n * sizeof(float));
@@ -6027,11 +5313,11 @@ gemm_fpx_nn_kernel(
  * fpx src (m, k) @ fpx mat (k, n) = fpx dst (m, n) */
 static void
 gemm_fpx_nn(
-  floatx *restrict       dst,
+  floatx *RESTRICT       dst,
   int                    dst_stride,
-  const floatx *restrict mat,
+  const floatx *RESTRICT mat,
   int                    mat_stride,
-  const floatx *restrict src,
+  const floatx *RESTRICT src,
   int                    src_stride,
   int                    m,
   int                    n,
@@ -6099,8 +5385,8 @@ gemm_i8_pack_scratch_get(size_t needed_bytes)
  * upcast needed, this is a pure gather-to-contiguous transpose. */
 static inline void
 pack_panel_i8(
-  int8_t *restrict       packed,
-  const int8_t *restrict src,
+  int8_t *RESTRICT       packed,
+  const int8_t *RESTRICT src,
   int                    row_stride,
   int                    rows,
   int                    k
@@ -6122,8 +5408,8 @@ pack_panel_i8(
 /* */
 static void
 pack_all_i8(
-  int8_t *restrict       packed_full,
-  const int8_t *restrict mat,
+  int8_t *RESTRICT       packed_full,
+  const int8_t *RESTRICT mat,
   int                    stride,
   int                    total_rows,
   int                    R,
@@ -6156,12 +5442,12 @@ pack_all_i8(
 /* */
 static inline void
 gemm_int8_kernel(
-  floatx *restrict       dst,
+  floatx *RESTRICT       dst,
   int                    dst_stride,
-  const int8_t *restrict Bp,
-  const floatx *restrict mat_scales,
-  const int8_t *restrict Ap,
-  const floatx *restrict src_scales,
+  const int8_t *RESTRICT Bp,
+  const floatx *RESTRICT mat_scales,
+  const int8_t *RESTRICT Ap,
+  const floatx *RESTRICT src_scales,
   int                    k
 )
 {
@@ -6266,14 +5552,14 @@ gemm_int8_kernel(
 /* Scalar fallback for the remainder tiles. */
 static inline void
 gemm_int8_scalar(
-  floatx *restrict       dst,
+  floatx *RESTRICT       dst,
   int                    dst_stride,
-  const int8_t *restrict mat,
+  const int8_t *RESTRICT mat,
   int                    mat_stride,
-  const floatx *restrict mat_scales,
-  const int8_t *restrict src,
+  const floatx *RESTRICT mat_scales,
+  const int8_t *RESTRICT src,
   int                    src_stride,
-  const floatx *restrict src_scales,
+  const floatx *RESTRICT src_scales,
   int                    m,
   int                    n,
   int                    k
@@ -6306,14 +5592,14 @@ gemm_int8_scalar(
  * @ (int8 mat (n, k) * fpx mat_scales (n,)).T = (fpx dst (m, n)) */
 static void
 gemm_int8(
-  floatx *restrict       dst,
+  floatx *RESTRICT       dst,
   int                    dst_stride,
-  const int8_t *restrict mat,
+  const int8_t *RESTRICT mat,
   int                    mat_stride,
-  const floatx *restrict mat_scales,
-  const int8_t *restrict src,
+  const floatx *RESTRICT mat_scales,
+  const int8_t *RESTRICT src,
   int                    src_stride,
-  const floatx *restrict src_scales,
+  const floatx *RESTRICT src_scales,
   int                    m,
   int                    n,
   int                    k,
@@ -6421,9 +5707,10 @@ prepare_image(const char *path, int image_size)
 {
   // Load the image
   int            rows, cols, channels;
-  unsigned char *raw = stbi_load(path, &cols, &rows, &channels, 3);
+  unsigned char *raw = load_image_utf8(path, &cols, &rows, &channels, 3);
   if (raw == NULL)
   {
+    fprintf(stderr, "error: %s\n", stbi_failure_reason());
     return NULL;
   }
 
@@ -6473,12 +5760,15 @@ prepare_image_pas(
   *n_crops = 0;
 
   // Load the full image
-  raw = stbi_load(path, &cols, &rows, &channels, 3);
+  raw = load_image_utf8(path, &cols, &rows, &channels, 3);
   if (raw == NULL) goto fail;
 
   // Compute the number of crops (W / H)
-  int wn_crops = 1;
-  int hn_crops = 1;
+  int wn_crops = 0;
+  int hn_crops = 0;
+
+  int cw = 0, ch = 0;
+
   if (cols >= rows)
   {
     if ((float)cols / rows >= 1.5)
@@ -6486,6 +5776,7 @@ prepare_image_pas(
       wn_crops = (int)floor((double)cols / rows + 0.5);
       int cap  = (int)floor((double)cols / min_crop_size);
       wn_crops = min(max(min(cap, wn_crops), 2), max_crops);
+      hn_crops = 1;
     }
   }
   else
@@ -6495,17 +5786,19 @@ prepare_image_pas(
       hn_crops = (int)floor((double)rows / cols + 0.5);
       int cap  = (int)floor((double)rows / min_crop_size);
       hn_crops = min(max(min(cap, hn_crops), 2), max_crops);
+      wn_crops = 1;
     }
   }
 
   // Size of each crop
-  int cw = (cols + wn_crops - 1) / wn_crops;
-  int ch = (rows + hn_crops - 1) / hn_crops;
-
-  // Fallback to full size if too small
-  if (cw < min_crop_size || ch < min_crop_size)
+  if (wn_crops > 0 && hn_crops > 0)
   {
-    wn_crops = hn_crops = 0;
+    cw = (cols + wn_crops - 1) / wn_crops;
+    ch = (rows + hn_crops - 1) / hn_crops;
+    if (cw < min_crop_size || ch < min_crop_size)
+    {
+      wn_crops = hn_crops = 0;
+    }
   }
 
   *n_crops = wn_crops * hn_crops;
@@ -7147,8 +6440,8 @@ forward_text_decode(
     if (is_interrupted()) return 1;
 
     // Combine the residual stream
-    floatx *restrict x     = buf->x;
-    floatx *restrict resid = buf->resid;
+    floatx *RESTRICT x     = buf->x;
+    floatx *RESTRICT resid = buf->resid;
     for (int d = 0; d < C; d++)
     {
       /* Sometimes the residual stream accumulates huge values on certain
@@ -7667,8 +6960,8 @@ forward_text_chunk(
     }
     if (is_interrupted()) return 1;
 
-    floatx *restrict x     = buf->x;
-    floatx *restrict resid = buf->resid;
+    floatx *RESTRICT x     = buf->x;
+    floatx *RESTRICT resid = buf->resid;
 
     int d;
     #pragma omp parallel for OMP_PARALLEL_ARGS
@@ -8497,6 +7790,16 @@ typedef struct
 } CommandContext;
 
 /* */
+static void
+command_context_cleanup(CommandContext *cmd_ctx)
+{
+  free(cmd_ctx->img);
+  cmd_ctx->img = NULL;
+  free(cmd_ctx->crops);
+  cmd_ctx->crops = NULL;
+}
+
+/* */
 typedef struct InjectContext InjectContext;
 
 /* */
@@ -8559,6 +7862,14 @@ struct InjectContext
   int            tokens_len;
   int            tokens_cap;
 };
+
+/* */
+static void
+inject_context_cleanup(InjectContext *ctx)
+{
+  if (ctx == NULL) return;
+  command_context_cleanup(&ctx->cmd_ctx);
+}
 
 /* */
 typedef struct
@@ -8645,7 +7956,7 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
       );
       epos = ctx->tokens_len;
 
-      cmd_ctx->state = 3;
+      cmd_ctx->state = GENERATOR_EXIT;
       return (InjectData){
         .type     = INJECT_TEXT,
         .tokens   = ctx->tokens_buf + spos,
@@ -8653,8 +7964,7 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
       };
 
     default:
-      free(cmd_ctx->img);
-      cmd_ctx->state = GENERATOR_EXIT;
+      command_context_cleanup(cmd_ctx);
       return (InjectData){.type = INJECT_DONE};
   }
 }
@@ -8747,15 +8057,29 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
        * Passing in cmd_ctx->crops is safe here since `sample()` will only take
        * the first `image_size * image_size * 3` elements. */
       return (InjectData){.type = INJECT_IMAG, .image = cmd_ctx->crops};
-
+    
     case 2:
-      // Inject crop prompt ("and here are some crops to help you see better")
+      // Trailer of the full image
       spos = ctx->tokens_len;
+      ctx->tokens_buf[ctx->tokens_len++] = tok->eoi;
+      encode(tok, "\n\n", 2, ctx->tokens_buf, ctx->tokens_len, &ctx->tokens_len);
+
+      if (cmd_ctx->n_crops <= 1)
+      {
+        epos = ctx->tokens_len;
+        cmd_ctx->state = GENERATOR_EXIT;  // Finish off
+        return (InjectData){
+          .type     = INJECT_TEXT,
+          .tokens   = ctx->tokens_buf + spos,
+          .n_tokens = epos - spos,
+        };
+      }
+      // Inject crop prompt ("and here are some crops to help you see better")
       encode(
         tok, CROPPED_IMAGE_FILTER, strlen(CROPPED_IMAGE_FILTER),
-        ctx->tokens_buf, spos, &ctx->tokens_len
+        ctx->tokens_buf, ctx->tokens_len, &ctx->tokens_len
       );
-      // Inject image header of the first crop
+      // Image header of the first crop
       encode(
         tok, "\n\n", 2, ctx->tokens_buf, ctx->tokens_len, &ctx->tokens_len
       );
@@ -8771,10 +8095,10 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
 
     case 3:
       // Inject all the crops
-      for (cmd_ctx->crop_i = 0; cmd_ctx->crop_i < cmd_ctx->n_crops;
+      for (cmd_ctx->crop_i = 1; cmd_ctx->crop_i < cmd_ctx->n_crops;
         cmd_ctx->crop_i++)
       {
-        if (cmd_ctx->crop_i != 0)
+        if (cmd_ctx->crop_i != 1)
         {
           // Inject crop header
           spos = ctx->tokens_len;
@@ -8818,12 +8142,11 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
         case 6:;
       }
 
-#ifndef _MSC_VER
+#if !defined(_MSC_VER)
       __attribute__((fallthrough));
 #endif
     default:
-      free(cmd_ctx->crops);
-      cmd_ctx->state = GENERATOR_EXIT;
+      command_context_cleanup(cmd_ctx);
       return (InjectData){.type = INJECT_DONE};
   }
 }
@@ -8993,7 +8316,7 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
           }
           else
           {
-            ctx->state = 4;  // done
+            ctx->state = GENERATOR_EXIT;  // done
             break;
           }
         }
@@ -9002,12 +8325,11 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
         ctx->text = ctx->event.remaining;
     }
 
-#ifndef _MSC_VER
+#if !defined(_MSC_VER)
     __attribute__((fallthrough));
 #endif
 
     default:
-      ctx->state = GENERATOR_EXIT;
       return (InjectData){.type = INJECT_DONE};
   }
 }
@@ -9070,6 +8392,7 @@ generate(
     model, buf, vbuf, seqlen, chunk_size, temperature, topk, topp, rpen,
     enable_mm, &ctx, generate_inject_callback
   );
+  inject_context_cleanup(&ctx);
 
   free(tokens_buf);
 }
@@ -9099,7 +8422,7 @@ new_turn(GemmaModel *model, bool use_mm, ChatContext *ctx)
       {
         if (!is_interrupted())
         {
-#ifdef _WIN32
+#if defined(_WIN32)
           // Wait 10ms for the console handler to set the flag
           Sleep(10);
 #endif
@@ -9180,7 +8503,7 @@ new_turn(GemmaModel *model, bool use_mm, ChatContext *ctx)
 
       int epos = jctx->tokens_len;
 
-      ctx->state = 3;
+      ctx->state = GENERATOR_EXIT;
       return (InjectData){
         .type     = INJECT_TEXT,
         .tokens   = jctx->tokens_buf + spos,
@@ -9188,7 +8511,6 @@ new_turn(GemmaModel *model, bool use_mm, ChatContext *ctx)
       };
 
     default:
-      ctx->state = GENERATOR_EXIT;
       return (InjectData){.type = INJECT_DONE};
 
     fail:
@@ -9261,6 +8583,7 @@ chat(
     model, buf, vbuf, seqlen, chunk_size, temperature, topk, topp, rpen, use_mm,
     &ctx, chat_inject_callback
   );
+  inject_context_cleanup(&jctx);
 
 fail:
   free(tokens_buf);

@@ -126,8 +126,14 @@ else
   debug: LDFLAGS := -fsanitize=address,undefined
   debug: LDLIBS := -lm
   debug: $(TARGET)
-
+    
+  ifeq ($(OS),Windows_NT)
   clean:
-	rm -f gemma gemma.exe
+		-del /Q gemma gemma.exe 2>NUL
+		-rm -f gemma gemma.exe 2>NUL
+  else
+  clean:
+		rm -f gemma gemma.exe
+  endif
 
 endif
