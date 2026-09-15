@@ -81,7 +81,7 @@ python export.py google/gemma-3-4b-it \
 | ------------------ | ------------------------------------------------------------------------- |
 | `modelfile`        | HuggingFace model id or a local directory                                 |
 | `-o, --output`     | Output `.bin` path (required)                                             |
-| `-d, --dtype`      | Weight precision: `float16` / `float32` / `bfloat16` (default: `float16`) |
+| `-d, --dtype`      | Weight precision: `float16` / `float32` / `bfloat16` (default: `float32`) |
 | `-q, --quantize`   | Enable INT8 (W8A8) quantization                                           |
 | `-c, --cache-path` | Custom HuggingFace cache directory                                        |
  
@@ -223,10 +223,15 @@ Test environment:
 ## Roadmap
  
 - [ ] KV cache quantization
-- [ ] W4A16 quantization
+- [ ] W4A8 quantization
 - [x] Multimodal inference
 - [ ] Gemma 4 architecture support
- 
+- [ ] Further optimize GEMM
+- [ ] Speculative decoding
+- [ ] HTTP server implementation
+- [ ] Fancier CLI
+- [ ] Runtime dtype dispatch
+
 ## Acknowledgements
  
 - [Google Gemma](https://ai.google.dev/gemma) official models and technical reports

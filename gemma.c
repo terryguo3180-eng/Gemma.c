@@ -55,7 +55,7 @@
  *   cl /O2 -openmp:experimental gemma.c /link shell32.lib /Fe:gemma.exe
  *   ```
  *
- * Weight dtype defaults to float16; override with -DDTYPE at compile time
+ * Weight dtype defaults to float32; override with -DDTYPE at compile time
  * (FP32 / FP16 / BF16), or `make DTYPE=BF16`:
  *
  *   ```bash
@@ -120,11 +120,17 @@
  * @TerryGuo (https://github.com/terryguo3180-eng | terry.guo2021@outlook.com)
  */
 
+// Kill MSVC CRT "use *_s instead" deprecation spam on Windows (clang + cl)
+#if defined(_WIN32) && !defined(_CRT_SECURE_NO_WARNINGS)
+#  define _CRT_SECURE_NO_WARNINGS
+#endif
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -132,12 +138,20 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if !defined(_MSC_VER)
-// Tell clang to shut up
+#if defined(_MSC_VER) && !defined(__clang__)
+// clang defines _MSC_VER on Windows as well, so we have to exclude __clang__
+#  define __MSVC__
+#endif
+#if defined(__GNUC__) && !defined(__clang__)
+// clang sometimes defines __GNUC__ as well, kind of funny
+#  define __GCC__
+#endif
+
+#if defined(__clang__) || defined(__GCC__)
 #  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
 
-#if defined(_MSC_VER)
+#if defined(__MSVC__)
 #  include <malloc.h>
 #  define RESTRICT      __restrict
 #  define _Thread_local __declspec(thread)
@@ -253,7 +267,7 @@ mmap(void *addr, size_t len, int prot, int flags, int fildes, int64_t off)
   HANDLE fm, h;
   void  *map = MAP_FAILED;
 
-#  if defined(_MSC_VER)
+#  if defined(__MSVC__)
 #    pragma warning(push)
 #    pragma warning(disable : 4293)
 #  endif
@@ -266,7 +280,7 @@ mmap(void *addr, size_t len, int prot, int flags, int fildes, int64_t off)
   const uint32_t dw_maxsize_low  = (uint32_t)(maxsize & 0xFFFFFFFFL);
   const uint32_t dw_maxsize_high = (uint32_t)((maxsize >> 32) & 0xFFFFFFFFL);
 
-#  if defined(_MSC_VER)
+#  if defined(__MSVC__)
 #    pragma warning(pop)
 #  endif
 
@@ -579,17 +593,24 @@ now_sec(void)
 
 // NOLINTBEGIN
 // clang-format off
-#if defined(_MSC_VER)
-#  pragma warning(push)
-#  pragma warning(disable : 4138)
-#else
+
+// Suppress diagnostics for the minified stb_image / stb_image_resize2 blob
+#if defined(__clang__) || defined(__GCC__)
 #  pragma GCC diagnostic push
 #  pragma GCC diagnostic ignored "-Wdangling-else"
 #  pragma GCC diagnostic ignored "-Wmisleading-indentation"
 #  pragma GCC diagnostic ignored "-Wunknown-pragmas"
 #  pragma GCC diagnostic ignored "-Wunused-parameter"
-#  pragma GCC diagnostic ignored "-Wunused-but-set-variable="
+#  pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 #  pragma GCC diagnostic ignored "-Wunused-variable"
+#  pragma GCC diagnostic ignored "-Wsign-compare"
+#  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__MSVC__)
+#  pragma warning(push)
+#  pragma warning(disable : 4138)  // nonstandard extension used
+#  pragma warning(disable : 4244)  // conversion, possible loss of data
+#  pragma warning(disable : 4100)  // unreferenced formal parameter
+#  pragma warning(disable : 4189)  // local var is inited not referenced
 #endif
 
 #define Z1 float////////////////////////////////////////////////////////////////
@@ -2467,7 +2488,7 @@ STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern void*stbir_resize(const void*Gw,
 int Gx,int Gy,int Gz,void*G0,int G1,int G2,int G3,Bs G4,Bv G5,Bt G6,Bu G7){/////
 return(void*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,G5,G6,G7);}//////////////////////////
 
-#if defined(_MSC_VER)
+#if defined(__MSVC__)
 #  pragma warning(pop)
 #else
 #  pragma GCC diagnostic pop
@@ -2476,26 +2497,26 @@ return(void*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,G5,G6,G7);}//////////////////////////
 // NOLINTEND
 
 /* Wrapper for stbi_load to handle utf-8 filenames properly */
-unsigned char* load_image_utf8(
-  const char* utf8_path, int* w, int* h, int* ch, int req_comp)
+unsigned char *
+load_image_utf8(const char *utf8_path, int *w, int *h, int *ch, int req_comp)
 {
 #ifdef _WIN32
   // Windows: convert utf-8 -> utf-16 and open with _wfopen
   int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, NULL, 0);
   if (wlen == 0) return NULL;
 
-  wchar_t* wpath = (wchar_t*)malloc(wlen * sizeof(wchar_t));
+  wchar_t *wpath = (wchar_t *)malloc(wlen * sizeof(wchar_t));
   MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, wpath, wlen);
 
-  FILE* f = _wfopen(wpath, L"rb");
+  FILE *f = _wfopen(wpath, L"rb");
   free(wpath);
   if (!f) return NULL;
 
-  unsigned char* data = stbi_load_from_file(f, w, h, ch, req_comp);
+  unsigned char *data = stbi_load_from_file(f, w, h, ch, req_comp);
   fclose(f);
   return data;
 #else
-    return stbi_load(utf8_path, w, h, ch, req_comp);
+  return stbi_load(utf8_path, w, h, ch, req_comp);
 #endif
 }
 
@@ -2510,17 +2531,18 @@ unsigned char* load_image_utf8(
 #define DEFAULT_RPEN        1.0
 #define DEFAULT_PROMPT      "Once upon a time"
 
-// If the number of prefill tokens is below this number, fallback to the decode
-// implementation
-#define PREFILL_FALLBACK_THRESHOLD 8
-
 // Block size of blockwise causal masking
 #define QK_BLOCK_SIZE 64
 
 // OpenMP parameters
-#define OMP_NUM_THREADS 8
-
+#define OMP_NUM_THREADS   8
 #define OMP_PARALLEL_ARGS num_threads(OMP_NUM_THREADS)
+#if defined(__MSVC__) && !defined(MSVC_OMP_COLLAPSE)
+// Most versions of MSVC does not support the `collapse` clause
+#  define OMP_COLLAPSE2
+#else
+#  define OMP_COLLAPSE2 collapse(2)
+#endif
 
 // Prompt used in pan & scan
 // google/gemma_pytorch/blob/main/gemma/gemma3_preprocessor.py
@@ -2538,13 +2560,9 @@ unsigned char* load_image_utf8(
 #define BF16 2
 #define FP32 3
 
-#if !defined(DTYPE)
 // Default dtype
-#  if defined(_MSC_VER)
-#    define DTYPE FP32
-#  else
-#    define DTYPE FP16
-#  endif
+#if !defined(DTYPE)
+#  define DTYPE FP32
 #endif
 
 // clang-format off
@@ -2565,14 +2583,25 @@ unsigned char* load_image_utf8(
 #endif
 // clang-format on
 
+// no-fast-math
+#if defined(__GCC__)
+#  define NO_FAST_MATH_BEGIN                                                   \
+    _Pragma("GCC push_options") _Pragma("GCC optimize (\"no-fast-math\")")
+#  define NO_FAST_MATH_END _Pragma("GCC pop_options")
+#elif defined(__clang__) || defined(__MSVC__)
+#  define NO_FAST_MATH_BEGIN                                                   \
+    _Pragma("float_control(push)") _Pragma("float_control(precise, on)")
+#  define NO_FAST_MATH_END _Pragma("float_control(pop)")
+#endif
+
+#define GENERATOR_EXIT 10000
+
 #if defined(min)
 #  undef min
 #endif
 #if defined(max)
 #  undef max
 #endif
-
-#define GENERATOR_EXIT 10000
 
 /* */
 static inline int
@@ -2593,189 +2622,188 @@ min(int a, int b)
 // temporary
 #define STRINGIFY_(x) #x
 
-/* Poor man's memory wrappers, I just really dislike the redundency of writing
- * ```c
- * if ((ptr = malloc(count * sizeof(*ptr))) == NULL)
- * {
- *   fprintf(stderr, "error: ...");
- *   goto fail;
- * }
- * ```
- * in every memory allocation. So I wrapped them into the following macros, now
- * I only need to type:
- * ```c
- * MALLOC(ptr, count, "name_of_the_buffer", goto fail;);
- * ```
- * (Same for other operations like calloc or fread)
- * This is much more readable and less redundent for me. The implementations of
- * the macros themselves are indeed error-prone and hard to read, but once
- * they're complete I barely need to touch them. I guess that worked for me :D
- */
+// Error logger
 
-#define MALLOC(ptr, count, name, ...)                                          \
-  do                                                                           \
-  {                                                                            \
-    ptr = malloc((count) * sizeof(*(ptr)));                                    \
-    if (ptr == NULL)                                                           \
-    {                                                                          \
-      fprintf(                                                                 \
-        stderr, "error: memory allocation failed: %s (size: %zu)\n", (name),   \
-        (size_t)(count) * sizeof(*(ptr))                                       \
-      );                                                                       \
-      __VA_ARGS__                                                              \
-    }                                                                          \
-  }                                                                            \
-  while (0)
+_Thread_local static char g_errmsg[128] = {0};
 
-#define CALLOC(ptr, count, name, ...)                                          \
-  do                                                                           \
-  {                                                                            \
-    ptr = calloc((count), sizeof(*(ptr)));                                     \
-    if (ptr == NULL)                                                           \
-    {                                                                          \
-      fprintf(                                                                 \
-        stderr, "error: memory allocation failed: %s (size: %zu)\n", (name),   \
-        (size_t)(count) * sizeof(*(ptr))                                       \
-      );                                                                       \
-      __VA_ARGS__                                                              \
-    }                                                                          \
-  }                                                                            \
-  while (0)
+/* */
+static int
+log_error(const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap, fmt);
+  int ret = vsnprintf(g_errmsg, sizeof(g_errmsg), fmt, ap);
+  va_end(ap);
+  return ret;
+}
 
-#define FGETC(var, fp, name, ...)                                              \
-  do                                                                           \
-  {                                                                            \
-    var = fgetc(fp);                                                           \
-    if (var == EOF)                                                            \
-    {                                                                          \
-      fprintf(stderr, "error: file read failed: %s", (name));                  \
-      __VA_ARGS__                                                              \
-    }                                                                          \
-  }                                                                            \
-  while (0)
+/* */
+static char *
+get_error(void)
+{
+  return g_errmsg;
+}
 
-#define FSEEK(fp, offset, base, name, ...)                                     \
-  do                                                                           \
-  {                                                                            \
-    if (fseek((fp), (offset), (base)) == EOF)                                  \
-    {                                                                          \
-      fprintf(stderr, "error: file seek failed: %s", (name));                  \
-      __VA_ARGS__                                                              \
-    }                                                                          \
-  }                                                                            \
-  while (0)
+// Memory wrappers
 
-#define FREAD(ptr, count, fp, name, ...)                                       \
-  do                                                                           \
-  {                                                                            \
-    size_t fread_buf_ = fread((ptr), sizeof(*(ptr)), (count), (fp));           \
-    if (fread_buf_ != (size_t)(count))                                         \
-    {                                                                          \
-      fprintf(                                                                 \
-        stderr, "error: file read failed: %s (expected %zu, got %zu)\n",       \
-        (name), (size_t)(count), fread_buf_                                    \
-      );                                                                       \
-      __VA_ARGS__                                                              \
-    }                                                                          \
-  }                                                                            \
-  while (0)
+/* */
+static void *
+malloc_ckd(size_t count, size_t elt_size)
+{
+  void *ptr = malloc(count * elt_size);
+  if (ptr == NULL)
+  {
+    log_error("memory allocation failed (size: %zu)", count * elt_size);
+  }
+  return ptr;
+}
 
-#define READ_UINT16(var, fp, name, ...)                                        \
-  do                                                                           \
-  {                                                                            \
-    /* Big-endian */                                                           \
-    unsigned char ru16_buf_[2];                                                \
-    FREAD(ru16_buf_, 2, (fp), (name), __VA_ARGS__);                            \
-    var = ((int)ru16_buf_[0] << 8) | (int)ru16_buf_[1];                        \
-  }                                                                            \
-  while (0)
+/* */
+static void *
+calloc_ckd(size_t count, size_t elt_size)
+{
+  void *ptr = calloc(count, elt_size);
+  if (ptr == NULL)
+  {
+    log_error("memory allocation failed (size: %zu)", count * elt_size);
+  }
+  return ptr;
+}
 
-#define READ_UINT32(var, fp, name, ...)                                        \
-  do                                                                           \
-  {                                                                            \
-    /* Big-endian */                                                           \
-    unsigned char ru32_buf_[4];                                                \
-    FREAD(ru32_buf_, 4, (fp), (name), __VA_ARGS__);                            \
-    var = ((uint32_t)ru32_buf_[0] << 24) | ((uint32_t)ru32_buf_[1] << 16) |    \
-          ((uint32_t)ru32_buf_[2] << 8) | ((uint32_t)ru32_buf_[3]);            \
-  }                                                                            \
-  while (0)
+/* */
+static bool
+read_uint8_ckd(FILE *fp, uint8_t *out)
+{
+  int c = fgetc(fp);
+  if (c == EOF)
+  {
+    log_error("file read failed");
+    return false;
+  }
+  *out = (uint8_t)c;
+  return true;
+}
 
-#define READ_FP32(var, fp, name, ...)                                          \
-  do                                                                           \
-  {                                                                            \
-    int rfp32_bits_;                                                           \
-    READ_UINT32(rfp32_bits_, (fp), (name), __VA_ARGS__);                       \
-    memcpy(&var, &rfp32_bits_, sizeof(float));                                 \
-  }                                                                            \
-  while (0)
+/* */
+static bool
+fseek_ckd(FILE *fp, long offset, int base)
+{
+  if (fseek(fp, offset, base) != 0)
+  {
+    log_error("file seek failed");
+    return false;
+  }
+  return true;
+}
 
-#define READ_TENSOR(ptr, count, fp, name, ...)                                 \
-  do                                                                           \
-  {                                                                            \
-    MALLOC((ptr), (count), (name), __VA_ARGS__);                               \
-    FREAD((ptr), (count), (fp), (name), __VA_ARGS__);                          \
-  }                                                                            \
-  while (0)
+/* */
+static bool
+fread_ckd(void *ptr, size_t count, size_t elt_size, FILE *fp)
+{
+  size_t got = fread(ptr, elt_size, count, fp);
+  if (got != count)
+  {
+    log_error("file read failed (expected %zu, got %zu)", count, got);
+    return false;
+  }
+  return true;
+}
 
-// Pascal-style string: first byte is length, then that many chars
-#define READ_STR(var, fp, data, offset, name, ...)                             \
-  do                                                                           \
-  {                                                                            \
-    char rstr_len_name_[128];                                                  \
-    snprintf(rstr_len_name_, 128, "%s.length", (name));                        \
-    int rstr_len_;                                                             \
-    FGETC(rstr_len_, fp, rstr_len_name_, __VA_ARGS__);                         \
-    var = (data) + *(offset);                                                  \
-    FREAD(var, rstr_len_, (fp), (name), __VA_ARGS__);                          \
-    (data)[*(offset) + rstr_len_] = '\0';                                      \
-    *(offset) += rstr_len_ + 1;                                                \
-  }                                                                            \
-  while (0)
+/* */
+static bool
+read_uint16_ckd(FILE *fp, uint16_t *out)
+{
+  unsigned char buf[2];
+  if (!fread_ckd(buf, 2, 1, fp)) return false;
+  *out = (uint16_t)(((uint16_t)buf[0] << 8) | (uint16_t)buf[1]);
+  return true;
+}
+
+/* */
+static bool
+read_uint32_ckd(FILE *fp, uint32_t *out)
+{
+  unsigned char buf[4];
+  if (!fread_ckd(buf, 4, 1, fp)) return false;
+  *out = ((uint32_t)buf[0] << 24) | ((uint32_t)buf[1] << 16) |
+         ((uint32_t)buf[2] << 8) | (uint32_t)buf[3];
+  return true;
+}
+
+/* */
+static bool
+read_fp32_ckd(FILE *fp, float *out)
+{
+  uint32_t bits;
+  if (!read_uint32_ckd(fp, &bits)) return false;
+  memcpy(out, &bits, sizeof(float));
+  return true;
+}
+
+/* Read count elements to the allocated buffer */
+static void *
+read_tensor_ckd(size_t count, size_t elt_size, FILE *fp)
+{
+  void *ptr = NULL;
+  if (!(ptr = malloc_ckd(count, elt_size))) return NULL;
+  if (!fread_ckd(ptr, count, elt_size, fp))
+  {
+    free(ptr);
+    return NULL;
+  }
+  return ptr;
+}
+
+/* Pascal-style string: first byte is length, then that many chars */
+static bool
+read_str_ckd(char **var, FILE *fp, char *data, size_t *offset)
+{
+  uint8_t len;
+  if (!read_uint8_ckd(fp, &len)) return false;
+
+  *var = data + *offset;
+  if (!fread_ckd(*var, (size_t)len, 1, fp)) return false;
+
+  data[*offset + (size_t)len] = '\0';
+  *offset += (size_t)len + 1;
+  return true;
+}
 
 /* Peek at how many bytes a sequence of pascal strings will occupy */
-static inline int
+static size_t
 get_strarr_bytes(FILE *fp, int count)
 {
-  // Read a sequence of pascal-stype strings
-  int  offset = 0;
-  long pos    = ftell(fp);
+  // Read a sequence of pascal-style strings
+  size_t offset = 0;
+  long   pos    = ftell(fp);
   if (pos == -1L)
   {
-    perror("ftell failed");
-    return -1;
+    log_error("ftell failed");
+    return (size_t)-1;
   }
   // Get the total number of bytes
   for (int i = 0; i < count; i++)
   {
-    int len;
-    FGETC(len, fp, "<str.length>", return -1;);
-    if (fseek(fp, len, SEEK_CUR) != 0)
-    {
-      perror("fseek failed");
-      return -1;
-    }
+    uint8_t len;
+    if (!read_uint8_ckd(fp, &len)) return (size_t)-1;
+    if (!fseek_ckd(fp, len, SEEK_CUR)) return (size_t)-1;
     offset += len + 1;
   }
   // Resume position
-  if (fseek(fp, pos, SEEK_SET) != 0)
-  {
-    perror("fseek failed");
-    return -1;
-  }
+  if (!fseek_ckd(fp, pos, SEEK_SET)) return (size_t)-1;
   return offset;
 }
 
 /* Configuration for the SigLIP vision encoder */
 typedef struct
 {
-  int   n_layers;    // ViT layers
-  int   image_size;  // Pixels per image side
-  int   patch_size;  // Patches per image side
-  int   hidden_dim;  // ViT dimension
-  int   n_heads;     // Attention heads
-  int   mlp_dim;     // Intermediate size in FFN
-  float eps;         // LayerNorm epsilon
+  uint8_t  n_layers;    // ViT layers
+  uint8_t  n_heads;     // Attention heads
+  uint16_t image_size;  // Pixels per image side
+  uint16_t patch_size;  // Patches per image side
+  uint16_t hidden_dim;  // ViT dimension
+  uint16_t mlp_dim;     // Intermediate size in FFN
+  float    eps;         // LayerNorm epsilon
 } VisionConfig;
 
 /* */
@@ -2784,24 +2812,14 @@ read_vision_config(FILE *fp)
 {
   VisionConfig *vcfg;
 
-  const char *vcfg_name = "model.encoder.config";
-  const char *nl_name   = "model.encoder.config.n_layers";
-  const char *nh_name   = "model.encoder.config.n_heads";
-  const char *cm_name   = "model.encoder.config.mlp_dim";
-  const char *c_name    = "model.encoder.config.hidden_dim";
-  const char *is_name   = "model.encoder.config.image_size";
-  const char *ps_name   = "model.encoder.config.patch_size";
-  const char *eps_name  = "model.encoder.config.eps";
-
-  CALLOC(vcfg, 1, vcfg_name, goto fail;);
-
-  FGETC(vcfg->n_layers, fp, nl_name, goto fail;);
-  FGETC(vcfg->n_heads, fp, nh_name, goto fail;);
-  READ_UINT16(vcfg->mlp_dim, fp, cm_name, goto fail;);
-  READ_UINT16(vcfg->hidden_dim, fp, c_name, goto fail;);
-  READ_UINT16(vcfg->image_size, fp, is_name, goto fail;);
-  READ_UINT16(vcfg->patch_size, fp, ps_name, goto fail;);
-  READ_FP32(vcfg->eps, fp, eps_name, goto fail;);
+  if (!(vcfg = calloc_ckd(1, sizeof(*vcfg))) ||
+      !read_uint8_ckd(fp, &vcfg->n_layers) ||
+      !read_uint8_ckd(fp, &vcfg->n_heads) ||
+      !read_uint16_ckd(fp, &vcfg->mlp_dim) ||
+      !read_uint16_ckd(fp, &vcfg->hidden_dim) ||
+      !read_uint16_ckd(fp, &vcfg->image_size) ||
+      !read_uint16_ckd(fp, &vcfg->patch_size) || !read_fp32_ckd(fp, &vcfg->eps))
+    goto fail;
 
   return vcfg;
 
@@ -2813,26 +2831,26 @@ fail:
 /* Configuration for the main Gemma text encoder */
 typedef struct
 {
-  int   n_layers;       // Transformer layers
-  int   n_heads;        // Attention heads
-  int   n_kv_heads;     // Key/value heads (GQA)
-  int   head_dim;       // Dim per head
-  int   embed_dim;      // Model dimension
-  int   mlp_dim;        // Intermediate size in FFN
-  int   q_scale;        // Scale applied to queries before attention
-  int   slide_len;      // Sliding-window size
-  int   image_toks;     // Number of soft tokens per image
-  int   max_seqlen;     // Max number of position embeddings
-  int   vocab_size;     // Number of possible tokens
-  float local_theta;    // RoPE base for local (sliding) attention
-  float global_theta;   // RoPE base for full attention
-  float eps;            // RMSNorm epsilon
-  float att_softcap;    // tanh softcap on attention scores (0 = off)
-  float logit_softcap;  // tanh softcap on final logits (0 = off)
-  bool *att_layers;     // true = use sliding window for that layer
-  bool  qk_norm;        // query/key RMSNorm
-  bool  pre_mlp_norm;
-  bool  pst_mlp_norm;
+  uint8_t  n_layers;       // Transformer layers
+  uint8_t  n_heads;        // Attention heads
+  uint8_t  n_kv_heads;     // Key/value heads (GQA)
+  uint16_t head_dim;       // Dim per head
+  uint16_t embed_dim;      // Model dimension
+  uint16_t mlp_dim;        // Intermediate size in FFN
+  uint16_t q_scale;        // Scale applied to queries before attention
+  uint16_t slide_len;      // Sliding-window size
+  uint16_t image_toks;     // Number of soft tokens per image
+  uint32_t max_seqlen;     // Max number of position embeddings
+  uint32_t vocab_size;     // Number of possible tokens
+  float    local_theta;    // RoPE base for local (sliding) attention
+  float    global_theta;   // RoPE base for full attention
+  float    eps;            // RMSNorm epsilon
+  float    att_softcap;    // tanh softcap on attention scores (0 = off)
+  float    logit_softcap;  // tanh softcap on final logits (0 = off)
+  bool    *att_layers;     // true = use sliding window for that layer
+  bool     qk_norm;        // query/key RMSNorm
+  bool     pre_mlp_norm;
+  bool     pst_mlp_norm;
 } TextConfig;
 
 /* */
@@ -2851,59 +2869,39 @@ read_text_config(FILE *fp, bool *support_mm)
   TextConfig *cfg            = NULL;
   char       *att_layers_buf = NULL;
 
-  const char *cfg_name = "model.decoder.config";
-  const char *nl_name  = "model.decoder.config.n_layers";
-  const char *nh_name  = "model.decoder.config.n_heads";
-  const char *nkv_name = "model.decoder.config.n_kv_heads";
-  const char *ch_name  = "model.decoder.config.head_dim";
-  const char *c_name   = "model.decoder.config.embed_dim";
-  const char *cm_name  = "model.decoder.config.mlp_dim";
-  const char *qs_name  = "model.decoder.config.q_scale";
-  const char *sl_name  = "model.decoder.config.slide_len";
-  const char *it_name  = "model.decoder.config.image_toks";
-  const char *msq_name = "model.decoder.config.max_seqlen";
-  const char *vs_name  = "model.decoder.config.vocab_size";
-  const char *lt_name  = "model.decoder.config.local_theta";
-  const char *gt_name  = "model.decoder.config.global_theta";
-  const char *eps_name = "model.decoder.config.eps";
-  const char *asc_name = "model.decoder.config.att_softcap";
-  const char *lgc_name = "model.decoder.config.logit_softcap";
-  const char *al_name  = "model.decoder.config.att_layers";
-  const char *ext_name = "model.decoder.config.extra_bytes";
-
-  CALLOC(cfg, 1, cfg_name, goto fail;);
-
-  FGETC(cfg->n_layers, fp, nl_name, goto fail;);
-  FGETC(cfg->n_heads, fp, nh_name, goto fail;);
-  FGETC(cfg->n_kv_heads, fp, nkv_name, goto fail;);
-
-  READ_UINT16(cfg->head_dim, fp, ch_name, goto fail;);
-  READ_UINT16(cfg->embed_dim, fp, c_name, goto fail;);
-  READ_UINT16(cfg->mlp_dim, fp, cm_name, goto fail;);
-  READ_UINT16(cfg->q_scale, fp, qs_name, goto fail;);
-  READ_UINT16(cfg->slide_len, fp, sl_name, goto fail;);
-  READ_UINT16(cfg->image_toks, fp, it_name, goto fail;);
-  READ_UINT32(cfg->max_seqlen, fp, msq_name, goto fail;);
-  READ_UINT32(cfg->vocab_size, fp, vs_name, goto fail;);
-
-  READ_FP32(cfg->local_theta, fp, lt_name, goto fail;);
-  READ_FP32(cfg->global_theta, fp, gt_name, goto fail;);
-  READ_FP32(cfg->eps, fp, eps_name, goto fail;);
-  READ_FP32(cfg->att_softcap, fp, asc_name, goto fail;);
-  READ_FP32(cfg->logit_softcap, fp, lgc_name, goto fail;);
+  if (!(cfg = calloc_ckd(1, sizeof(*cfg))) ||
+      !read_uint8_ckd(fp, &cfg->n_layers) ||
+      !read_uint8_ckd(fp, &cfg->n_heads) ||
+      !read_uint8_ckd(fp, &cfg->n_kv_heads) ||
+      !read_uint16_ckd(fp, &cfg->head_dim) ||
+      !read_uint16_ckd(fp, &cfg->embed_dim) ||
+      !read_uint16_ckd(fp, &cfg->mlp_dim) ||
+      !read_uint16_ckd(fp, &cfg->q_scale) ||
+      !read_uint16_ckd(fp, &cfg->slide_len) ||
+      !read_uint16_ckd(fp, &cfg->image_toks) ||
+      !read_uint32_ckd(fp, &cfg->max_seqlen) ||
+      !read_uint32_ckd(fp, &cfg->vocab_size) ||
+      !read_fp32_ckd(fp, &cfg->local_theta) ||
+      !read_fp32_ckd(fp, &cfg->global_theta) || !read_fp32_ckd(fp, &cfg->eps) ||
+      !read_fp32_ckd(fp, &cfg->att_softcap) ||
+      !read_fp32_ckd(fp, &cfg->logit_softcap))
+    goto fail;
 
   // Packed bit-field of which layers use sliding-window attention
   // A terrible terrible idea, wish I didn't do this
-  int n_bytes;
-  FGETC(n_bytes, fp, al_name, goto fail;);
+  uint8_t n_bytes;
+  if (!read_uint8_ckd(fp, &n_bytes)) goto fail;
   if (n_bytes * 8 < cfg->n_layers)
   {
-    fprintf(stderr, "error: insufficient att_layers bytes\n");
+    log_error("insufficient att_layers bytes");
     goto fail;
   }
-  MALLOC(att_layers_buf, n_bytes, al_name, goto fail;);
-  MALLOC(cfg->att_layers, cfg->n_layers, al_name, goto fail;);
-  FREAD(att_layers_buf, n_bytes, fp, al_name, goto fail;);
+  if (!(att_layers_buf = malloc_ckd(n_bytes, sizeof(*att_layers_buf))) ||
+      !(cfg->att_layers =
+          malloc_ckd(cfg->n_layers, sizeof(*cfg->att_layers))) ||
+      !fread_ckd(att_layers_buf, n_bytes, sizeof(*att_layers_buf), fp))
+    goto fail;
+
   for (int i = 0; i < cfg->n_layers; i++)
   {
     int pos            = i;
@@ -2915,8 +2913,8 @@ read_text_config(FILE *fp, bool *support_mm)
   att_layers_buf = NULL;
 
   // Extra feature flags packed into one byte
-  int extra_flags;
-  FGETC(extra_flags, fp, ext_name, goto fail;);
+  uint8_t extra_flags;
+  if (!read_uint8_ckd(fp, &extra_flags)) goto fail;
   *support_mm       = (extra_flags & 8) == 8;
   cfg->qk_norm      = (extra_flags & 4) == 4;
   cfg->pre_mlp_norm = (extra_flags & 2) == 2;
@@ -2967,7 +2965,8 @@ cmp_merge(const void *a, const void *b)
 /* */
 typedef struct
 {
-  int n_merges;
+  uint32_t n_merges;
+
   int vocab_size;
   int bos;  // beginning of sequence
   int eos;  // end of sequence
@@ -3030,35 +3029,35 @@ static GemmaTokenizer *
 read_tokenizer(FILE *fp, TextConfig *cfg, bool support_mm)
 {
   GemmaTokenizer *tok;
-  CALLOC(tok, 1, "model.tokenizer", goto fail;);
+  if (!(tok = calloc_ckd(1, sizeof(*tok)))) goto fail;
 
   tok->vocab_size = cfg->vocab_size;
   if (support_mm)
   {
     tok->vocab_size++;
   }  // ++ for the <image_soft_token>
-  int vocab_data_bytes = get_strarr_bytes(fp, tok->vocab_size);
-  if (vocab_data_bytes == -1) goto fail;
 
-  const char *vd_name = "model.tokenizer.vocab_data";
-  const char *vc_name = "model.tokenizer.vocab";
-  const char *vt_name = "model.tokenizer.vocab_sorted";
+  size_t vocab_data_bytes = get_strarr_bytes(fp, tok->vocab_size);
+  if (vocab_data_bytes == (size_t)-1) goto fail;
 
-  MALLOC(tok->vocab_data, vocab_data_bytes, vd_name, goto fail;);
-  MALLOC(tok->vocab, tok->vocab_size, vc_name, goto fail;);
-  MALLOC(tok->vocab_sorted, tok->vocab_size, vt_name, goto fail;);
+  if (!(tok->vocab_data =
+          malloc_ckd(vocab_data_bytes, sizeof(*tok->vocab_data))) ||
+      !(tok->vocab = malloc_ckd(tok->vocab_size, sizeof(*tok->vocab))) ||
+      !(tok->vocab_sorted =
+          malloc_ckd(tok->vocab_size, sizeof(*tok->vocab_sorted))))
+    goto fail;
 
-  int offset = 0;
+  size_t offset = 0;
   for (int i = 0; i < tok->vocab_size; i++)
   {
-    char name[64];
-    snprintf(name, sizeof(name), "%s.%d", vd_name, i);
     char *str;
-    READ_STR(str, fp, tok->vocab_data, &offset, name, goto fail;);
+    if (!read_str_ckd(&str, fp, tok->vocab_data, &offset)) goto fail;
+
     tok->vocab[i]            = str;
     tok->vocab_sorted[i].idx = i;
     tok->vocab_sorted[i].val = str;
   }
+
   qsort(
     tok->vocab_sorted, tok->vocab_size, sizeof(tok->vocab_sorted[0]), cmp_token
   );
@@ -3072,33 +3071,29 @@ read_tokenizer(FILE *fp, TextConfig *cfg, bool support_mm)
   tok->eoi = get_token_idx(tok, "<end_of_image>");
   tok->ist = get_token_idx(tok, "<image_soft_token>");
 
-  const char *nm_name = "model.tokenizer.n_merges";
-  const char *rk_name = "model.tokenizer.ranks";
-  const char *md_name = "model.tokenizer.merge_data";
-
   // Build merges
-  READ_UINT32(tok->n_merges, fp, nm_name, goto fail;);
-  MALLOC(tok->ranks, tok->n_merges, rk_name, goto fail;);
+  if (!read_uint32_ckd(fp, &tok->n_merges)) goto fail;
 
-  int merge_bytes = get_strarr_bytes(fp, tok->n_merges * 2);
-  if (merge_bytes == -1) goto fail;
-  MALLOC(tok->merge_data, merge_bytes, md_name, goto fail;);
+  if (!(tok->ranks = malloc_ckd(tok->n_merges, sizeof(*tok->ranks)))) goto fail;
+
+  size_t merge_bytes = get_strarr_bytes(fp, tok->n_merges * 2);
+  if (merge_bytes == (size_t)-1) goto fail;
+
+  if (!(tok->merge_data = malloc_ckd(merge_bytes, sizeof(*tok->merge_data))))
+    goto fail;
 
   offset = 0;
-  for (int i = 0; i < tok->n_merges; i++)
+  for (uint32_t i = 0; i < tok->n_merges; i++)
   {
-    char name0[64], name1[64];
-    snprintf(name0, sizeof(name0), "%s.%d.0", md_name, i);
-    snprintf(name1, sizeof(name1), "%s.%d.1", md_name, i);
-
     char *str1, *str2;
-    READ_STR(str1, fp, tok->merge_data, &offset, name0, goto fail;);
-    READ_STR(str2, fp, tok->merge_data, &offset, name1, goto fail;);
+    if (!read_str_ckd(&str1, fp, tok->merge_data, &offset)) goto fail;
+    if (!read_str_ckd(&str2, fp, tok->merge_data, &offset)) goto fail;
 
     tok->ranks[i].rank = i;
     tok->ranks[i].str1 = str1;
     tok->ranks[i].str2 = str2;
   }
+
   qsort(tok->ranks, tok->n_merges, sizeof(tok->ranks[0]), cmp_merge);
   return tok;
 
@@ -3255,17 +3250,10 @@ decode(GemmaTokenizer *tok, int id, char *byte_buf)
 
 // Weight storage
 
-/* */
-typedef enum
-{
-  DTYPE_FPX,
-  DTYPE_INT8
-} WeightDType;
-
 /* A linear layer, either dense fpx or int8 + scales */
 typedef struct
 {
-  WeightDType dtype;
+  bool quant;
   union
   {
     floatx *fpx;
@@ -3275,11 +3263,28 @@ typedef struct
       floatx *scales;
     } i8;
   };
-} Linear;
+} QTensor;
+
+/* */
+static void
+free_qtensor(QTensor *l)
+{
+  if (l == NULL) return;
+  if (!l->quant)
+  {
+    free(l->fpx);
+  }
+  else
+  {
+    free(l->i8.q);
+    free(l->i8.scales);
+  }
+  free(l);
+}
 
 /* */
 static inline size_t
-linear_size(int m, int n, bool quant)
+qtensor_size(int m, int n, bool quant)
 {
   if (!quant)
   {
@@ -3292,73 +3297,52 @@ linear_size(int m, int n, bool quant)
 }
 
 // Linear layer weights: either plain floatx or int8 + per-channel scales
-#define READ_LINEAR(w, fp, m, n, quant, name, ...)                             \
-  do                                                                           \
-  {                                                                            \
-    MALLOC((w), 1, (name), __VA_ARGS__);                                       \
-    if (!(quant))                                                              \
-    {                                                                          \
-      (w)->dtype = DTYPE_FPX;                                                  \
-      char rlinear_fpx_name_[128];                                             \
-      snprintf(rlinear_fpx_name_, 128, "%s.fpx", (name));                      \
-      READ_TENSOR(                                                             \
-        (w)->fpx, (size_t)(m) * (size_t)(n), (fp), rlinear_fpx_name_,          \
-        __VA_ARGS__                                                            \
-      );                                                                       \
-    }                                                                          \
-    else                                                                       \
-    {                                                                          \
-      (w)->dtype = DTYPE_INT8;                                                 \
-      char rlinear_i8q_name_[128];                                             \
-      char rlinear_i8scales_name_[128];                                        \
-      snprintf(rlinear_i8q_name_, 128, "%s.i8.q", (name));                     \
-      snprintf(rlinear_i8scales_name_, 128, "%s.i8.scales", (name));           \
-      READ_TENSOR(                                                             \
-        (w)->i8.q, (size_t)(m) * (size_t)(n), (fp), rlinear_i8q_name_,         \
-        __VA_ARGS__                                                            \
-      );                                                                       \
-      READ_TENSOR(                                                             \
-        (w)->i8.scales, (n), (fp), rlinear_i8scales_name_, __VA_ARGS__         \
-      );                                                                       \
-    }                                                                          \
-  }                                                                            \
-  while (0)
+static QTensor *
+read_qtensor(FILE *fp, int m, int n, bool quant)
+{
+  QTensor *w;
+  if (!(w = calloc_ckd(1, sizeof(*w)))) return NULL;
+
+  if (!quant)
+  {
+    w->quant = false;
+    if (!(w->fpx = read_tensor_ckd((size_t)m * (size_t)n, sizeof(floatx), fp)))
+      goto fail;
+  }
+  else
+  {
+    w->quant = true;
+    if (!(w->i8.q =
+            read_tensor_ckd((size_t)m * (size_t)n, sizeof(int8_t), fp)) ||
+        !(w->i8.scales = read_tensor_ckd((size_t)n, sizeof(floatx), fp)))
+      goto fail;
+  }
+
+  return w;
+
+fail:
+  free_qtensor(w);
+  return NULL;
+}
 
 /* */
 static inline void
-mmap_linear(Linear *w, uint8_t *base, size_t *off, int m, int n, bool quant)
+mmap_qtensor(QTensor *w, uint8_t *base, size_t *off, int m, int n, bool quant)
 {
   if (!quant)
   {
-    w->dtype = DTYPE_FPX;
+    w->quant = false;
     w->fpx   = (floatx *)(base + *off);
     *off += (size_t)m * n * sizeof(floatx);
   }
   else
   {
-    w->dtype = DTYPE_INT8;
+    w->quant = true;
     w->i8.q  = (int8_t *)(base + *off);
     *off += (size_t)m * n * sizeof(int8_t);
     w->i8.scales = (floatx *)(base + *off);
     *off += (size_t)n * sizeof(floatx);
   }
-}
-
-/* */
-static void
-free_linear(Linear *l)
-{
-  if (l == NULL) return;
-  if (l->dtype == DTYPE_FPX)
-  {
-    free(l->fpx);
-  }
-  else
-  {
-    free(l->i8.q);
-    free(l->i8.scales);
-  }
-  free(l);
 }
 
 /* One Gemma transformer block */
@@ -3367,15 +3351,15 @@ typedef struct
   // Attention weights
   // 2D weights are stored transposed for better GEMV cache use
 
-  Linear *wq;  // (embed_dim, n_heads * head_dim).T
-  Linear *wk;  // (embed_dim, n_kv_heads * head_dim).T
-  Linear *wv;  // (embed_dim, n_kv_heads * head_dim).T
-  Linear *wo;  // (n_heads * head_dim, embed_dim).T
+  QTensor *wq;  // (embed_dim, n_heads * head_dim).T
+  QTensor *wk;  // (embed_dim, n_kv_heads * head_dim).T
+  QTensor *wv;  // (embed_dim, n_kv_heads * head_dim).T
+  QTensor *wo;  // (n_heads * head_dim, embed_dim).T
 
   // Feedforward weights
-  Linear *w1;  // (embed_dim, mlp_dim).T
-  Linear *w2;  // (embed_dim, mlp_dim).T
-  Linear *w3;  // (mlp_dim, embed_dim).T
+  QTensor *w1;  // (embed_dim, mlp_dim).T
+  QTensor *w2;  // (embed_dim, mlp_dim).T
+  QTensor *w3;  // (mlp_dim, embed_dim).T
 
   // RMSNorm weights (Gemma adds 1.0 to the weight)
   floatx *nq;  // (head_dim,)
@@ -3391,13 +3375,13 @@ static void
 free_text_layer(TextDecoderLayer *layer)
 {
   if (layer == NULL) return;
-  free_linear(layer->wq);
-  free_linear(layer->wk);
-  free_linear(layer->wv);
-  free_linear(layer->wo);
-  free_linear(layer->w1);
-  free_linear(layer->w2);
-  free_linear(layer->w3);
+  free_qtensor(layer->wq);
+  free_qtensor(layer->wk);
+  free_qtensor(layer->wv);
+  free_qtensor(layer->wo);
+  free_qtensor(layer->w1);
+  free_qtensor(layer->w2);
+  free_qtensor(layer->w3);
   free(layer->n1);
   free(layer->n2);
   free(layer->nq);
@@ -3427,10 +3411,10 @@ free_text_layer_wrapper(TextDecoderLayer *layer)
 typedef struct
 {
   // ViT attention weights
-  Linear *wq;  // (hidden_dim, hidden_dim).T
-  Linear *wk;  // (hidden_dim, hidden_dim).T
-  Linear *wv;  // (hidden_dim, hidden_dim).T
-  Linear *wo;  // (hidden_dim, hidden_dim).T
+  QTensor *wq;  // (hidden_dim, hidden_dim).T
+  QTensor *wk;  // (hidden_dim, hidden_dim).T
+  QTensor *wv;  // (hidden_dim, hidden_dim).T
+  QTensor *wo;  // (hidden_dim, hidden_dim).T
 
   // ViT attention biases
   floatx *bq;  // (hidden_dim,)
@@ -3439,8 +3423,8 @@ typedef struct
   floatx *bo;  // (hidden_dim,)
 
   // ViT feedforward weights
-  Linear *w1;  // (hidden_dim, mlp_dim).T
-  Linear *w2;  // (hidden_dim, mlp_dim).T
+  QTensor *w1;  // (hidden_dim, mlp_dim).T
+  QTensor *w2;  // (hidden_dim, mlp_dim).T
 
   // ViT feedforward biases
   floatx *b1;  // (mlp_dim,)
@@ -3460,16 +3444,16 @@ static void
 free_vision_layer(VisionEncoderLayer *layer)
 {
   if (layer == NULL) return;
-  free_linear(layer->wq);
-  free_linear(layer->wk);
-  free_linear(layer->wv);
-  free_linear(layer->wo);
+  free_qtensor(layer->wq);
+  free_qtensor(layer->wk);
+  free_qtensor(layer->wv);
+  free_qtensor(layer->wo);
   free(layer->bq);
   free(layer->bk);
   free(layer->bv);
   free(layer->bo);
-  free_linear(layer->w1);
-  free_linear(layer->w2);
+  free_qtensor(layer->w1);
+  free_qtensor(layer->w2);
   free(layer->b1);
   free(layer->b2);
   free(layer->n1);
@@ -3498,7 +3482,7 @@ typedef struct
 {
   TextConfig *config;
   // (vocab_size, embed_dim), shared with lm_head (tied weights)
-  Linear            *embedding;
+  QTensor           *embedding;
   TextDecoderLayer **layers;
   floatx            *final_norm;  // (embed_dim,)
 } TextDecoder;
@@ -3515,15 +3499,15 @@ get_text_decoder_size(const TextConfig *cfg, bool quant)
   int    vs   = cfg->vocab_size;
 
   // embedding: linear (C -> vs)
-  size += linear_size(C, vs, quant);
+  size += qtensor_size(C, vs, quant);
 
   for (int l = 0; l < cfg->n_layers; l++)
   {
     // wq, wk, wv, wo
-    size += linear_size(C, Cq, quant);
-    size += linear_size(C, Ckv, quant);
-    size += linear_size(C, Ckv, quant);
-    size += linear_size(Cq, C, quant);
+    size += qtensor_size(C, Cq, quant);
+    size += qtensor_size(C, Ckv, quant);
+    size += qtensor_size(C, Ckv, quant);
+    size += qtensor_size(Cq, C, quant);
 
     // optional nq, nk
     if (cfg->qk_norm)
@@ -3533,9 +3517,9 @@ get_text_decoder_size(const TextConfig *cfg, bool quant)
     }
 
     // w1, w2, w3
-    size += linear_size(C, CM, quant);
-    size += linear_size(C, CM, quant);
-    size += linear_size(CM, C, quant);
+    size += qtensor_size(C, CM, quant);
+    size += qtensor_size(C, CM, quant);
+    size += qtensor_size(CM, C, quant);
 
     // n1, n2
     size += (size_t)C * sizeof(floatx);
@@ -3560,11 +3544,11 @@ get_text_decoder_size(const TextConfig *cfg, bool quant)
 
 /* */
 void
-free_text_decoder(TextDecoder *dec)
+free_text_decoder(TextDecoder *dec, bool free_cfg)
 {
   if (dec == NULL) return;
 
-  free_linear(dec->embedding);
+  free_qtensor(dec->embedding);
   if (dec->layers != NULL && dec->config != NULL)
   {
     for (int l = 0; l < dec->config->n_layers; l++)
@@ -3574,13 +3558,16 @@ free_text_decoder(TextDecoder *dec)
     free(dec->layers);
   }
   free(dec->final_norm);
-  free_text_config(dec->config);
+  if (free_cfg)
+  {
+    free_text_config(dec->config);
+  }
   free(dec);
 }
 
 /* */
 void
-free_text_decoder_wrapper(TextDecoder *dec)
+free_text_decoder_wrapper(TextDecoder *dec, bool free_cfg)
 {
   if (dec == NULL) return;
 
@@ -3593,7 +3580,10 @@ free_text_decoder_wrapper(TextDecoder *dec)
     }
     free(dec->layers);
   }
-  free_text_config(dec->config);
+  if (free_cfg)
+  {
+    free_text_config(dec->config);
+  }
   free(dec);
 }
 
@@ -3602,7 +3592,7 @@ static TextDecoder *
 read_text_decoder(FILE *fp, TextConfig *cfg, bool quant)
 {
   TextDecoder *dec;
-  CALLOC(dec, 1, "model.decoder", goto fail;);
+  if (!(dec = calloc_ckd(1, sizeof(*dec)))) goto fail;
   dec->config = cfg;
 
   int C   = cfg->embed_dim;
@@ -3611,46 +3601,42 @@ read_text_decoder(FILE *fp, TextConfig *cfg, bool quant)
   int Ckv = cfg->n_kv_heads * cfg->head_dim;
   int vs  = cfg->vocab_size;
 
-  const char *emb_name = "model.decoder.embedding";
-  const char *lrs_name = "model.decoder.layers";
-
   /* The embedding shape is (vocab_size, embed_dim), but it uses per-tensor
    * quantization rather than per-channel like other weights. Gemma uses tied
    * weights, which means the final lm_head shares the same weights with the
    * embedding table, but transposed. So it becomes per-channel quantization in
-   * the final lm_head.
-   */
+   * the final lm_head. */
 
-  READ_LINEAR(dec->embedding, fp, C, vs, quant, emb_name, goto fail;);
-  CALLOC(dec->layers, cfg->n_layers, lrs_name, goto fail;);  // NOLINT
+  if (!(dec->embedding = read_qtensor(fp, C, vs, quant)) ||
+      !(dec->layers = calloc_ckd(
+          cfg->n_layers, sizeof(*dec->layers)  // NOLINT
+        )))
+    goto fail;
 
   // Read all the layers
   for (int l = 0; l < cfg->n_layers; l++)
   {
-    char layer_name[64];
-    snprintf(layer_name, sizeof(layer_name), "%s.%d", lrs_name, l);
     TextDecoderLayer *layer = NULL;
-    CALLOC(layer, 1, layer_name, goto fail;);
 
-    char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
-    snprintf(wq_name, sizeof(wq_name), "%s.%d.wq", lrs_name, l);
-    snprintf(wk_name, sizeof(wk_name), "%s.%d.wk", lrs_name, l);
-    snprintf(wv_name, sizeof(wv_name), "%s.%d.wv", lrs_name, l);
-    snprintf(wo_name, sizeof(wo_name), "%s.%d.wo", lrs_name, l);
+    if (!(layer = calloc_ckd(1, sizeof(*layer)))) goto fail;
 
-    // Attention weights
-    READ_LINEAR(layer->wq, fp, C, Cq, quant, wq_name, goto fail;);
-    READ_LINEAR(layer->wk, fp, C, Ckv, quant, wk_name, goto fail;);
-    READ_LINEAR(layer->wv, fp, C, Ckv, quant, wv_name, goto fail;);
-    READ_LINEAR(layer->wo, fp, Cq, C, quant, wo_name, goto fail;);
+    dec->layers[l] = layer;
+
+    if (
+      // Attention weights
+      !(layer->wq = read_qtensor(fp, C, Cq, quant)) ||
+      !(layer->wk = read_qtensor(fp, C, Ckv, quant)) ||
+      !(layer->wv = read_qtensor(fp, C, Ckv, quant)) ||
+      !(layer->wo = read_qtensor(fp, Cq, C, quant)))
+      goto fail;
 
     if (cfg->qk_norm)
     {
-      char nq_name[64], nk_name[64];
-      snprintf(nq_name, sizeof(nq_name), "%s.%d.nq", lrs_name, l);
-      snprintf(nk_name, sizeof(nk_name), "%s.%d.nk", lrs_name, l);
-      READ_TENSOR(layer->nq, cfg->head_dim, fp, nq_name, goto fail;);
-      READ_TENSOR(layer->nk, cfg->head_dim, fp, nk_name, goto fail;);
+      // QK RMSNorms
+      if (!(layer->nq =
+              read_tensor_ckd(cfg->head_dim, sizeof(*layer->nq), fp)) ||
+          !(layer->nk = read_tensor_ckd(cfg->head_dim, sizeof(*layer->nk), fp)))
+        goto fail;
     }
     else
     {
@@ -3658,29 +3644,19 @@ read_text_decoder(FILE *fp, TextConfig *cfg, bool quant)
       layer->nk = NULL;
     }
 
-    char w1_name[64], w2_name[64], w3_name[64];
-    snprintf(w1_name, sizeof(w1_name), "%s.%d.w1", lrs_name, l);
-    snprintf(w2_name, sizeof(w2_name), "%s.%d.w2", lrs_name, l);
-    snprintf(w3_name, sizeof(w3_name), "%s.%d.w3", lrs_name, l);
-
-    // Feedforward weights
-    READ_LINEAR(layer->w1, fp, C, CM, quant, w1_name, goto fail;);
-    READ_LINEAR(layer->w2, fp, C, CM, quant, w2_name, goto fail;);
-    READ_LINEAR(layer->w3, fp, CM, C, quant, w3_name, goto fail;);
-
-    char n1_name[64], n2_name[64];
-    snprintf(n1_name, sizeof(n1_name), "%s.%d.n1", lrs_name, l);
-    snprintf(n2_name, sizeof(n2_name), "%s.%d.n2", lrs_name, l);
-
-    // RMSNorm weights
-    READ_TENSOR(layer->n1, C, fp, n1_name, goto fail;);
-    READ_TENSOR(layer->n2, C, fp, n2_name, goto fail;);
+    if (
+      // Feedforward weights
+      !(layer->w1 = read_qtensor(fp, C, CM, quant)) ||
+      !(layer->w2 = read_qtensor(fp, C, CM, quant)) ||
+      !(layer->w3 = read_qtensor(fp, CM, C, quant)) ||
+      // RMSNorm weights
+      !(layer->n1 = read_tensor_ckd(C, sizeof(*layer->n1), fp)) ||
+      !(layer->n2 = read_tensor_ckd(C, sizeof(*layer->n2), fp)))
+      goto fail;
 
     if (cfg->pre_mlp_norm)
     {
-      char n3_name[64];
-      snprintf(n3_name, sizeof(n3_name), "%s.%d.n3", lrs_name, l);
-      READ_TENSOR(layer->n3, C, fp, n3_name, goto fail;);
+      if (!(layer->n3 = read_tensor_ckd(C, sizeof(*layer->n3), fp))) goto fail;
     }
     else
     {
@@ -3688,9 +3664,7 @@ read_text_decoder(FILE *fp, TextConfig *cfg, bool quant)
     }
     if (cfg->pst_mlp_norm)
     {
-      char n4_name[64];
-      snprintf(n4_name, sizeof(n4_name), "%s.%d.n4", lrs_name, l);
-      READ_TENSOR(layer->n4, C, fp, n4_name, goto fail;);
+      if (!(layer->n4 = read_tensor_ckd(C, sizeof(*layer->n4), fp))) goto fail;
     }
     else
     {
@@ -3698,12 +3672,14 @@ read_text_decoder(FILE *fp, TextConfig *cfg, bool quant)
     }
     dec->layers[l] = layer;
   }
-  READ_TENSOR(dec->final_norm, C, fp, "model.decoder.final_norm", goto fail;);
+
+  if (!(dec->final_norm = read_tensor_ckd(C, sizeof(*dec->final_norm), fp)))
+    goto fail;
 
   return dec;
 
 fail:
-  free_text_decoder(dec);
+  free_text_decoder(dec, false);
   return NULL;
 }
 
@@ -3712,7 +3688,7 @@ static TextDecoder *
 mmap_text_decoder(void *data, TextConfig *cfg, size_t *offset, bool quant)
 {
   TextDecoder *dec;
-  CALLOC(dec, 1, "model.decoder", goto fail;);
+  if (!(dec = calloc_ckd(1, sizeof(*dec)))) goto fail;
   dec->config = cfg;
 
   uint8_t *base = (uint8_t *)data;
@@ -3723,38 +3699,33 @@ mmap_text_decoder(void *data, TextConfig *cfg, size_t *offset, bool quant)
   int Ckv = cfg->n_kv_heads * cfg->head_dim;
   int vs  = cfg->vocab_size;
 
-  const char *emb_name = "model.decoder.embedding";
-  const char *lrs_name = "model.decoder.layers";
-
   // Embedding: linear (C -> vs)
-  CALLOC(dec->embedding, 1, emb_name, goto fail;);
-  mmap_linear(dec->embedding, base, offset, C, vs, quant);
+  if (!(dec->embedding = calloc_ckd(1, sizeof(*dec->embedding)))) goto fail;
+  mmap_qtensor(dec->embedding, base, offset, C, vs, quant);
 
   // Layers array
-  CALLOC(dec->layers, cfg->n_layers, lrs_name, goto fail;);  // NOLINT
+  if (!(dec->layers =
+          calloc_ckd(cfg->n_layers, sizeof(*dec->layers))))  // NOLINT
+    goto fail;
 
   for (int l = 0; l < cfg->n_layers; l++)
   {
-    char layer_name[64];
-    snprintf(layer_name, sizeof(layer_name), "%s.%d", lrs_name, l);
     TextDecoderLayer *layer = NULL;
-    CALLOC(layer, 1, layer_name, goto fail;);
+    if (!(layer = calloc_ckd(1, sizeof(*layer)))) goto fail;
+    dec->layers[l] = layer;
 
     // Attention weights
-    char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
-    snprintf(wq_name, sizeof(wq_name), "%s.%d.wq", lrs_name, l);
-    snprintf(wk_name, sizeof(wk_name), "%s.%d.wk", lrs_name, l);
-    snprintf(wv_name, sizeof(wv_name), "%s.%d.wv", lrs_name, l);
-    snprintf(wo_name, sizeof(wo_name), "%s.%d.wo", lrs_name, l);
+    if (!(layer->wq = calloc_ckd(1, sizeof(*layer->wq)))) goto fail;
+    mmap_qtensor(layer->wq, base, offset, C, Cq, quant);
 
-    CALLOC(layer->wq, 1, wq_name, goto fail;);
-    mmap_linear(layer->wq, base, offset, C, Cq, quant);
-    CALLOC(layer->wk, 1, wk_name, goto fail;);
-    mmap_linear(layer->wk, base, offset, C, Ckv, quant);
-    CALLOC(layer->wv, 1, wv_name, goto fail;);
-    mmap_linear(layer->wv, base, offset, C, Ckv, quant);
-    CALLOC(layer->wo, 1, wo_name, goto fail;);
-    mmap_linear(layer->wo, base, offset, Cq, C, quant);
+    if (!(layer->wk = calloc_ckd(1, sizeof(*layer->wk)))) goto fail;
+    mmap_qtensor(layer->wk, base, offset, C, Ckv, quant);
+
+    if (!(layer->wv = calloc_ckd(1, sizeof(*layer->wv)))) goto fail;
+    mmap_qtensor(layer->wv, base, offset, C, Ckv, quant);
+
+    if (!(layer->wo = calloc_ckd(1, sizeof(*layer->wo)))) goto fail;
+    mmap_qtensor(layer->wo, base, offset, Cq, C, quant);
 
     // QK normalization (optional)
     if (cfg->qk_norm)
@@ -3771,17 +3742,14 @@ mmap_text_decoder(void *data, TextConfig *cfg, size_t *offset, bool quant)
     }
 
     // Feedforward weights
-    char w1_name[64], w2_name[64], w3_name[64];
-    snprintf(w1_name, sizeof(w1_name), "%s.%d.w1", lrs_name, l);
-    snprintf(w2_name, sizeof(w2_name), "%s.%d.w2", lrs_name, l);
-    snprintf(w3_name, sizeof(w3_name), "%s.%d.w3", lrs_name, l);
+    if (!(layer->w1 = calloc_ckd(1, sizeof(*layer->w1)))) goto fail;
+    mmap_qtensor(layer->w1, base, offset, C, CM, quant);
 
-    CALLOC(layer->w1, 1, w1_name, goto fail;);
-    mmap_linear(layer->w1, base, offset, C, CM, quant);
-    CALLOC(layer->w2, 1, w2_name, goto fail;);
-    mmap_linear(layer->w2, base, offset, C, CM, quant);
-    CALLOC(layer->w3, 1, w3_name, goto fail;);
-    mmap_linear(layer->w3, base, offset, CM, C, quant);
+    if (!(layer->w2 = calloc_ckd(1, sizeof(*layer->w2)))) goto fail;
+    mmap_qtensor(layer->w2, base, offset, C, CM, quant);
+
+    if (!(layer->w3 = calloc_ckd(1, sizeof(*layer->w3)))) goto fail;
+    mmap_qtensor(layer->w3, base, offset, CM, C, quant);
 
     // RMSNorm weights
     layer->n1 = (floatx *)(base + *offset);
@@ -3820,7 +3788,7 @@ mmap_text_decoder(void *data, TextConfig *cfg, size_t *offset, bool quant)
   return dec;
 
 fail:
-  free_text_decoder(dec);
+  free_text_decoder_wrapper(dec, false);
   return NULL;
 }
 
@@ -3829,16 +3797,16 @@ typedef struct
 {
   VisionConfig *config;
 
-  floatx *patch_emb;      // (hidden_dim, 3, patch_size, patch_size)
-  floatx *patch_emb_b;    // (hidden_dim,)
-  Linear *pos_embedding;  // ((image_size / patch_size)^2, hidden_dim)
+  floatx  *patch_emb;      // (hidden_dim, 3, patch_size, patch_size)
+  floatx  *patch_emb_b;    // (hidden_dim,)
+  QTensor *pos_embedding;  // ((image_size / patch_size)^2, hidden_dim)
 
   VisionEncoderLayer **layers;
 
-  floatx *post_norm;    // (hidden_dim,)
-  floatx *post_norm_b;  // (hidden_dim,)
-  floatx *norm;         // (hidden_dim,)
-  Linear *proj;         // (hidden_dim, embed_dim).T
+  floatx  *post_norm;    // (hidden_dim,)
+  floatx  *post_norm_b;  // (hidden_dim,)
+  floatx  *norm;         // (hidden_dim,)
+  QTensor *proj;         // (hidden_dim, embed_dim).T
 } VisionEncoder;
 
 /* */
@@ -3860,7 +3828,7 @@ get_vision_encoder_size(
   size += (size_t)C * sizeof(floatx);
 
   // pos_embedding: linear (C -> N)
-  size += linear_size(C, N, quant);
+  size += qtensor_size(C, N, quant);
 
   // each layer
   for (int l = 0; l < vcfg->n_layers; l++)
@@ -3870,10 +3838,10 @@ get_vision_encoder_size(
     size += (size_t)C * sizeof(floatx);
 
     // wq, wk, wv, wo: linear (C -> C)
-    size += linear_size(C, C, quant);
-    size += linear_size(C, C, quant);
-    size += linear_size(C, C, quant);
-    size += linear_size(C, C, quant);
+    size += qtensor_size(C, C, quant);
+    size += qtensor_size(C, C, quant);
+    size += qtensor_size(C, C, quant);
+    size += qtensor_size(C, C, quant);
 
     // bq, bk, bv, bo
     size += (size_t)C * sizeof(floatx);
@@ -3886,8 +3854,8 @@ get_vision_encoder_size(
     size += (size_t)C * sizeof(floatx);
 
     // w1: linear (C -> CM), w2: linear (CM -> C)
-    size += linear_size(C, CM, quant);
-    size += linear_size(CM, C, quant);
+    size += qtensor_size(C, CM, quant);
+    size += qtensor_size(CM, C, quant);
 
     // b1 (CM), b2 (C)
     size += (size_t)CM * sizeof(floatx);
@@ -3902,20 +3870,20 @@ get_vision_encoder_size(
   size += (size_t)C * sizeof(floatx);
 
   // proj: linear (C -> cfg->embed_dim)
-  size += linear_size(C, cfg->embed_dim, quant);
+  size += qtensor_size(C, cfg->embed_dim, quant);
 
   return size;
 }
 
 /* */
 void
-free_vision_encoder(VisionEncoder *enc)
+free_vision_encoder(VisionEncoder *enc, bool free_cfg)
 {
   if (enc == NULL) return;
 
   free(enc->patch_emb);
   free(enc->patch_emb_b);
-  free_linear(enc->pos_embedding);
+  free_qtensor(enc->pos_embedding);
   if (enc->layers != NULL && enc->config != NULL)
   {
     for (int l = 0; l < enc->config->n_layers; l++)
@@ -3924,17 +3892,20 @@ free_vision_encoder(VisionEncoder *enc)
     }
     free(enc->layers);
   }
-  free(enc->config);
+  if (free_cfg)
+  {
+    free(enc->config);
+  }
   free(enc->post_norm);
   free(enc->post_norm_b);
   free(enc->norm);
-  free_linear(enc->proj);
+  free_qtensor(enc->proj);
   free(enc);
 }
 
 /* */
 void
-free_vision_encoder_wrapper(VisionEncoder *enc)
+free_vision_encoder_wrapper(VisionEncoder *enc, bool free_cfg)
 {
   if (enc == NULL) return;
   free(enc->pos_embedding);
@@ -3946,7 +3917,10 @@ free_vision_encoder_wrapper(VisionEncoder *enc)
     }
     free(enc->layers);
   }
-  free(enc->config);
+  if (free_cfg)
+  {
+    free(enc->config);
+  }
   free(enc->proj);
   free(enc);
 }
@@ -3956,108 +3930,78 @@ static VisionEncoder *
 read_vision_encoder(FILE *fp, TextConfig *cfg, VisionConfig *vcfg, bool quant)
 {
   VisionEncoder *enc;
-  CALLOC(enc, 1, "model.encoder", goto fail;);
+  if (!(enc = calloc_ckd(1, sizeof(*enc)))) goto fail;
+
   enc->config = vcfg;
 
   int P  = vcfg->patch_size;
   int C  = vcfg->hidden_dim;
   int CM = vcfg->mlp_dim;
   int N  = vcfg->image_size / P;
+
   N *= N;
 
-  const char *pem_name = "model.encoder.patch_emb";
-  const char *peb_name = "model.encoder.patch_emb_b";
-  const char *psm_name = "model.encoder.pos_embedding";
-  const char *lrs_name = "model.encoder.layers";
-  const char *pnm_name = "model.encoder.post_norm";
-  const char *pnb_name = "model.encoder.post_norm_b";
-  const char *nrm_name = "model.encoder.norm";
-  const char *prj_name = "model.encoder.proj";
-
-  READ_TENSOR(enc->patch_emb, C * 3 * P * P, fp, pem_name, goto fail;);
-  READ_TENSOR(enc->patch_emb_b, C, fp, peb_name, goto fail;);
-
-  // Same as here, the real shape is (N, C)
-  READ_LINEAR(enc->pos_embedding, fp, C, N, quant, psm_name, goto fail;);
-  CALLOC(enc->layers, vcfg->n_layers, lrs_name, goto fail;);  // NOLINT
+  if (!(enc->patch_emb =
+          read_tensor_ckd((size_t)C * 3 * P * P, sizeof(floatx), fp)) ||
+      !(enc->patch_emb_b = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      // Same as here, the real shape is (N, C)
+      !(enc->pos_embedding = read_qtensor(fp, C, N, quant)) ||
+      !(enc->layers = calloc_ckd(
+          vcfg->n_layers, sizeof(*enc->layers)  // NOLINT
+        )))
+    goto fail;
 
   // Read all the layers of ViT
   for (int l = 0; l < vcfg->n_layers; l++)
   {
-    char layer_name[64];
-    snprintf(layer_name, sizeof(layer_name), "%s.%d", lrs_name, l);
     VisionEncoderLayer *layer = NULL;
-    CALLOC(layer, 1, layer_name, goto fail;);
 
-    // First layernorm
-    char n1_name[64], n1b_name[64];
-    snprintf(n1_name, sizeof(n1_name), "%s.%d.n1", lrs_name, l);
-    snprintf(n1b_name, sizeof(n1b_name), "%s.%d.n1_b", lrs_name, l);
-    READ_TENSOR(layer->n1, C, fp, n1_name, goto fail;);
-    READ_TENSOR(layer->n1_b, C, fp, n1b_name, goto fail;);
+    if (!(layer = calloc_ckd(1, sizeof(*layer)))) goto fail;
 
-    // Attention weights
-    char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
-    snprintf(wq_name, sizeof(wq_name), "%s.%d.wq", lrs_name, l);
-    snprintf(wk_name, sizeof(wk_name), "%s.%d.wk", lrs_name, l);
-    snprintf(wv_name, sizeof(wv_name), "%s.%d.wv", lrs_name, l);
-    snprintf(wo_name, sizeof(wo_name), "%s.%d.wo", lrs_name, l);
+    enc->layers[l] = layer;
 
-    READ_LINEAR(layer->wq, fp, C, C, quant, wq_name, goto fail;);
-    READ_LINEAR(layer->wk, fp, C, C, quant, wk_name, goto fail;);
-    READ_LINEAR(layer->wv, fp, C, C, quant, wv_name, goto fail;);
-    READ_LINEAR(layer->wo, fp, C, C, quant, wo_name, goto fail;);
-
-    // Attention biases
-    char bq_name[64], bk_name[64], bv_name[64], bo_name[64];
-    snprintf(bq_name, sizeof(bq_name), "%s.%d.bq", lrs_name, l);
-    snprintf(bk_name, sizeof(bk_name), "%s.%d.bk", lrs_name, l);
-    snprintf(bv_name, sizeof(bv_name), "%s.%d.bv", lrs_name, l);
-    snprintf(bo_name, sizeof(bo_name), "%s.%d.bo", lrs_name, l);
-
-    READ_TENSOR(layer->bq, C, fp, bq_name, goto fail;);
-    READ_TENSOR(layer->bk, C, fp, bk_name, goto fail;);
-    READ_TENSOR(layer->bv, C, fp, bv_name, goto fail;);
-    READ_TENSOR(layer->bo, C, fp, bo_name, goto fail;);
-
-    // Second layernorm
-    char n2_name[64], n2b_name[64];
-    snprintf(n2_name, sizeof(n2_name), "%s.%d.n2", lrs_name, l);
-    snprintf(n2b_name, sizeof(n2b_name), "%s.%d.n2_b", lrs_name, l);
-
-    READ_TENSOR(layer->n2, C, fp, n2_name, goto fail;);
-    READ_TENSOR(layer->n2_b, C, fp, n2b_name, goto fail;);
-
-    // Feedforward weights
-    char w1_name[64], w2_name[64];
-    snprintf(w1_name, sizeof(w1_name), "%s.%d.w1", lrs_name, l);
-    snprintf(w2_name, sizeof(w2_name), "%s.%d.w2", lrs_name, l);
-    READ_LINEAR(layer->w1, fp, C, CM, quant, w1_name, goto fail;);
-    READ_LINEAR(layer->w2, fp, CM, C, quant, w2_name, goto fail;);
-
-    // Feedforward biases
-    char b1_name[64], b2_name[64];
-    snprintf(b1_name, sizeof(b1_name), "%s.%d.b1", lrs_name, l);
-    snprintf(b2_name, sizeof(b2_name), "%s.%d.b2", lrs_name, l);
-    READ_TENSOR(layer->b1, CM, fp, b1_name, goto fail;);
-    READ_TENSOR(layer->b2, C, fp, b2_name, goto fail;);
+    if (
+      // First LayerNorm
+      !(layer->n1 = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      !(layer->n1_b = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      // Attention weights
+      !(layer->wq = read_qtensor(fp, C, C, quant)) ||
+      !(layer->wk = read_qtensor(fp, C, C, quant)) ||
+      !(layer->wv = read_qtensor(fp, C, C, quant)) ||
+      !(layer->wo = read_qtensor(fp, C, C, quant)) ||
+      // Attention biases
+      !(layer->bq = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      !(layer->bk = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      !(layer->bv = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      !(layer->bo = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      // Second LayerNorm
+      !(layer->n2 = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      !(layer->n2_b = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      // Feedforward weights
+      !(layer->w1 = read_qtensor(fp, C, CM, quant)) ||
+      !(layer->w2 = read_qtensor(fp, CM, C, quant)) ||
+      // Feedforward biases
+      !(layer->b1 = read_tensor_ckd((size_t)CM, sizeof(floatx), fp)) ||
+      !(layer->b2 = read_tensor_ckd((size_t)C, sizeof(floatx), fp)))
+      goto fail;
 
     enc->layers[l] = layer;
   }
 
-  // Post layernorm
-  READ_TENSOR(enc->post_norm, C, fp, pnm_name, goto fail;);
-  READ_TENSOR(enc->post_norm_b, C, fp, pnb_name, goto fail;);
-
-  // Soft embedding RMSNorm
-  READ_TENSOR(enc->norm, C, fp, nrm_name, goto fail;);
-  // Final projection
-  READ_LINEAR(enc->proj, fp, C, cfg->embed_dim, quant, prj_name, goto fail;);
+  if (
+    // Post layernorm
+    !(enc->post_norm = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+    !(enc->post_norm_b = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+    // Soft embedding RMSNorm
+    !(enc->norm = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+    // Final projection
+    !(enc->proj = read_qtensor(fp, C, cfg->embed_dim, quant)))
+    goto fail;
 
   return enc;
 
 fail:
-  free_vision_encoder(enc);
+  free_vision_encoder(enc, false);
   return NULL;
 }
 
@@ -4068,7 +4012,7 @@ mmap_vision_encoder(
 )
 {
   VisionEncoder *enc;
-  CALLOC(enc, 1, "model.encoder", goto fail;);
+  if (!(enc = calloc_ckd(1, sizeof(*enc)))) goto fail;
   enc->config = vcfg;
 
   uint8_t *base = (uint8_t *)data;
@@ -4077,11 +4021,8 @@ mmap_vision_encoder(
   int C  = vcfg->hidden_dim;
   int CM = vcfg->mlp_dim;
   int N  = vcfg->image_size / P;
-  N *= N;
 
-  const char *psm_name = "model.encoder.pos_embedding";
-  const char *lrs_name = "model.encoder.layers";
-  const char *prj_name = "model.encoder.proj";
+  N *= N;
 
   // patch_emb: C * 3 * P * P floats
   enc->patch_emb = (floatx *)(base + *offset);
@@ -4092,18 +4033,21 @@ mmap_vision_encoder(
   *offset += (size_t)C * sizeof(floatx);
 
   // pos_embedding: linear (C -> N)
-  CALLOC(enc->pos_embedding, 1, psm_name, goto fail;);
-  mmap_linear(enc->pos_embedding, base, offset, C, N, quant);
+  if (!(enc->pos_embedding = calloc_ckd(1, sizeof(*enc->pos_embedding))))
+    goto fail;
+  mmap_qtensor(enc->pos_embedding, base, offset, C, N, quant);
 
   // layers array
-  CALLOC(enc->layers, vcfg->n_layers, lrs_name, goto fail;);  // NOLINT
+  if (!(enc->layers = calloc_ckd(
+          vcfg->n_layers, sizeof(*enc->layers)  // NOLINT
+        )))
+    goto fail;
 
   for (int l = 0; l < vcfg->n_layers; l++)
   {
-    char layer_name[64];
-    snprintf(layer_name, sizeof(layer_name), "%s.%d", lrs_name, l);
     VisionEncoderLayer *layer = NULL;
-    CALLOC(layer, 1, layer_name, goto fail;);
+    if (!(layer = calloc_ckd(1, sizeof(*layer)))) goto fail;
+    enc->layers[l] = layer;
 
     // n1, n1_b
     layer->n1 = (floatx *)(base + *offset);
@@ -4112,20 +4056,17 @@ mmap_vision_encoder(
     *offset += (size_t)C * sizeof(floatx);
 
     // attention weights: wq, wk, wv, wo (linear C -> C)
-    char wq_name[64], wk_name[64], wv_name[64], wo_name[64];
-    snprintf(wq_name, sizeof(wq_name), "%s.%d.wq", lrs_name, l);
-    snprintf(wk_name, sizeof(wk_name), "%s.%d.wk", lrs_name, l);
-    snprintf(wv_name, sizeof(wv_name), "%s.%d.wv", lrs_name, l);
-    snprintf(wo_name, sizeof(wo_name), "%s.%d.wo", lrs_name, l);
+    if (!(layer->wq = calloc_ckd(1, sizeof(*layer->wq)))) goto fail;
+    mmap_qtensor(layer->wq, base, offset, C, C, quant);
 
-    CALLOC(layer->wq, 1, wq_name, goto fail;);
-    mmap_linear(layer->wq, base, offset, C, C, quant);
-    CALLOC(layer->wk, 1, wk_name, goto fail;);
-    mmap_linear(layer->wk, base, offset, C, C, quant);
-    CALLOC(layer->wv, 1, wv_name, goto fail;);
-    mmap_linear(layer->wv, base, offset, C, C, quant);
-    CALLOC(layer->wo, 1, wo_name, goto fail;);
-    mmap_linear(layer->wo, base, offset, C, C, quant);
+    if (!(layer->wk = calloc_ckd(1, sizeof(*layer->wk)))) goto fail;
+    mmap_qtensor(layer->wk, base, offset, C, C, quant);
+
+    if (!(layer->wv = calloc_ckd(1, sizeof(*layer->wv)))) goto fail;
+    mmap_qtensor(layer->wv, base, offset, C, C, quant);
+
+    if (!(layer->wo = calloc_ckd(1, sizeof(*layer->wo)))) goto fail;
+    mmap_qtensor(layer->wo, base, offset, C, C, quant);
 
     // attention biases: bq, bk, bv, bo
     layer->bq = (floatx *)(base + *offset);
@@ -4144,14 +4085,11 @@ mmap_vision_encoder(
     *offset += (size_t)C * sizeof(floatx);
 
     // feedforward weights: w1 (C -> CM), w2 (CM -> C)
-    char w1_name[64], w2_name[64];
-    snprintf(w1_name, sizeof(w1_name), "%s.%d.w1", lrs_name, l);
-    snprintf(w2_name, sizeof(w2_name), "%s.%d.w2", lrs_name, l);
+    if (!(layer->w1 = calloc_ckd(1, sizeof(*layer->w1)))) goto fail;
+    mmap_qtensor(layer->w1, base, offset, C, CM, quant);
 
-    CALLOC(layer->w1, 1, w1_name, goto fail;);
-    mmap_linear(layer->w1, base, offset, C, CM, quant);
-    CALLOC(layer->w2, 1, w2_name, goto fail;);
-    mmap_linear(layer->w2, base, offset, CM, C, quant);
+    if (!(layer->w2 = calloc_ckd(1, sizeof(*layer->w2)))) goto fail;
+    mmap_qtensor(layer->w2, base, offset, CM, C, quant);
 
     // feedforward biases: b1 (CM), b2 (C)
     layer->b1 = (floatx *)(base + *offset);
@@ -4173,13 +4111,13 @@ mmap_vision_encoder(
   *offset += (size_t)C * sizeof(floatx);
 
   // proj: linear (C -> embed_dim)
-  CALLOC(enc->proj, 1, prj_name, goto fail;);
-  mmap_linear(enc->proj, base, offset, C, cfg->embed_dim, quant);
+  if (!(enc->proj = calloc_ckd(1, sizeof(*enc->proj)))) goto fail;
+  mmap_qtensor(enc->proj, base, offset, C, cfg->embed_dim, quant);
 
   return enc;
 
 fail:
-  free_vision_encoder(enc);
+  free_vision_encoder_wrapper(enc, false);
   return NULL;
 }
 
@@ -4201,8 +4139,8 @@ free_gemma_model(GemmaModel *model)
 {
   if (model == NULL) return;
   free_tokenizer(model->tokenizer);
-  free_vision_encoder(model->encoder);
-  free_text_decoder(model->decoder);
+  free_vision_encoder(model->encoder, true);
+  free_text_decoder(model->decoder, true);
   free(model);
 }
 
@@ -4212,9 +4150,12 @@ munmap_gemma_model(GemmaModel *model)
 {
   if (model == NULL) return;
   free_tokenizer(model->tokenizer);
-  munmap(model->mmap_data, model->mmap_size);
-  free_vision_encoder_wrapper(model->encoder);
-  free_text_decoder_wrapper(model->decoder);
+  if (model->mmap_data != NULL)
+  {
+    munmap(model->mmap_data, model->mmap_size);
+  }
+  free_vision_encoder_wrapper(model->encoder, true);
+  free_text_decoder_wrapper(model->decoder, true);
   free(model);
 }
 
@@ -4225,18 +4166,17 @@ check_head(FILE *fp, const char *filename)
 {
   // Magic header
   char hdr[8];
-  FREAD(hdr, 8, fp, "header", return -1;);
+  if (!fread_ckd(hdr, 8, 1, fp)) return -1;
   if (memcmp(hdr, "GEMA", 4) != 0)
   {
-    fprintf(stderr, "error: not a valid gemma model file: %s\n", filename);
+    log_error("not a valid gemma model file: %s", filename);
     return -1;
   }
   // dtype
   if (memcmp(hdr + 4, DTYPE_MAGIC, 3) != 0)
   {
     fprintf(
-      stderr, "error: unsupported dtype '%c%c%c' in model file\n", hdr[4],
-      hdr[5], hdr[6]
+      stderr, "unsupported dtype '%c%c%c' in model file", hdr[4], hdr[5], hdr[6]
     );
     return -1;
   }
@@ -4247,7 +4187,7 @@ check_head(FILE *fp, const char *filename)
   }
   else if (hdr[7] != 'U')
   {
-    fprintf(stderr, "error: not a valid gemma model file: %s\n", filename);
+    log_error("not a valid gemma model file: %s", filename);
     return -1;
   }
 
@@ -4258,15 +4198,20 @@ check_head(FILE *fp, const char *filename)
 GemmaModel *
 mmap_gemma_model(const char *filename, bool enable_mm)
 {
-  FILE       *fp    = fopen(filename, "rb");
-  GemmaModel *model = NULL;
+  FILE         *fp         = fopen(filename, "rb");
+  GemmaModel   *model      = NULL;
+  TextConfig   *cfg        = NULL;
+  VisionConfig *vcfg       = NULL;
+  bool          cfg_owned  = false;
+  bool          vcfg_owned = false;
+  int           fd         = -1;
 
   if (fp == NULL)
   {
-    fprintf(stderr, "error: failed to open file: %s\n", filename);
+    log_error("failed to open file: %s", filename);
     goto fail;
   }
-  CALLOC(model, 1, "model", goto fail;);
+  if (!(model = calloc_ckd(1, sizeof(*model)))) goto fail;
 
   // Header
   int quant = check_head(fp, filename);
@@ -4274,13 +4219,13 @@ mmap_gemma_model(const char *filename, bool enable_mm)
   model->quant = (bool)quant;
 
   // Text config
-  TextConfig *cfg = read_text_config(fp, &model->support_mm);
+  cfg = read_text_config(fp, &model->support_mm);
   if (cfg == NULL) goto fail;
 
   bool use_mm = model->support_mm && enable_mm;
 
   // Vision config
-  VisionConfig *vcfg = NULL;
+  vcfg = NULL;
   if (use_mm)
   {
     vcfg = read_vision_config(fp);
@@ -4289,7 +4234,9 @@ mmap_gemma_model(const char *filename, bool enable_mm)
   else if (model->support_mm)
   {
     // Skip vision config if user didn't ask for multimodal
-    if (read_vision_config(fp) == NULL) goto fail;
+    VisionConfig *tmp = read_vision_config(fp);
+    if (tmp == NULL) goto fail;
+    free(tmp);
   }
 
   // Tokenizer
@@ -4297,13 +4244,18 @@ mmap_gemma_model(const char *filename, bool enable_mm)
   if (tok == NULL) goto fail;
   model->tokenizer = tok;
 
-  size_t offset = ftell(fp);
-  fclose(fp);
+  long offset_l = ftell(fp);
+  if (offset_l < 0)
+  {
+    log_error("ftell failed");
+    goto fail;
+  }
+  size_t offset = (size_t)offset_l;
 
-  int fd = open(filename, O_RDONLY);  // read-only
+  fd = open(filename, O_RDONLY);  // read-only
   if (fd == -1)
   {
-    fprintf(stderr, "error: failed to open file: %s\n", filename);
+    log_error("failed to open file: %s", filename);
     goto fail;
   }
 
@@ -4317,7 +4269,9 @@ mmap_gemma_model(const char *filename, bool enable_mm)
   void *data = mmap(NULL, mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
   if (data == MAP_FAILED)
   {
-    fprintf(stderr, "error: memory mapping failed: %s\n", filename);
+    close(fd);
+    fd = -1;
+    log_error("memory mapping failed: %s", filename);
     goto fail;
   }
   model->mmap_data = data;
@@ -4328,21 +4282,36 @@ mmap_gemma_model(const char *filename, bool enable_mm)
   TextDecoder *dec = mmap_text_decoder(data, cfg, &offset, model->quant);
   if (dec == NULL) goto fail;
   model->decoder = dec;
+  cfg_owned      = true;
+  cfg            = NULL;
 
   // Vision encoder
   if (use_mm)
   {
     VisionEncoder *enc =
-      mmap_vision_encoder(data, cfg, vcfg, &offset, model->quant);
+      mmap_vision_encoder(data, dec->config, vcfg, &offset, model->quant);
     if (enc == NULL) goto fail;
     model->encoder = enc;
+    vcfg_owned     = true;
+    vcfg           = NULL;
   }
 
   return model;
 
 fail:
-  if (fp != NULL) fclose(fp);
-  free(model);
+  if (fp != NULL)
+  {
+    fclose(fp);
+  }
+  if (!cfg_owned)
+  {
+    free_text_config(cfg);
+  }
+  if (!vcfg_owned)
+  {
+    free(vcfg);
+  }
+  munmap_gemma_model(model);
   return NULL;
 }
 
@@ -4350,15 +4319,19 @@ fail:
 GemmaModel *
 read_gemma_model(const char *filename, bool enable_mm)
 {
-  FILE       *fp    = fopen(filename, "rb");
-  GemmaModel *model = NULL;
+  FILE         *fp         = fopen(filename, "rb");
+  GemmaModel   *model      = NULL;
+  TextConfig   *cfg        = NULL;
+  VisionConfig *vcfg       = NULL;
+  bool          cfg_owned  = false;
+  bool          vcfg_owned = false;
 
   if (fp == NULL)
   {
-    fprintf(stderr, "error: failed to open file: %s\n", filename);
+    log_error("failed to open file: %s", filename);
     goto fail;
   }
-  CALLOC(model, 1, "model", goto fail;);
+  if (!(model = calloc_ckd(1, sizeof(*model)))) goto fail;
 
   // Header
   int quant = check_head(fp, filename);
@@ -4366,13 +4339,13 @@ read_gemma_model(const char *filename, bool enable_mm)
   model->quant = (bool)quant;
 
   // Text config
-  TextConfig *cfg = read_text_config(fp, &model->support_mm);
+  cfg = read_text_config(fp, &model->support_mm);
   if (cfg == NULL) goto fail;
 
   bool use_mm = model->support_mm && enable_mm;
 
   // Vision config
-  VisionConfig *vcfg = NULL;
+  vcfg = NULL;
   if (use_mm)
   {
     vcfg = read_vision_config(fp);
@@ -4381,7 +4354,9 @@ read_gemma_model(const char *filename, bool enable_mm)
   else if (model->support_mm)
   {
     // Skip vision config if user didn't ask for multimodal
-    if (read_vision_config(fp) == NULL) goto fail;
+    VisionConfig *tmp = read_vision_config(fp);
+    if (tmp == NULL) goto fail;
+    free(tmp);
   }
 
   // Tokenizer
@@ -4393,21 +4368,37 @@ read_gemma_model(const char *filename, bool enable_mm)
   TextDecoder *dec = read_text_decoder(fp, cfg, model->quant);
   if (dec == NULL) goto fail;
   model->decoder = dec;
+  cfg_owned      = true;  // cfg is now owned by dec
+  cfg            = NULL;
 
   // Vision encoder
   if (use_mm)
   {
-    VisionEncoder *enc = read_vision_encoder(fp, cfg, vcfg, model->quant);
+    VisionEncoder *enc =
+      read_vision_encoder(fp, dec->config, vcfg, model->quant);
     if (enc == NULL) goto fail;
     model->encoder = enc;
+    vcfg_owned     = true;  // vcfg is now owned by enc
+    vcfg           = NULL;
   }
 
   fclose(fp);
   return model;
 
 fail:
-  if (fp != NULL) fclose(fp);
-  free(model);
+  if (fp != NULL)
+  {
+    fclose(fp);
+  }
+  if (!cfg_owned)
+  {
+    free_text_config(cfg);
+  }
+  if (!vcfg_owned)
+  {
+    free(vcfg);
+  }
+  free_gemma_model(model);
   return NULL;
 }
 
@@ -4466,7 +4457,7 @@ VisionBuffer *
 malloc_vision_buffer(VisionConfig *vcfg, bool quant)
 {
   VisionBuffer *buf = NULL;
-  CALLOC(buf, 1, "vbuf", goto fail;);
+  if (!(buf = calloc_ckd(1, sizeof(*buf)))) goto fail;
 
   size_t C   = (size_t)vcfg->hidden_dim;
   size_t ppi = (size_t)vcfg->image_size / vcfg->patch_size;
@@ -4477,20 +4468,22 @@ malloc_vision_buffer(VisionConfig *vcfg, bool quant)
   if (quant)
   {
     // Quantization buffers
-    MALLOC(buf->x_i8, N * C, "vbuf.x_i8", goto fail;);
-    MALLOC(buf->mlp_i8, N * CM, "vbuf.mlp_i8", goto fail;);
-    MALLOC(buf->x_scales, N, "vbuf.x_scales", goto fail;);
-    MALLOC(buf->mlp_scales, N, "vbuf.mlp_scales", goto fail;);
+    if (!(buf->x_i8 = malloc_ckd(N * C, sizeof(*buf->x_i8))) ||
+        !(buf->mlp_i8 = malloc_ckd(N * CM, sizeof(*buf->mlp_i8))) ||
+        !(buf->x_scales = malloc_ckd(N, sizeof(*buf->x_scales))) ||
+        !(buf->mlp_scales = malloc_ckd(N, sizeof(*buf->mlp_scales))))
+      goto fail;
   }
 
-  MALLOC(buf->x, N * C, "vbuf.x", goto fail;);
-  MALLOC(buf->resid, N * C, "vbuf.resid", goto fail;);
-  MALLOC(buf->xq, N * C, "vbuf.q", goto fail;);
-  MALLOC(buf->xk, N * C, "vbuf.k", goto fail;);
-  MALLOC(buf->xv, N * C, "vbuf.v", goto fail;);
-  MALLOC(buf->att_out, N * C, "vbuf.att_out", goto fail;);
-  MALLOC(buf->mlp_hidden, N * CM, "vbuf.mlp_hidden", goto fail;);
-  MALLOC(buf->scores, NH * N * N, "vbuf.scores", goto fail;);
+  if (!(buf->x = malloc_ckd(N * C, sizeof(*buf->x))) ||
+      !(buf->resid = malloc_ckd(N * C, sizeof(*buf->resid))) ||
+      !(buf->xq = malloc_ckd(N * C, sizeof(*buf->xq))) ||
+      !(buf->xk = malloc_ckd(N * C, sizeof(*buf->xk))) ||
+      !(buf->xv = malloc_ckd(N * C, sizeof(*buf->xv))) ||
+      !(buf->att_out = malloc_ckd(N * C, sizeof(*buf->att_out))) ||
+      !(buf->mlp_hidden = malloc_ckd(N * CM, sizeof(*buf->mlp_hidden))) ||
+      !(buf->scores = malloc_ckd(NH * N * N, sizeof(*buf->scores))))
+    goto fail;
 
   return buf;
 
@@ -4585,7 +4578,7 @@ malloc_text_buffer(
 )
 {
   TextBuffer *buf = NULL;
-  CALLOC(buf, 1, "buf", goto fail;);  // Init to all NULL
+  if (!(buf = calloc_ckd(1, sizeof(*buf)))) goto fail;  // Init to all NULL
 
   buf->cache_len = cache_len;
 
@@ -4598,9 +4591,14 @@ malloc_text_buffer(
   int Cq  = NH * CH;
   int Ckv = cfg->n_kv_heads * CH;
 
-  MALLOC(buf->kv_cache, (size_t)L * 2 * (size_t)cache_len * (size_t)Ckv,
-    "buf.kv_cache", goto fail;);
-  MALLOC(buf->logits, cfg->vocab_size, "buf.logits", goto fail;);
+  if (!(buf->kv_cache = malloc_ckd(
+          (size_t)L * 2 * (size_t)cache_len * (size_t)Ckv,
+          sizeof(*buf->kv_cache)
+        )))
+    goto fail;
+
+  if (!(buf->logits = malloc_ckd(cfg->vocab_size, sizeof(*buf->logits))))
+    goto fail;
 
   int mult = chunk_size;
 
@@ -4613,25 +4611,29 @@ malloc_text_buffer(
   if (quant)
   {
     // Quantization buffers
-    MALLOC(buf->x_i8, mult * C, "buf.x_i8", goto fail;);
-    MALLOC(buf->xo_i8, mult * Cq, "buf.xo_i8", goto fail;);
-    MALLOC(buf->xg_i8, mult * CM, "buf.xg_i8", goto fail;);
-    MALLOC(buf->x_scales, mult, "buf.x_scales", goto fail;);
-    MALLOC(buf->xo_scales, mult, "buf.xo_scales", goto fail;);
-    MALLOC(buf->xg_scales, mult, "buf.xg_scales", goto fail;);
+    if (!(buf->x_i8 = malloc_ckd(mult * C, sizeof(*buf->x_i8))) ||
+        !(buf->xo_i8 = malloc_ckd(mult * Cq, sizeof(*buf->xo_i8))) ||
+        !(buf->xg_i8 = malloc_ckd(mult * CM, sizeof(*buf->xg_i8))) ||
+        !(buf->x_scales = malloc_ckd(mult, sizeof(*buf->x_scales))) ||
+        !(buf->xo_scales = malloc_ckd(mult, sizeof(*buf->xo_scales))) ||
+        !(buf->xg_scales = malloc_ckd(mult, sizeof(*buf->xg_scales))))
+      goto fail;
   }
 
-  MALLOC(buf->x, mult * C, "buf.x", goto fail;);
-  MALLOC(buf->resid, mult * C, "buf.resid", goto fail;);
-  MALLOC(buf->xq, mult * Cq, "buf.xq", goto fail;);
-  MALLOC(buf->xk, mult * Ckv, "buf.xk", goto fail;);
-  MALLOC(buf->csfreqs_slid, mult * CH, "buf.csfreqs_slid", goto fail;);
-  MALLOC(buf->csfreqs_full, mult * CH, "buf.csfreqs_full", goto fail;);
-  MALLOC(buf->xv, mult * Ckv, "buf.xv", goto fail;);
-  MALLOC(buf->xo, mult * Cq, "buf.xo", goto fail;);
-  MALLOC(buf->att, mult * NH * cache_len, "buf.att", goto fail;);
-  MALLOC(buf->xg, mult * CM, "buf.xg", goto fail;);
-  MALLOC(buf->xu, mult * CM, "buf.xu", goto fail;);
+  if (!(buf->x = malloc_ckd(mult * C, sizeof(*buf->x))) ||
+      !(buf->resid = malloc_ckd(mult * C, sizeof(*buf->resid))) ||
+      !(buf->xq = malloc_ckd(mult * Cq, sizeof(*buf->xq))) ||
+      !(buf->xk = malloc_ckd(mult * Ckv, sizeof(*buf->xk))) ||
+      !(buf->csfreqs_slid =
+          malloc_ckd(mult * CH, sizeof(*buf->csfreqs_slid))) ||
+      !(buf->csfreqs_full =
+          malloc_ckd(mult * CH, sizeof(*buf->csfreqs_full))) ||
+      !(buf->xv = malloc_ckd(mult * Ckv, sizeof(*buf->xv))) ||
+      !(buf->xo = malloc_ckd(mult * Cq, sizeof(*buf->xo))) ||
+      !(buf->att = malloc_ckd(mult * NH * cache_len, sizeof(*buf->att))) ||
+      !(buf->xg = malloc_ckd(mult * CM, sizeof(*buf->xg))) ||
+      !(buf->xu = malloc_ckd(mult * CM, sizeof(*buf->xu))))
+    goto fail;
 
   return buf;
 
@@ -4642,34 +4644,23 @@ fail:
 
 // Math primitives
 
-// Make sure the clamping is not optimized by compilers
-#if defined(__GNUC__) && !defined(__clang__)  // GCC
-#  define CLAMP_NO_FAST_MATH __attribute__((optimize("no-fast-math")))
-#elif defined(__clang__)  // clang
-#  define CLAMP_NO_FAST_MATH
-#elif defined(_MSC_VER)  // MSVC
-#  define CLAMP_NO_FAST_MATH
-#else
-#  define CLAMP_NO_FAST_MATH
-#endif
-
-#if defined(__clang__)
-#  pragma float_control(precise, on, push)
-#elif defined(_MSC_VER)
-#  pragma float_control(push)
-#  pragma float_control(precise, on)
-#endif
-
 /* */
-static inline floatx CLAMP_NO_FAST_MATH
+NO_FAST_MATH_BEGIN
+static inline floatx
 clamp_fpx(floatx v)
 {
   return (floatx)fminf(FLOATX_MAX, fmaxf((float)-FLOATX_MAX, (float)v));
 }
+NO_FAST_MATH_END
 
-#if defined(__clang__) || defined(_MSC_VER)
-#  pragma float_control(pop)
-#endif
+/* */
+NO_FAST_MATH_BEGIN
+static inline float
+compute_rms(float sqsum, int dim, float eps)
+{
+  return 1.0f / sqrtf(sqsum / (float)dim + eps);
+}
+NO_FAST_MATH_END
 
 /* Gemma-style RMSNorm: (x * rsqrt(mean(x^2) + eps)) * (weight + 1) */
 static void
@@ -4679,13 +4670,13 @@ rmsnorm(
 {
   float sqsum = 0.0f;
   int   i;
-  #pragma omp simd reduction(+ : sqsum)
+
   for (i = 0; i < dim; i++)
   {
     sqsum += (float)src[i] * (float)src[i];
   }
-  float rms = 1.0f / sqrtf(sqsum / (float)dim + eps);
-  #pragma omp simd
+  float rms = compute_rms(sqsum, (float)dim, eps);
+
   for (i = 0; i < dim; i++)
   {
     dst[i] = (floatx)((float)src[i] * rms * (float)(weight[i] + 1));
@@ -4705,7 +4696,7 @@ layernorm(
 {
   float mean = 0.0f;
   int   i;
-  #pragma omp simd reduction(+ : mean)
+
   for (i = 0; i < dim; i++)
   {
     mean += (float)src[i];
@@ -4713,7 +4704,7 @@ layernorm(
   mean /= (float)dim;
 
   float var = 0.0f;
-  #pragma omp simd reduction(+ : var)
+
   for (i = 0; i < dim; i++)
   {
     float diff = (float)src[i] - mean;
@@ -4722,7 +4713,7 @@ layernorm(
   var /= (float)dim;
 
   float inv_std = 1.0f / sqrtf(var + eps);
-  #pragma omp simd
+
   for (i = 0; i < dim; i++)
   {
     dst[i] = (floatx)(((float)src[i] - mean) * inv_std * (float)weight[i] +
@@ -4738,7 +4729,7 @@ quantize_act(int8_t *dst, const floatx *vec, int dim)
   floatx amax = 0.0f;
 
   int d;
-  #pragma omp simd reduction(max : amax)
+
   for (d = 0; d < dim; d++)
   {
     floatx av = vec[d] >= 0 ? vec[d] : -vec[d];
@@ -4788,7 +4779,7 @@ quantize_acts(
   if (omp)
   {
     int i;
-    #pragma omp parallel OMP_PARALLEL_ARGS
+    #pragma omp parallel for OMP_PARALLEL_ARGS
     for (i = 0; i < m; i++)
     {
       dst_scales[i] = quantize_act(dst + i * n, src + i * src_stride, n);
@@ -4809,7 +4800,7 @@ gemv_fpx_row(
 {
   float sum = 0;
   int   j;
-  #pragma omp simd reduction(+ : sum)
+
   for (j = 0; j < n; j++)
   {
     sum += (float)mat[i * n + j] * (float)vec[j];
@@ -4831,8 +4822,9 @@ gemv_fpx(
 {
   if (omp)
   {
-    int i;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    int i;  // Loop vars are not automatically privatized in MSVC, have to keep
+            // it explicit
+    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
     for (i = 0; i < m; i++)
     {
       dst[i] = gemv_fpx_row(vec, mat, n, i);
@@ -4858,7 +4850,7 @@ gemv_int8_row(
 {
   int32_t sum = 0;
   int     j;
-  #pragma omp simd reduction(+ : sum)
+
   for (j = 0; j < n; j++)
   {
     sum += (int32_t)mat[i * n + j] * (int32_t)vec[j];
@@ -4884,7 +4876,7 @@ gemv_int8(
   if (omp)
   {
     int i;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
     for (i = 0; i < m; i++)
     {
       dst[i] = gemv_int8_row(vec, vec_scale, mat, mat_scales, n, i);
@@ -4912,7 +4904,7 @@ gemv_fpx_nn(
 {
   if (mat_stride == 0) mat_stride = m;
 
-#if defined(_MSC_VER)
+#if defined(__MSVC__)
   float *acc = (float *)_alloca((size_t)m * sizeof(float));
 #else
   float acc[m];
@@ -4958,10 +4950,7 @@ pack_panel(
   for (int r = 0; r < rows; r++)
   {
     const floatx *row = src + r * row_stride;
-
-    int l;
-    #pragma omp simd
-    for (l = 0; l < k; l++)
+    for (int l = 0; l < k; l++)
     {
       packed[l * rows + r] = (float)row[l];
     }
@@ -4985,7 +4974,7 @@ pack_all(
   if (omp)
   {
     int b;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(b) OMP_PARALLEL_ARGS
     for (b = 0; b < total_rows; b += R)
     {
       pack_panel(
@@ -5040,75 +5029,72 @@ gemm_fpx_kernel(
     float b6 = Bp[l * 8 + 6];
     float b7 = Bp[l * 8 + 7];
 
-    acc[0] += a0 * b0;
-    acc[1] += a0 * b1;
-    acc[2] += a0 * b2;
-    acc[3] += a0 * b3;
-    acc[4] += a0 * b4;
-    acc[5] += a0 * b5;
-    acc[6] += a0 * b6;
-    acc[7] += a0 * b7;
-    acc[8] += a1 * b0;
-    acc[9] += a1 * b1;
-    acc[10] += a1 * b2;
-    acc[11] += a1 * b3;
-    acc[12] += a1 * b4;
-    acc[13] += a1 * b5;
-    acc[14] += a1 * b6;
-    acc[15] += a1 * b7;
-    acc[16] += a2 * b0;
-    acc[17] += a2 * b1;
-    acc[18] += a2 * b2;
-    acc[19] += a2 * b3;
-    acc[20] += a2 * b4;
-    acc[21] += a2 * b5;
-    acc[22] += a2 * b6;
-    acc[23] += a2 * b7;
-    acc[24] += a3 * b0;
-    acc[25] += a3 * b1;
-    acc[26] += a3 * b2;
-    acc[27] += a3 * b3;
-    acc[28] += a3 * b4;
-    acc[29] += a3 * b5;
-    acc[30] += a3 * b6;
-    acc[31] += a3 * b7;
-    acc[32] += a4 * b0;
-    acc[33] += a4 * b1;
-    acc[34] += a4 * b2;
-    acc[35] += a4 * b3;
-    acc[36] += a4 * b4;
-    acc[37] += a4 * b5;
-    acc[38] += a4 * b6;
-    acc[39] += a4 * b7;
-    acc[40] += a5 * b0;
-    acc[41] += a5 * b1;
-    acc[42] += a5 * b2;
-    acc[43] += a5 * b3;
-    acc[44] += a5 * b4;
-    acc[45] += a5 * b5;
-    acc[46] += a5 * b6;
-    acc[47] += a5 * b7;
-    acc[48] += a6 * b0;
-    acc[49] += a6 * b1;
-    acc[50] += a6 * b2;
-    acc[51] += a6 * b3;
-    acc[52] += a6 * b4;
-    acc[53] += a6 * b5;
-    acc[54] += a6 * b6;
-    acc[55] += a6 * b7;
-    acc[56] += a7 * b0;
-    acc[57] += a7 * b1;
-    acc[58] += a7 * b2;
-    acc[59] += a7 * b3;
-    acc[60] += a7 * b4;
-    acc[61] += a7 * b5;
-    acc[62] += a7 * b6;
-    acc[63] += a7 * b7;
+    // clang-format off
+    acc[ 0] += a0 * b0; acc[ 1] += a0 * b1;
+    acc[ 2] += a0 * b2; acc[ 3] += a0 * b3;
+    acc[ 4] += a0 * b4; acc[ 5] += a0 * b5;
+    acc[ 6] += a0 * b6; acc[ 7] += a0 * b7;
+    acc[ 8] += a1 * b0; acc[ 9] += a1 * b1;
+    acc[10] += a1 * b2; acc[11] += a1 * b3;
+    acc[12] += a1 * b4; acc[13] += a1 * b5;
+    acc[14] += a1 * b6; acc[15] += a1 * b7;
+    acc[16] += a2 * b0; acc[17] += a2 * b1;
+    acc[18] += a2 * b2; acc[19] += a2 * b3;
+    acc[20] += a2 * b4; acc[21] += a2 * b5;
+    acc[22] += a2 * b6; acc[23] += a2 * b7;
+    acc[24] += a3 * b0; acc[25] += a3 * b1;
+    acc[26] += a3 * b2; acc[27] += a3 * b3;
+    acc[28] += a3 * b4; acc[29] += a3 * b5;
+    acc[30] += a3 * b6; acc[31] += a3 * b7;
+    acc[32] += a4 * b0; acc[33] += a4 * b1;
+    acc[34] += a4 * b2; acc[35] += a4 * b3;
+    acc[36] += a4 * b4; acc[37] += a4 * b5;
+    acc[38] += a4 * b6; acc[39] += a4 * b7;
+    acc[40] += a5 * b0; acc[41] += a5 * b1;
+    acc[42] += a5 * b2; acc[43] += a5 * b3;
+    acc[44] += a5 * b4; acc[45] += a5 * b5;
+    acc[46] += a5 * b6; acc[47] += a5 * b7;
+    acc[48] += a6 * b0; acc[49] += a6 * b1;
+    acc[50] += a6 * b2; acc[51] += a6 * b3;
+    acc[52] += a6 * b4; acc[53] += a6 * b5;
+    acc[54] += a6 * b6; acc[55] += a6 * b7;
+    acc[56] += a7 * b0; acc[57] += a7 * b1;
+    acc[58] += a7 * b2; acc[59] += a7 * b3;
+    acc[60] += a7 * b4; acc[61] += a7 * b5;
+    acc[62] += a7 * b6; acc[63] += a7 * b7;
+    // clang-format on
   }
 
   for (int i = 0; i < 8; i++)
     for (int j = 0; j < 8; j++)
       dst[i * dst_stride + j] = (floatx)acc[i * 8 + j];
+}
+
+/* */
+static inline void
+gemm_fpx_scalar_row(
+  floatx *RESTRICT       dst,
+  int                    dst_stride,
+  const floatx *RESTRICT mat,
+  int                    mat_stride,
+  const floatx *RESTRICT src,
+  int                    src_stride,
+  int                    i,
+  int                    j,
+  int                    k
+)
+{
+  float         sum     = 0.0f;
+  const floatx *src_row = src + i * src_stride;
+  const floatx *w_row   = mat + j * mat_stride;
+
+  int l;
+
+  for (l = 0; l < k; l++)
+  {
+    sum += (float)src_row[l] * (float)w_row[l];
+  }
+  dst[i * dst_stride + j] = (floatx)sum;
 }
 
 /* Scalar fallback for the remainder tiles. */
@@ -5122,29 +5108,37 @@ gemm_fpx_scalar(
   int                    src_stride,
   int                    m,
   int                    n,
-  int                    k
+  int                    k,
+  bool                   omp
 )
 {
-  for (int i = 0; i < m; i++)
-    for (int j = 0; j < n; j++)
-    {
-      float         sum     = 0.0f;
-      const floatx *src_row = src + i * src_stride;
-      const floatx *w_row   = mat + j * mat_stride;
-
-      int l;
-      #pragma omp simd reduction(+ : sum)
-      for (l = 0; l < k; l++)
+  if (omp)
+  {
+    int i, j;
+    #pragma omp parallel for private(i, j) OMP_COLLAPSE2 OMP_PARALLEL_ARGS
+    for (i = 0; i < m; i++)
+      for (j = 0; j < n; j++)
       {
-        sum += (float)src_row[l] * (float)w_row[l];
+        gemm_fpx_scalar_row(
+          dst, dst_stride, mat, mat_stride, src, src_stride, i, j, k
+        );
       }
-      dst[i * dst_stride + j] = (floatx)sum;
-    }
+  }
+  else
+  {
+    for (int i = 0; i < m; i++)
+      for (int j = 0; j < n; j++)
+      {
+        gemm_fpx_scalar_row(
+          dst, dst_stride, mat, mat_stride, src, src_stride, i, j, k
+        );
+      }
+  }
 }
 
 // _Thread_local is critical here since these will be used in openmp threads
-static _Thread_local float *gemm_fpx_pack_scratch     = NULL;
-static _Thread_local size_t gemm_fpx_pack_scratch_cap = 0;  // in floats
+_Thread_local static float *gemm_fpx_pack_scratch     = NULL;
+_Thread_local static size_t gemm_fpx_pack_scratch_cap = 0;  // in floats
 
 /* */
 static float *
@@ -5189,7 +5183,7 @@ gemm_fpx(
     float *scratch = gemm_pack_scratch_get(needed);
     if (scratch == NULL)
     {
-      fprintf(stderr, "error: gemm packing scratch allocation failed\n");
+      log_error("gemm packing scratch allocation failed");
       return;
     }
     float *Ap_full = scratch;
@@ -5201,7 +5195,8 @@ gemm_fpx(
     if (omp)
     {
       int jb, ib;
-      #pragma omp parallel for collapse(2) OMP_PARALLEL_ARGS
+      #pragma omp parallel for private(ib, jb) OMP_COLLAPSE2
+      // OMP_PARALLEL_ARGS
       for (jb = 0; jb < n_full; jb += 8)
         for (ib = 0; ib < m_full; ib += 8)
         {
@@ -5230,14 +5225,14 @@ gemm_fpx(
   {
     gemm_fpx_scalar(
       dst + m_full * dst_stride, dst_stride, mat, mat_stride,
-      src + m_full * src_stride, src_stride, m - m_full, n, k
+      src + m_full * src_stride, src_stride, m - m_full, n, k, omp
     );
   }
   if (n_full < n && m_full > 0)
   {
     gemm_fpx_scalar(
       dst + n_full, dst_stride, mat + n_full * mat_stride, mat_stride, src,
-      src_stride, m_full, n - n_full, k
+      src_stride, m_full, n - n_full, k, omp
     );
   }
 }
@@ -5259,7 +5254,7 @@ gemm_fpx_nn_kernel(
   int                    k
 )
 {
-#if defined(_MSC_VER)
+#if defined(__MSVC__)
 #  define ACC(ii, j) acc[(ii) * n + (j)]
   float *acc = (float *)_alloca(8 * (size_t)n * sizeof(float));
   float *row = (float *)_alloca((size_t)n * sizeof(float));
@@ -5280,9 +5275,7 @@ gemm_fpx_nn_kernel(
   for (int l = 0; l < k; l++)
   {
     const floatx *mat_row = mat + l * mat_stride;
-    int           j;
-    #pragma omp simd
-    for (j = 0; j < n; j++)
+    for (int j = 0; j < n; j++)
     {
       row[j] = (float)mat_row[j];
     }
@@ -5290,9 +5283,7 @@ gemm_fpx_nn_kernel(
     for (int ii = 0; ii < mr; ii++)
     {
       float a = (float)src[ii * src_stride + l];
-      int   j;
-      #pragma omp simd
-      for (j = 0; j < n; j++)
+      for (int j = 0; j < n; j++)
       {
         ACC(ii, j) += a * row[j];
       }
@@ -5334,7 +5325,7 @@ gemm_fpx_nn(
   if (omp)
   {
     int ib;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(ib) OMP_PARALLEL_ARGS
     for (ib = 0; ib < m_full; ib += 8)
     {
       gemm_fpx_nn_kernel(
@@ -5381,6 +5372,19 @@ gemm_i8_pack_scratch_get(size_t needed_bytes)
   return gemm_i8_pack_scratch;
 }
 
+/* */
+static void
+gemm_free_thread_scratch(void)
+{
+  free(gemm_fpx_pack_scratch);
+  gemm_fpx_pack_scratch     = NULL;
+  gemm_fpx_pack_scratch_cap = 0;
+
+  free(gemm_i8_pack_scratch);
+  gemm_i8_pack_scratch     = NULL;
+  gemm_i8_pack_scratch_cap = 0;
+}
+
 /* Same idea as pack_panel/pack_all for fpx, but source/dest are int8_t, no
  * upcast needed, this is a pure gather-to-contiguous transpose. */
 static inline void
@@ -5395,10 +5399,7 @@ pack_panel_i8(
   for (int r = 0; r < rows; r++)
   {
     const int8_t *row = src + r * row_stride;
-
-    int l;
-    #pragma omp simd
-    for (l = 0; l < k; l++)
+    for (int l = 0; l < k; l++)
     {
       packed[l * rows + r] = row[l];
     }
@@ -5420,7 +5421,7 @@ pack_all_i8(
   if (omp)
   {
     int b;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(b) OMP_PARALLEL_ARGS
     for (b = 0; b < total_rows; b += R)
     {
       pack_panel_i8(
@@ -5472,70 +5473,40 @@ gemm_int8_kernel(
     int32_t b6 = Bp[l * 8 + 6];
     int32_t b7 = Bp[l * 8 + 7];
 
-    acc[0] += a0 * b0;
-    acc[1] += a0 * b1;
-    acc[2] += a0 * b2;
-    acc[3] += a0 * b3;
-    acc[4] += a0 * b4;
-    acc[5] += a0 * b5;
-    acc[6] += a0 * b6;
-    acc[7] += a0 * b7;
-    acc[8] += a1 * b0;
-    acc[9] += a1 * b1;
-    acc[10] += a1 * b2;
-    acc[11] += a1 * b3;
-    acc[12] += a1 * b4;
-    acc[13] += a1 * b5;
-    acc[14] += a1 * b6;
-    acc[15] += a1 * b7;
-    acc[16] += a2 * b0;
-    acc[17] += a2 * b1;
-    acc[18] += a2 * b2;
-    acc[19] += a2 * b3;
-    acc[20] += a2 * b4;
-    acc[21] += a2 * b5;
-    acc[22] += a2 * b6;
-    acc[23] += a2 * b7;
-    acc[24] += a3 * b0;
-    acc[25] += a3 * b1;
-    acc[26] += a3 * b2;
-    acc[27] += a3 * b3;
-    acc[28] += a3 * b4;
-    acc[29] += a3 * b5;
-    acc[30] += a3 * b6;
-    acc[31] += a3 * b7;
-    acc[32] += a4 * b0;
-    acc[33] += a4 * b1;
-    acc[34] += a4 * b2;
-    acc[35] += a4 * b3;
-    acc[36] += a4 * b4;
-    acc[37] += a4 * b5;
-    acc[38] += a4 * b6;
-    acc[39] += a4 * b7;
-    acc[40] += a5 * b0;
-    acc[41] += a5 * b1;
-    acc[42] += a5 * b2;
-    acc[43] += a5 * b3;
-    acc[44] += a5 * b4;
-    acc[45] += a5 * b5;
-    acc[46] += a5 * b6;
-    acc[47] += a5 * b7;
-    acc[48] += a6 * b0;
-    acc[49] += a6 * b1;
-    acc[50] += a6 * b2;
-    acc[51] += a6 * b3;
-    acc[52] += a6 * b4;
-    acc[53] += a6 * b5;
-    acc[54] += a6 * b6;
-    acc[55] += a6 * b7;
-    acc[56] += a7 * b0;
-    acc[57] += a7 * b1;
-    acc[58] += a7 * b2;
-    acc[59] += a7 * b3;
-    acc[60] += a7 * b4;
-    acc[61] += a7 * b5;
-    acc[62] += a7 * b6;
-    acc[63] += a7 * b7;
+    // clang-format off
+    acc[ 0] += a0 * b0; acc[ 1] += a0 * b1;
+    acc[ 2] += a0 * b2; acc[ 3] += a0 * b3;
+    acc[ 4] += a0 * b4; acc[ 5] += a0 * b5;
+    acc[ 6] += a0 * b6; acc[ 7] += a0 * b7;
+    acc[ 8] += a1 * b0; acc[ 9] += a1 * b1;
+    acc[10] += a1 * b2; acc[11] += a1 * b3;
+    acc[12] += a1 * b4; acc[13] += a1 * b5;
+    acc[14] += a1 * b6; acc[15] += a1 * b7;
+    acc[16] += a2 * b0; acc[17] += a2 * b1;
+    acc[18] += a2 * b2; acc[19] += a2 * b3;
+    acc[20] += a2 * b4; acc[21] += a2 * b5;
+    acc[22] += a2 * b6; acc[23] += a2 * b7;
+    acc[24] += a3 * b0; acc[25] += a3 * b1;
+    acc[26] += a3 * b2; acc[27] += a3 * b3;
+    acc[28] += a3 * b4; acc[29] += a3 * b5;
+    acc[30] += a3 * b6; acc[31] += a3 * b7;
+    acc[32] += a4 * b0; acc[33] += a4 * b1;
+    acc[34] += a4 * b2; acc[35] += a4 * b3;
+    acc[36] += a4 * b4; acc[37] += a4 * b5;
+    acc[38] += a4 * b6; acc[39] += a4 * b7;
+    acc[40] += a5 * b0; acc[41] += a5 * b1;
+    acc[42] += a5 * b2; acc[43] += a5 * b3;
+    acc[44] += a5 * b4; acc[45] += a5 * b5;
+    acc[46] += a5 * b6; acc[47] += a5 * b7;
+    acc[48] += a6 * b0; acc[49] += a6 * b1;
+    acc[50] += a6 * b2; acc[51] += a6 * b3;
+    acc[52] += a6 * b4; acc[53] += a6 * b5;
+    acc[54] += a6 * b6; acc[55] += a6 * b7;
+    acc[56] += a7 * b0; acc[57] += a7 * b1;
+    acc[58] += a7 * b2; acc[59] += a7 * b3;
+    acc[60] += a7 * b4; acc[61] += a7 * b5;
+    acc[62] += a7 * b6; acc[63] += a7 * b7;
+    // clang-format on
   }
 
   for (int i = 0; i < 8; i++)
@@ -5547,6 +5518,38 @@ gemm_int8_kernel(
         (floatx)((float)acc[i * 8 + j] * fscale * (float)mat_scales[j]);
     }
   }
+}
+
+/* */
+static inline void
+gemm_int8_scalar_row(
+  floatx *RESTRICT       dst,
+  int                    dst_stride,
+  const int8_t *RESTRICT mat,
+  int                    mat_stride,
+  const floatx *RESTRICT mat_scales,
+  const int8_t *RESTRICT src,
+  int                    src_stride,
+  const floatx *RESTRICT src_scales,
+  int                    i,
+  int                    j,
+  int                    k
+)
+{
+  float fscale = (float)src_scales[i];
+
+  int32_t       sum     = 0;
+  const int8_t *src_row = src + i * src_stride;
+  const int8_t *mat_row = mat + j * mat_stride;
+
+  int l;
+
+  for (l = 0; l < k; l++)
+  {
+    sum += (int32_t)src_row[l] * (int32_t)mat_row[l];
+  }
+  float val               = (float)sum * fscale * (float)mat_scales[j];
+  dst[i * dst_stride + j] = (floatx)val;
 }
 
 /* Scalar fallback for the remainder tiles. */
@@ -5562,27 +5565,33 @@ gemm_int8_scalar(
   const floatx *RESTRICT src_scales,
   int                    m,
   int                    n,
-  int                    k
+  int                    k,
+  bool                   omp
 )
 {
-  for (int i = 0; i < m; i++)
+  if (omp)
   {
-    float fscale = (float)src_scales[i];
-    for (int j = 0; j < n; j++)
-    {
-      int32_t       sum     = 0;
-      const int8_t *src_row = src + i * src_stride;
-      const int8_t *mat_row = mat + j * mat_stride;
-
-      int l;
-      #pragma omp simd reduction(+ : sum)
-      for (l = 0; l < k; l++)
+    int i, j;
+    #pragma omp parallel for private(i, j) OMP_COLLAPSE2 OMP_PARALLEL_ARGS
+    for (i = 0; i < m; i++)
+      for (j = 0; j < n; j++)
       {
-        sum += (int32_t)src_row[l] * (int32_t)mat_row[l];
+        gemm_int8_scalar_row(
+          dst, dst_stride, mat, mat_stride, mat_scales, src, src_stride,
+          src_scales, i, j, k
+        );
       }
-      float val               = (float)sum * fscale * (float)mat_scales[j];
-      dst[i * dst_stride + j] = (floatx)val;
-    }
+  }
+  else
+  {
+    for (int i = 0; i < m; i++)
+      for (int j = 0; j < n; j++)
+      {
+        gemm_int8_scalar_row(
+          dst, dst_stride, mat, mat_stride, mat_scales, src, src_stride,
+          src_scales, i, j, k
+        );
+      }
   }
 }
 
@@ -5618,7 +5627,7 @@ gemm_int8(
     int8_t *scratch = gemm_i8_pack_scratch_get((size_t)(m_full + n_full) * k);
     if (scratch == NULL)
     {
-      fprintf(stderr, "error: gemm_int8 packing scratch allocation failed\n");
+      log_error("gemm_int8 packing scratch allocation failed");
       return;
     }
     int8_t *Ap_full = scratch;
@@ -5630,7 +5639,8 @@ gemm_int8(
     if (omp)
     {
       int jb, ib;
-      #pragma omp parallel for collapse(2) OMP_PARALLEL_ARGS
+      #pragma omp parallel for private(ib, jb) OMP_COLLAPSE2
+      // OMP_PARALLEL_ARGS
       for (jb = 0; jb < n_full; jb += 8)
         for (ib = 0; ib < m_full; ib += 8)
         {
@@ -5660,14 +5670,15 @@ gemm_int8(
     gemm_int8_scalar(
       dst + m_full * dst_stride, dst_stride, mat, mat_stride, mat_scales,
       src + m_full * src_stride, src_stride, src_scales + m_full, m - m_full, n,
-      k
+      k, omp
     );
   }
   if (n_full < n)
   {
     gemm_int8_scalar(
       dst + n_full, dst_stride, mat + n_full * mat_stride, mat_stride,
-      mat_scales + n_full, src, src_stride, src_scales, m_full, n - n_full, k
+      mat_scales + n_full, src, src_stride, src_scales, m_full, n - n_full, k,
+      omp
     );
   }
 }
@@ -5710,7 +5721,7 @@ prepare_image(const char *path, int image_size)
   unsigned char *raw = load_image_utf8(path, &cols, &rows, &channels, 3);
   if (raw == NULL)
   {
-    fprintf(stderr, "error: %s\n", stbi_failure_reason());
+    log_error("%s", stbi_failure_reason());
     return NULL;
   }
 
@@ -5726,10 +5737,11 @@ prepare_image(const char *path, int image_size)
   }
 
   floatx *out;
-  MALLOC(out, image_size * image_size * 3, "image_buf", {
+  if (!(out = malloc_ckd(image_size * image_size * 3, sizeof(*out))))
+  {
     free(rsz);
     return NULL;
-  });
+  }
 
   for (int i = 0; i < image_size * image_size * 3; i++)
   {
@@ -5804,9 +5816,12 @@ prepare_image_pas(
   *n_crops = wn_crops * hn_crops;
 
   // Allocate resize buffer
-  MALLOC(rsz, (size_t)(*n_crops + 1) * epi, "pas_resize", goto fail;);
+  if (!(rsz = malloc_ckd((size_t)(*n_crops + 1) * epi, sizeof(*rsz))))
+    goto fail;
+
   // Allocate out container
-  CALLOC(out, (size_t)(*n_crops + 1) * epi, "pas_crops", goto fail;);
+  if (!(out = calloc_ckd((size_t)(*n_crops + 1) * epi, sizeof(*out))))
+    goto fail;
 
   // The first entry represents the full image (resized)
   unsigned char *rsz_r = stbir_resize(
@@ -5898,7 +5913,7 @@ forward_vision(
   // Can be further optimized by reusing GEMM, but this part is executed only
   // once per call, the cost is acceptable
   int oy, ox;
-  #pragma omp parallel for collapse(2) OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(oy, ox) OMP_COLLAPSE2 OMP_PARALLEL_ARGS
   for (oy = 0; oy < ppi; oy++)
     for (ox = 0; ox < ppi; ox++)
     {
@@ -5911,11 +5926,10 @@ forward_vision(
 
         // equivalent to Conv2d(
         //   in_channels=3, out_channels=C, kernal_size=P, stride=P, bias=True)
-        int py, px, c;
-        #pragma omp simd collapse(3)
-        for (py = 0; py < P; py++)
-          for (px = 0; px < P; px++)
-            for (c = 0; c < 3; c++)
+
+        for (int py = 0; py < P; py++)
+          for (int px = 0; px < P; px++)
+            for (int c = 0; c < 3; c++)
             {
               // img[c, oy*P + py, ox*P + px]
               int in_idx = ((oy * P + py) * img_sz + (ox * P + px)) * 3 + c;
@@ -5934,9 +5948,7 @@ forward_vision(
   // Position Embedding
   if (!quant)
   {
-    int d;
-    #pragma omp simd
-    for (d = 0; d < N * C; d++)
+    for (int d = 0; d < N * C; d++)
     {
       vbuf->x[d] = clamp_fpx(vbuf->x[d] + enc->pos_embedding->fpx[d]);
     }
@@ -5944,10 +5956,8 @@ forward_vision(
   else
   {
     // Dequantize per row
-    int i, j;
-    #pragma omp simd collapse(2)
-    for (i = 0; i < N; i++)
-      for (j = 0; j < C; j++)
+    for (int i = 0; i < N; i++)
+      for (int j = 0; j < C; j++)
       {
         float scale        = (float)enc->pos_embedding->i8.scales[i];
         float val          = (float)enc->pos_embedding->i8.q[i * C + j] * scale;
@@ -5965,7 +5975,7 @@ forward_vision(
     memcpy(vbuf->resid, vbuf->x, N * C * sizeof(floatx));
 
     int i;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
     for (i = 0; i < N; i++)
     {
       floatx *row = vbuf->x + i * C;
@@ -5999,10 +6009,8 @@ forward_vision(
     if (is_interrupted()) return 1;
 
     // Add biases
-    int j;
-    #pragma omp simd collapse(2)
-    for (i = 0; i < N; i++)
-      for (j = 0; j < C; j++)
+    for (int i = 0; i < N; i++)
+      for (int j = 0; j < C; j++)
       {
         int idx = i * C + j;
         vbuf->xq[idx] += layer->bq[j];
@@ -6016,7 +6024,7 @@ forward_vision(
     float scale = 1.0f / sqrtf((float)CH);
 
     int h;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(h) OMP_PARALLEL_ARGS
     for (h = 0; h < vcfg->n_heads; h++)
     {
       floatx *scores = vbuf->scores + h * N * N;  // (N, N) for this head
@@ -6031,9 +6039,7 @@ forward_vision(
       for (int i = 0; i < N; i++)
       {
         floatx *row = scores + i * N;
-        int     j;
-        #pragma omp simd
-        for (j = 0; j < N; j++)
+        for (int j = 0; j < N; j++)
         {
           row[j] *= scale;
         }
@@ -6064,9 +6070,8 @@ forward_vision(
     if (is_interrupted()) return 1;
 
     // Add output bias
-    #pragma omp simd collapse(2)
-    for (i = 0; i < N; i++)
-      for (j = 0; j < C; j++)
+    for (int i = 0; i < N; i++)
+      for (int j = 0; j < C; j++)
       {
         vbuf->x[i * C + j] += layer->bo[j];
       }
@@ -6081,7 +6086,7 @@ forward_vision(
 
     memcpy(vbuf->resid, vbuf->x, N * C * sizeof(floatx));
 
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
     for (i = 0; i < N; i++)
     {
       floatx *row = vbuf->x + i * C;
@@ -6106,9 +6111,8 @@ forward_vision(
     }
     if (is_interrupted()) return 1;
 
-    #pragma omp simd collapse(2)
-    for (i = 0; i < N; i++)
-      for (j = 0; j < CM; j++)
+    for (int i = 0; i < N; i++)
+      for (int j = 0; j < CM; j++)
       {
         // Apply fc1 biases
         float val = (float)vbuf->mlp_hidden[i * CM + j] + (float)layer->b1[j];
@@ -6140,9 +6144,8 @@ forward_vision(
     if (is_interrupted()) return 1;
 
     // x += b2
-    #pragma omp simd collapse(2)
-    for (i = 0; i < N; i++)
-      for (j = 0; j < C; j++)
+    for (int i = 0; i < N; i++)
+      for (int j = 0; j < C; j++)
       {
         vbuf->x[i * C + j] += layer->b2[j];
       }
@@ -6150,7 +6153,7 @@ forward_vision(
     if (is_interrupted()) return 1;
 
     // Residual connection
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
     for (i = 0; i < N * C; i++)
     {
       vbuf->x[i] = clamp_fpx(vbuf->x[i] + vbuf->resid[i]);
@@ -6160,7 +6163,7 @@ forward_vision(
 
   // Post-norm + average pooling down to image_toks tokens
   int i;
-  #pragma omp parallel for OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
   for (i = 0; i < N; i++)
   {
     floatx *row = vbuf->x + i * C;
@@ -6183,9 +6186,7 @@ forward_vision(
         float sum = 0.0f;
         for (int ky = 0; ky < K; ky++)
         {
-          int kx;
-          #pragma omp simd reduction(+ : sum)
-          for (kx = 0; kx < K; kx++)
+          for (int kx = 0; kx < K; kx++)
           {
             int py        = oy * K + ky;
             int px        = ox * K + kx;
@@ -6201,7 +6202,7 @@ forward_vision(
   // buf->x now becomes (tpi, C)
 
   // Final RMSNorm
-  #pragma omp parallel for OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
   for (i = 0; i < tpi; i++)
   {
     floatx *row = vbuf->x + i * C;
@@ -6249,7 +6250,7 @@ forward_text_decode(
 
   if (pos >= buf->cache_len)
   {
-    fprintf(stderr, "\nerror: KV Cache is full\n");
+    log_error("kv cache is full");
     return 1;
   }
 
@@ -6379,7 +6380,7 @@ forward_text_decode(
 
     // Iterate over all the attention heads
     int h;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(h) OMP_PARALLEL_ARGS
     for (h = 0; h < NH; h++)
     {
       int h_kv = h * NH_kv / NH;  // GQA mapping
@@ -6489,7 +6490,7 @@ forward_text_decode(
 
     // GELU gate
     int d;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
     for (d = 0; d < cfg->mlp_dim; d++)
     {
       // Tanh approximation of GELU
@@ -6558,7 +6559,7 @@ forward_text_decode(
     // Optional logit softcapping
     if (cfg->logit_softcap != 0.0f)
     {
-      for (int d = 0; d < cfg->vocab_size; d++)
+      for (uint32_t d = 0; d < cfg->vocab_size; d++)
       {
         float val      = (float)buf->logits[d] / cfg->logit_softcap;
         buf->logits[d] = (floatx)(tanhf(val) * cfg->logit_softcap);
@@ -6586,7 +6587,7 @@ forward_text_chunk(
   if (quant && (buf->x_scales == NULL || buf->xo_scales == NULL ||
                  buf->xg_scales == NULL))
   {
-    fprintf(stderr, "\nerror: scale buffers are not allocated\n");
+    log_error("scale buffers are not allocated");
     return 1;
   }
 
@@ -6602,13 +6603,13 @@ forward_text_chunk(
 
   if (epos >= buf->cache_len)
   {
-    fprintf(stderr, "\nerror: KV Cache is full\n");
+    log_error("kv cache is full");
     return 1;
   }
 
   // Precompute RoPE angles
   int t;
-  #pragma omp parallel for OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
   for (t = 0; t < T; t++)
   {
     int pos = spos + t;
@@ -6641,7 +6642,7 @@ forward_text_chunk(
     memcpy(buf->resid, buf->x, T * C * sizeof(*buf->x));
 
     int t;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
     for (t = 0; t < T; t++)
     {
       floatx *x_row = buf->x + t * C;
@@ -6658,7 +6659,7 @@ forward_text_chunk(
 
     // Compute xq & xk & xv
     int h;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(h) OMP_PARALLEL_ARGS
     for (h = 0; h < NH; h++)
     {
       floatx *xq_head = buf->xq + h * T * CH;  // (T, CH)
@@ -6711,7 +6712,7 @@ forward_text_chunk(
     if (cfg->qk_norm)
     {
       int h, t;
-      #pragma omp parallel for collapse(2) OMP_PARALLEL_ARGS
+      #pragma omp parallel for private(h, t) OMP_COLLAPSE2 OMP_PARALLEL_ARGS
       for (h = 0; h < NH; h++)
         for (t = 0; t < T; t++)
         {
@@ -6733,7 +6734,7 @@ forward_text_chunk(
     floatx *freqs_cs = is_local ? buf->csfreqs_slid : buf->csfreqs_full;
 
     // RoPE
-    #pragma omp parallel for collapse(2) OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(h, t) OMP_COLLAPSE2 OMP_PARALLEL_ARGS
     for (h = 0; h < NH + NH_kv; h++)
       for (t = 0; t < T; t++)
       {
@@ -6787,7 +6788,7 @@ forward_text_chunk(
 
     int max_k = epos + 1;
 
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(h) OMP_PARALLEL_ARGS
     for (h = 0; h < NH; h++)
     {
       int h_kv = h * NH_kv / NH;  // GQA mapping
@@ -6952,7 +6953,7 @@ forward_text_chunk(
     }
     if (is_interrupted()) return 1;
 
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
     for (t = 0; t < T; t++)
     {
       floatx *x_row = buf->x + t * C;
@@ -6964,7 +6965,7 @@ forward_text_chunk(
     floatx *RESTRICT resid = buf->resid;
 
     int d;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
     for (d = 0; d < T * C; d++)
     {
       // Combine the residual stream
@@ -6977,7 +6978,7 @@ forward_text_chunk(
     if (cfg->pre_mlp_norm)
     {
       int t;
-      #pragma omp parallel for OMP_PARALLEL_ARGS
+      #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
       for (t = 0; t < T; t++)
       {
         floatx *x_row = buf->x + t * C;
@@ -7011,7 +7012,7 @@ forward_text_chunk(
     if (is_interrupted()) return 1;
 
     // GELU gate
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
     for (d = 0; d < T * cfg->mlp_dim; d++)
     {
       // Tanh approximation of GELU
@@ -7044,7 +7045,7 @@ forward_text_chunk(
 
     if (cfg->pst_mlp_norm)
     {
-      #pragma omp parallel for OMP_PARALLEL_ARGS
+      #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
       for (t = 0; t < T; t++)
       {
         floatx *x_row = buf->x + t * C;
@@ -7055,7 +7056,7 @@ forward_text_chunk(
 
     x     = buf->x;
     resid = buf->resid;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
     for (d = 0; d < T * C; d++)
     {
       // Second residual
@@ -7065,7 +7066,7 @@ forward_text_chunk(
   }
 
   // Final RMSNorm
-  #pragma omp parallel for OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
   for (t = 0; t < T; t++)
   {
     floatx *x_row = buf->x + t * C;
@@ -7095,7 +7096,7 @@ forward_text_chunk(
     // Optional logit softcapping
     if (cfg->logit_softcap != 0.0f)
     {
-      for (int d = 0; d < cfg->vocab_size; d++)
+      for (uint32_t d = 0; d < cfg->vocab_size; d++)
       {
         float val      = (float)buf->logits[d] / cfg->logit_softcap;
         buf->logits[d] = (floatx)(tanhf(val) * cfg->logit_softcap);
@@ -7127,7 +7128,7 @@ forward_gemma_decode(GemmaModel *model, TextBuffer *buf, int token, int pos)
 
   // x = embedding[tok] * embed_scale
   int d;
-  #pragma omp parallel for OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
   for (d = 0; d < C; d++)
   {
     if (!model->quant)
@@ -7359,7 +7360,7 @@ apply_topk(floatx *logits, FloatIdx *logit_indices, int vocab_size, int k)
 
   // Record index info
   int i;
-  #pragma omp parallel for OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     logit_indices[i].idx = i;
@@ -7368,7 +7369,7 @@ apply_topk(floatx *logits, FloatIdx *logit_indices, int vocab_size, int k)
   quickselect_topk(logit_indices, 0, vocab_size - 1, k - 1);
 
   // Keep the top k channels
-  #pragma omp parallel for OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     logits[i] = -FLOATX_MAX;
@@ -7437,7 +7438,7 @@ apply_topp(
   if (k == 0)
   {
     int i;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
     for (i = 0; i < vocab_size; i++)
     {
       logit_indices[i].idx = i;
@@ -7459,7 +7460,7 @@ apply_topp(
 
   // Set logits to -inf
   int i;
-  #pragma omp parallel for OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     logits[i] = -FLOATX_MAX;
@@ -7487,7 +7488,7 @@ apply_rpen(floatx *logits, bool *visited, int vocab_size, float rpen)
 {
   // rpen short for Repetition Penalty
   int i;
-  #pragma omp parallel for OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     if (!visited[i]) continue;
@@ -7557,7 +7558,7 @@ sample_from_logits(
 
   // Apply the temperature
   int d;
-  #pragma omp parallel for OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
   for (d = 0; d < vocab_size; d++)
   {
     logits[d] /= (floatx)temperature;
@@ -7618,36 +7619,37 @@ sample(
   TextConfig *cfg = model->decoder->config;
   int         vs  = cfg->vocab_size;
 
-  bool    dosample        = temperature != 0 && topk != 1;
-  bool    use_topk        = dosample && topk != 0;
-  bool    use_topp        = dosample && topp < 1.0f;
-  bool    use_rpen        = dosample && rpen > 1.0f;
-  double  prefill_start   = 0.0;
-  double  prefill_end     = 0.0;
-  double  prefill_elapsed = 0.0;
-  double  gen_start       = 0.0;
-  double  gen_end         = 0.0;
-  double  gen_elapsed     = 0.0;
-  int     prompt_toks     = 0;
-  int     gen_toks        = 0;
-  int     pos             = 0;
-  int     token           = 0;
-  floatx *probs           = NULL;
+  bool   dosample        = temperature != 0 && topk != 1;
+  bool   use_topk        = dosample && topk != 0;
+  bool   use_topp        = dosample && topp < 1.0f;
+  bool   use_rpen        = dosample && rpen > 1.0f;
+  double prefill_start   = 0.0;
+  double prefill_end     = 0.0;
+  double prefill_elapsed = 0.0;
+  double gen_start       = 0.0;
+  double gen_end         = 0.0;
+  double gen_elapsed     = 0.0;
+  int    prompt_toks     = 0;
+  int    gen_toks        = 0;
+  int    pos             = 0;
+  int    token           = 0;
 
-  FloatIdx *logit_indices = NULL;
   bool     *visited       = NULL;
+  floatx   *probs         = NULL;
+  FloatIdx *logit_indices = NULL;
 
   if (use_rpen)
   {
-    CALLOC(visited, vs, "visited", goto end;);
+    if (!(visited = calloc_ckd((size_t)vs, sizeof(*visited)))) goto end;
   }
   if (dosample)
   {
-    MALLOC(probs, vs, "probs", goto end;);
+    if (!(probs = malloc_ckd((size_t)vs, sizeof(*probs)))) goto end;
   }
   if (use_topk || use_topp)
   {
-    MALLOC(logit_indices, vs, "logit_indices", goto end;);
+    if (!(logit_indices = malloc_ckd((size_t)vs, sizeof(*logit_indices))))
+      goto end;
   }
 
   // `<bos>` is always the very first token of the sequence
@@ -7931,7 +7933,7 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
       char path[4096] = {0};
       if ((size_t)cmd_ctx->arg_len >= sizeof(path))
       {
-        fprintf(stderr, "\nerror: image path too long\n");
+        log_error("image path too long");
         cmd_ctx->state = GENERATOR_EXIT;
         return (InjectData){.type = INJECT_QUIT};
       }
@@ -7939,7 +7941,7 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
       cmd_ctx->img = prepare_image(path, img_sz);
       if (cmd_ctx->img == NULL)
       {
-        fprintf(stderr, "\nerror: failed to prepare image: '%s'\n", path);
+        log_error("failed to prepare image: '%s'", path);
         cmd_ctx->state = GENERATOR_EXIT;
         return (InjectData){.type = INJECT_QUIT};
       }
@@ -8032,7 +8034,7 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
     case 1:
       if ((size_t)cmd_ctx->arg_len >= sizeof(cmd_ctx->path))
       {
-        fprintf(stderr, "\nerror: image path too long\n");
+        log_error("image path too long");
         cmd_ctx->state = GENERATOR_EXIT;
         return (InjectData){.type = INJECT_QUIT};
       }
@@ -8045,9 +8047,7 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
       );
       if (cmd_ctx->crops == NULL)
       {
-        fprintf(
-          stderr, "\nerror: failed to prepare image: '%s'\n", cmd_ctx->path
-        );
+        log_error("failed to prepare image: '%s'", cmd_ctx->path);
         cmd_ctx->state = GENERATOR_EXIT;
         return (InjectData){.type = INJECT_QUIT};
       }
@@ -8057,16 +8057,18 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
        * Passing in cmd_ctx->crops is safe here since `sample()` will only take
        * the first `image_size * image_size * 3` elements. */
       return (InjectData){.type = INJECT_IMAG, .image = cmd_ctx->crops};
-    
+
     case 2:
       // Trailer of the full image
-      spos = ctx->tokens_len;
+      spos                               = ctx->tokens_len;
       ctx->tokens_buf[ctx->tokens_len++] = tok->eoi;
-      encode(tok, "\n\n", 2, ctx->tokens_buf, ctx->tokens_len, &ctx->tokens_len);
+      encode(
+        tok, "\n\n", 2, ctx->tokens_buf, ctx->tokens_len, &ctx->tokens_len
+      );
 
       if (cmd_ctx->n_crops <= 1)
       {
-        epos = ctx->tokens_len;
+        epos           = ctx->tokens_len;
         cmd_ctx->state = GENERATOR_EXIT;  // Finish off
         return (InjectData){
           .type     = INJECT_TEXT,
@@ -8142,7 +8144,7 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
         case 6:;
       }
 
-#if !defined(_MSC_VER)
+#if !defined(__MSVC__)
       __attribute__((fallthrough));
 #endif
     default:
@@ -8325,7 +8327,7 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
         ctx->text = ctx->event.remaining;
     }
 
-#if !defined(_MSC_VER)
+#if !defined(__MSVC__)
     __attribute__((fallthrough));
 #endif
 
@@ -8377,7 +8379,7 @@ generate(
 
   int *tokens_buf;
   int  tokens_cap = seqlen * 50;
-  MALLOC(tokens_buf, tokens_cap, "tokens_buf", return;);
+  if (!(tokens_buf = malloc_ckd(tokens_cap, sizeof(*tokens_buf)))) return;
 
   InjectContext ctx = {
     .state      = 0,
@@ -8429,14 +8431,14 @@ new_turn(GemmaModel *model, bool use_mm, ChatContext *ctx)
         }
         if (!is_interrupted())
         {
-          fprintf(stderr, "\nerror: failed to read user input\n");
+          log_error("failed to read user input");
         }
         goto fail;
       }
       if (strchr(ctx->line_buf, '\n') == NULL)
       {
         // Input is truncated (too long)
-        fprintf(stderr, "\nerror: input too long\n");
+        log_error("input too long");
         goto fail;
       }
       if (is_interrupted()) goto fail;
@@ -8564,8 +8566,10 @@ chat(
 
   int tokens_cap = seqlen * 50;
   int line_cap   = seqlen * 50;
-  MALLOC(tokens_buf, tokens_cap, "tokens_buf", goto fail;);
-  MALLOC(line_buf, line_cap, "line_buf", goto fail;);
+
+  if (!(tokens_buf = malloc_ckd(tokens_cap, sizeof(*tokens_buf))) ||
+      !(line_buf = malloc_ckd(line_cap, sizeof(*line_buf))))
+    goto fail;
 
   InjectContext jctx = (InjectContext){
     .tokens_buf = tokens_buf,
@@ -8879,7 +8883,7 @@ safe_get_arg(int i, int argc, char **argv)
   if (i + 1 >= argc)
   {
     print_usage();
-    fprintf(stderr, "error: option '%s' requires an argument.\n", argv[i]);
+    log_error("option '%s' requires an argument.", argv[i]);
     return NULL;
   }
   return argv[i + 1];
@@ -8921,7 +8925,7 @@ main(int argc, char **argv)
   if (argc < 2)
   {
     print_usage();
-    fprintf(stderr, "\nerror: model filename is not provided\n");
+    log_error("model filename is not provided");
     goto fail;
   }
 
@@ -8945,7 +8949,7 @@ main(int argc, char **argv)
       if (!val) goto fail;
       if (!safe_atoui(val, &seqlen))
       {
-        fprintf(stderr, "error: invalid number for --seqlen: %s\n", val);
+        log_error("invalid number for --seqlen: %s", val);
         goto fail;
       }
     }
@@ -8955,7 +8959,7 @@ main(int argc, char **argv)
       if (!val) goto fail;
       if (!safe_atoui(val, &topk))
       {
-        fprintf(stderr, "error: invalid number for --topk: %s\n", val);
+        log_error("invalid number for --topk: %s", val);
         goto fail;
       }
     }
@@ -8965,7 +8969,7 @@ main(int argc, char **argv)
       if (!val) goto fail;
       if (!safe_atoui(val, &seed))
       {
-        fprintf(stderr, "error: invalid number for --seed: %s\n", val);
+        log_error("invalid number for --seed: %s", val);
         goto fail;
       }
     }
@@ -8975,7 +8979,7 @@ main(int argc, char **argv)
       if (!val) goto fail;
       if (!safe_atoui(val, &chunk_size) || chunk_size == 0)
       {
-        fprintf(stderr, "error: invalid number for --chunk: %s\n", val);
+        log_error("invalid number for --chunk: %s", val);
         goto fail;
       }
     }
@@ -8985,7 +8989,7 @@ main(int argc, char **argv)
       if (!val) goto fail;
       if (!safe_atof(val, &temperature) || temperature < 0.0f)
       {
-        fprintf(stderr, "error: invalid temperature: %s (must be >= 0)\n", val);
+        log_error("invalid temperature: %s (must be >= 0)", val);
         goto fail;
       }
     }
@@ -8995,7 +8999,7 @@ main(int argc, char **argv)
       if (!val) goto fail;
       if (!safe_atof(val, &topp) || topp <= 0.0f || topp > 1.0f)
       {
-        fprintf(stderr, "error: invalid top-p: %s (must be 0 < p <= 1)\n", val);
+        log_error("invalid top-p: %s (must be 0 < p <= 1)", val);
         goto fail;
       }
     }
@@ -9005,9 +9009,7 @@ main(int argc, char **argv)
       if (!val) goto fail;
       if (!safe_atof(val, &rpen) || rpen < 1.0f)
       {
-        fprintf(
-          stderr, "error: invalid repetition penalty: %s (must be >= 1)\n", val
-        );
+        log_error("invalid repetition penalty: %s (must be >= 1)", val);
         goto fail;
       }
     }
@@ -9040,7 +9042,7 @@ main(int argc, char **argv)
     }
     else
     {
-      fprintf(stderr, "error: unknown option: %s\n", arg);
+      log_error("unknown option: %s", arg);
       print_usage();
       goto fail;
     }
@@ -9114,10 +9116,19 @@ end:
   goto cleanup;
 fail:
   r = 1;
+  if (g_errmsg[0] != '\0')
+  {
+    fprintf(stderr, "\nerror: %s\n", get_error());
+  }
+  else
+  {
+    fprintf(stderr, "\nerror: unknown\n");
+  }
   goto cleanup;
 
 cleanup:
   free_utf8_argv(utf8_argv, argc);
+  gemm_free_thread_scratch();
   if (model != NULL)
   {
     free_text_buffer(buf, model->quant);
