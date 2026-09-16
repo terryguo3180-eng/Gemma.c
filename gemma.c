@@ -2811,8 +2811,7 @@ read_vision_config(FILE *fp)
       !read_uint16_ckd(fp, &vcfg->mlp_dim) ||
       !read_uint16_ckd(fp, &vcfg->hidden_dim) ||
       !read_uint16_ckd(fp, &vcfg->image_size) ||
-      !read_uint16_ckd(fp, &vcfg->patch_size) ||
-      !read_fp32_ckd(fp, &vcfg->eps))
+      !read_uint16_ckd(fp, &vcfg->patch_size) || !read_fp32_ckd(fp, &vcfg->eps))
     goto fail;
 
   return vcfg;
@@ -5270,8 +5269,7 @@ gemm_fpx(
     if (omp)
     {
       int jb, ib;
-      #pragma omp parallel for private(ib, jb) OMP_COLLAPSE2
-      //        OMP_PARA_ARGS
+      #pragma omp parallel for private(ib, jb) OMP_COLLAPSE2 OMP_PARA_ARGS
       for (jb = 0; jb < n_full; jb += 8)
         for (ib = 0; ib < m_full; ib += 8)
         {
@@ -5726,8 +5724,7 @@ gemm_int8(
     if (omp)
     {
       int jb, ib;
-      #pragma omp parallel for private(ib, jb) OMP_COLLAPSE2
-      //        OMP_PARA_ARGS
+      #pragma omp parallel for private(ib, jb) OMP_COLLAPSE2 OMP_PARA_ARGS
       for (jb = 0; jb < n_full; jb += 8)
         for (ib = 0; ib < m_full; ib += 8)
         {
@@ -6171,7 +6168,7 @@ forward_vision(
         head_dim, n_patches, false
       );
     }
-    if (is_interrupted()) return 1;
+    if (quit || is_interrupted()) return 1;
 
     // Output projection
     if (!quant)
@@ -6870,7 +6867,7 @@ forward_text_chunk(
           quit = true;
       }
     }
-    if (is_interrupted()) return 1;
+    if (quit || is_interrupted()) return 1;
 
     // Optional q & k norm
     if (tcfg->qk_norm)
@@ -7833,10 +7830,10 @@ sample(
   TextConfig *tcfg       = model->decoder->config;
   int         vocab_size = tcfg->vocab_size;
 
-  double    prefill_start = 0.0;
-  double    prefill_end   = 0.0;
-  double    gen_start     = 0.0;
-  double    gen_end       = 0.0;
+  double    prf_t0        = 0.0;
+  double    prf_t1        = 0.0;
+  double    gen_t0        = 0.0;
+  double    gen_t1        = 0.0;
   int       pos           = 0;
   int       token         = 0;
   bool      dosample      = temperature != 0 && topk != 1;
@@ -7868,6 +7865,7 @@ sample(
   }
 
   // `<bos>` is always the very first token of the sequence
+  prf_t0      = now_sec();
   int bos_tok = model->tokenizer->bos;
   if (forward_gemma_prefill(
         model, tbuf, &bos_tok, 1, &pos, chunk_size, visited, false
@@ -7875,6 +7873,8 @@ sample(
   {
     goto end;
   }
+  prf_t1 = now_sec();
+  *prefill_elapsed += prf_t1 - prf_t0;
   *prefill_toks = 1;
 
   InjectData injected = inject_callback(EOF, model, enable_mm, inject_ctx);
@@ -7884,11 +7884,9 @@ sample(
     if (injected.type == INJECT_NONE)
     {
       // pure auto-regressive step
-      gen_start = now_sec();
+      gen_t0 = now_sec();
       if (forward_gemma_decode(model, tbuf, token, pos) == 1) goto end;
       pos++;
-      gen_end = now_sec();
-      *gen_elapsed += gen_end - gen_start;
 
       if (is_interrupted()) break;
       // Fall through to common sample
@@ -7903,8 +7901,8 @@ sample(
       InjectData next    = inject_callback(EOF, model, enable_mm, inject_ctx);
       bool       is_last = (next.type == INJECT_DONE);
 
-      int prev_pos  = pos;
-      prefill_start = now_sec();
+      int prev_pos = pos;
+      prf_t0       = now_sec();
 
       if (injected.type == INJECT_TEXT)
       {
@@ -7926,8 +7924,8 @@ sample(
         }
       }
 
-      prefill_end = now_sec();
-      *prefill_elapsed += prefill_end - prefill_start;
+      prf_t1 = now_sec();
+      *prefill_elapsed += prf_t1 - prf_t0;
       *prefill_toks += pos - prev_pos;
 
       if (is_interrupted()) break;
@@ -7938,7 +7936,7 @@ sample(
         continue;
       }
       // is_last: fall through to common sample
-      gen_start = now_sec();
+      gen_t0 = now_sec();
     }
 
     // Common sample path (both Case A and last-injection)
@@ -7949,13 +7947,8 @@ sample(
     if (use_rpen) visited[token] = true;
     (*gen_toks)++;
 
-    // only the is_last path needs to close the gen timer here
-    // the pure-generation path already closed it before the fall-through
-    if (injected.type != INJECT_NONE)
-    {
-      gen_end = now_sec();
-      *gen_elapsed += gen_end - gen_start;
-    }
+    gen_t1 = now_sec();
+    *gen_elapsed += gen_t1 - gen_t0;
 
     injected = inject_callback(token, model, enable_mm, inject_ctx);
   }
@@ -8381,7 +8374,7 @@ scan_next_event(const char *text)
   CommandRecord first_cmd = {.raw = NULL};
   char         *closing;
 
-  for (int i = 0; i < ARRAYLEN(command_types); i++)
+  for (size_t i = 0; i < ARRAYLEN(command_types); i++)
   {
     CommandType cmd_type = command_types[i];
 
@@ -8951,9 +8944,21 @@ safe_atof(const char *str, float *result)
   return true;
 }
 
-typedef struct {const char *name; unsigned int val;} uint_field;
-typedef struct {const char *name; float        val;} float_field;
-typedef struct {const char *name; bool         val;} bool_field;
+typedef struct
+{
+  const char  *name;
+  unsigned int val;
+} uint_field;
+typedef struct
+{
+  const char *name;
+  float       val;
+} float_field;
+typedef struct
+{
+  const char *name;
+  bool        val;
+} bool_field;
 
 /* Pretty-print of the loaded model */
 void
@@ -8966,12 +8971,10 @@ print_model_config(
   TextDecoder    *dec    = model->decoder;
   GemmaTokenizer *tok    = model->tokenizer;
   TextConfig     *tcfg   = dec->config;
-  int             ppi    = 0;
   VisionConfig   *vcfg   = NULL;
   if (use_mm)
   {
     vcfg = enc->config;
-    ppi  = vcfg->image_size / vcfg->patch_size;
   }
 
   printf("\n========== model configuration ==========\n");
@@ -8990,8 +8993,8 @@ print_model_config(
       {"hidden_dim", vcfg->hidden_dim},
       {"n_heads"   , vcfg->n_heads   },
       {"mlp_dim"   , vcfg->mlp_dim   },
-      {""},
-    }; field->name[0] != '\0'; field++)
+      {0},
+    }; field->name != NULL; field++)
       printf("  %-*s: %d\n", width, field->name, (unsigned int)field->val);
     
     printf("  %-*s: %.8f\n", width, "eps", vcfg->eps);
@@ -9013,8 +9016,8 @@ print_model_config(
     {"image_toks", tcfg->image_toks},
     {"max_seqlen", tcfg->max_seqlen},
     {"vocab_size", tcfg->vocab_size},
-    {""},
-  }; field->name[0] != '\0'; field++)
+    {0},
+  }; field->name != NULL; field++)
     printf("  %-*s: %d\n", width, field->name, (unsigned int)field->val);
 
   // Float fields
@@ -9024,8 +9027,8 @@ print_model_config(
     {"eps"          , tcfg->eps          },
     {"att_softcap"  , tcfg->att_softcap  },
     {"logit_softcap", tcfg->logit_softcap},
-    {""},
-  }; field->name[0] != '\0'; field++)
+    {0},
+  }; field->name != NULL; field++)
     printf("  %-*s: %.8f\n", width, field->name, (double)field->val);
 
   // Attention layers
@@ -9047,8 +9050,8 @@ print_model_config(
     {"qk_norm"     , tcfg->qk_norm     },
     {"pre_mlp_norm", tcfg->pre_mlp_norm},
     {"pst_mlp_norm", tcfg->pst_mlp_norm},
-    {""},
-  }; field->name[0] != '\0'; field++)
+    {0},
+  }; field->name != NULL; field++)
     printf("  %-*s: %s\n", width, field->name, field->val ? "true" : "false");
 
   // Tokenizer
@@ -9063,8 +9066,8 @@ print_model_config(
     {"soi"       , tok->soi       },
     {"eoi"       , tok->eoi       },
     {"ist"       , tok->ist       },
-    {""},
-  }; field->name[0] != '\0'; field++)
+    {0},
+  }; field->name != NULL; field++)
     printf("  %-*s: %d\n", width, field->name, (unsigned int)field->val);
 
   // clang-format on
@@ -9088,7 +9091,7 @@ print_model_config(
   // Vision buffer & weights
   if (use_mm)
   {
-    double enc_GB = get_vision_buffer_size(vcfg, model->quant) / GB;
+    double enc_GB   = get_vision_buffer_size(vcfg, model->quant) / GB;
     double enc_w_GB = get_vision_encoder_size(vcfg, tcfg, model->quant) / GB;
     printf("  %-*s: %.2f GB\n", width, "encoder buffer", enc_GB);
     printf("  %-*s: %.2f GB\n", width, "encoder weights", enc_w_GB);
@@ -9104,7 +9107,7 @@ print_model_config(
 
   // KV cache per tok
   double kvc_t_KB = tcfg->n_layers * 2 * tcfg->n_kv_heads * tcfg->head_dim *
-                   sizeof(floatx) / 1024.0;
+                    sizeof(floatx) / 1024.0;
   printf("  %-*s: %.2f KB\n", width, "kv cache (tok)", kvc_t_KB);
   printf("=========================================\n\n");
 }
@@ -9348,16 +9351,16 @@ main(int argc, char **argv)
       {"topk"      , topk      },
       {"seed"      , seed      },
       {"chunk_size", chunk_size},
-      {""},
-    }; field->name[0] != '\0'; field++)
+      {0},
+    }; field->name != NULL; field++)
       printf("  %-*s: %d\n", width, field->name, field->val);
     
     for (float_field *field = (float_field[]){
       {"temperature", temperature},
       {"topp"       , topp       },
       {"rpen"       , rpen       },
-      {""},
-    }; field->name[0] != '\0'; field++)
+      {0},
+    }; field->name != NULL; field++)
       printf("  %-*s: %.8f\n", width, field->name, field->val);
     
     // Print the first 16 characters of the prompt
@@ -9388,8 +9391,8 @@ main(int argc, char **argv)
       {"enable_mm", enable_mm},
       {"use_mmap" , use_mmap },
       {"verbose"  , verbose  },
-      {""},
-    }; field->name[0] != '\0'; field++)
+      {0},
+    }; field->name != NULL; field++)
       printf("  %-*s: %s\n", width, field->name, field->val ? "true" : "false");
     
     printf("=========================================\n\n");
