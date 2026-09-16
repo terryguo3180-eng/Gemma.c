@@ -4873,7 +4873,6 @@ gemv_fpx_row(
  * fpx matrix-vector multiply (NT)
  * fpx vec (n,) @ fpx mat (m, n).T = fpx dst (m,)
  */
-NO_FAST_MATH_BEGIN
 static void
 gemv_fpx(
   floatx *RESTRICT       dst,
@@ -5007,7 +5006,7 @@ gemv_fpx_nn(
  * contiguous load instead of `rows` separate strided reads.
  */
 static inline void
-pack_panel(
+pack_panel_fpx(
   float *RESTRICT        packed,
   const floatx *RESTRICT src,
   int                    row_stride,
@@ -5031,7 +5030,7 @@ pack_panel(
  * touches every element of `mat` once.
  */
 static void
-pack_all(
+pack_all_fpx(
   float *RESTRICT        packed_full,
   const floatx *RESTRICT mat,
   int                    stride,
@@ -5047,7 +5046,7 @@ pack_all(
     #pragma omp parallel for private(b) OMP_PARA_ARGS
     for (b = 0; b < total_rows; b += R)
     {
-      pack_panel(
+      pack_panel_fpx(
         packed_full + (size_t)b * k, mat + (size_t)b * stride, stride, R, k
       );
     }
@@ -5056,7 +5055,7 @@ pack_all(
   {
     for (int b = 0; b < total_rows; b += R)
     {
-      pack_panel(
+      pack_panel_fpx(
         packed_full + (size_t)b * k, mat + (size_t)b * stride, stride, R, k
       );
     }
@@ -5263,8 +5262,8 @@ gemm_fpx(
     float *Ap_full = scratch;
     float *Bp_full = scratch + (size_t)m_full * k;
 
-    pack_all(Ap_full, src, src_stride, m_full, 8, k, omp);
-    pack_all(Bp_full, mat, mat_stride, n_full, 8, k, omp);
+    pack_all_fpx(Ap_full, src, src_stride, m_full, 8, k, omp);
+    pack_all_fpx(Bp_full, mat, mat_stride, n_full, 8, k, omp);
 
     if (omp)
     {
