@@ -46,13 +46,14 @@
  *
  *   ```bash
  *   gcc   -Ofast -march=native -fopenmp gemma.c -lm -o gemma   # gcc
- *   clang -O3    -march=native -fopenmp gemma.c -lm -o gemma   # clang
+ *   clang -Ofast -march=native -fopenmp gemma.c -lm -o gemma   # clang
  *   ```
  *
  * Or if you are using msvc:
  *
  *   ```powershell
- *   cl /O2 -openmp:experimental gemma.c /link shell32.lib /Fe:gemma.exe
+ *   cl /O2 /openmp:experimental /fp:fast gemma.c /link shell32.lib \
+ *      /Fe:gemma.exe
  *   ```
  *
  * Weight dtype defaults to float32; override with -DDTYPE at compile time
@@ -139,7 +140,7 @@
 #include <string.h>
 
 #if defined(_MSC_VER) && !defined(__clang__)
-// clang defines _MSC_VER on Windows as well, so we have to exclude __clang__
+// clang defines _MSC_VER on Windows, so we have to exclude __clang__
 #  define __MSVC__
 #endif
 #if defined(__GNUC__) && !defined(__clang__)
@@ -2520,7 +2521,7 @@ load_image_utf8(const char *utf8_path, int *w, int *h, int *ch, int req_comp)
 #endif
 }
 
-// The actual code starts here :D
+// The actual inference code starts here :D
 
 // Default values for cli
 #define DEFAULT_SEQLEN      16384
@@ -4644,23 +4645,16 @@ fail:
 
 // Math primitives
 
+NO_FAST_MATH_BEGIN;
+
 /* */
-NO_FAST_MATH_BEGIN
 static inline floatx
 clamp_fpx(floatx v)
 {
   return (floatx)fminf(FLOATX_MAX, fmaxf((float)-FLOATX_MAX, (float)v));
 }
-NO_FAST_MATH_END
 
-/* */
-NO_FAST_MATH_BEGIN
-static inline float
-compute_rms(float sqsum, int dim, float eps)
-{
-  return 1.0f / sqrtf(sqsum / (float)dim + eps);
-}
-NO_FAST_MATH_END
+NO_FAST_MATH_END;
 
 /* Gemma-style RMSNorm: (x * rsqrt(mean(x^2) + eps)) * (weight + 1) */
 static void
@@ -4675,7 +4669,7 @@ rmsnorm(
   {
     sqsum += (float)src[i] * (float)src[i];
   }
-  float rms = compute_rms(sqsum, (float)dim, eps);
+  float rms = 1.0f / sqrtf(sqsum / (float)dim + eps);
 
   for (i = 0; i < dim; i++)
   {
@@ -4810,6 +4804,7 @@ gemv_fpx_row(
 
 /* fpx matrix-vector multiply (NT)
  * fpx vec (n,) @ fpx mat (m, n).T = fpx dst (m,) */
+ NO_FAST_MATH_BEGIN
 static void
 gemv_fpx(
   floatx *RESTRICT       dst,
@@ -5879,6 +5874,8 @@ fail:
 }
 
 // Forward passes
+
+NO_FAST_MATH_BEGIN;
 
 /* Vision forward pass (SigLIP)
  * img: (img_sz, img_sz, 3) */
@@ -7106,6 +7103,8 @@ forward_text_chunk(
   }
   return 0;
 }
+
+NO_FAST_MATH_END;
 
 /* Language + vision model forward */
 int
@@ -8360,7 +8359,7 @@ generate_inject_callback(int token, GemmaModel *model, bool use_mm, void *ctx)
 }
 
 /* */
-void
+int
 generate(
   GemmaModel   *model,
   TextBuffer   *buf,
@@ -8379,7 +8378,7 @@ generate(
 
   int *tokens_buf;
   int  tokens_cap = seqlen * 50;
-  if (!(tokens_buf = malloc_ckd(tokens_cap, sizeof(*tokens_buf)))) return;
+  if (!(tokens_buf = malloc_ckd(tokens_cap, sizeof(*tokens_buf)))) return 1;
 
   InjectContext ctx = {
     .state      = 0,
@@ -8397,6 +8396,7 @@ generate(
   inject_context_cleanup(&ctx);
 
   free(tokens_buf);
+  return 0;
 }
 
 /* Build the Gemma chat template */
@@ -9092,22 +9092,19 @@ main(int argc, char **argv)
 
   if (chatmode)
   {
-    chat(
+    if (chat(
       model, buf, vbuf, (int)seqlen, (int)chunk_size, temperature, (int)topk,
       topp, rpen, use_mm
-    );
+    ) == 1)
+      goto fail;
   }
   else
   {
-    generate(
+    if (generate(
       model, buf, vbuf, prompt, (int)seqlen, (int)chunk_size, temperature,
       (int)topk, topp, rpen, use_mm
-    );
-  }
-
-  if (is_interrupted())
-  {
-    printf("\n");
+    ) == 1)
+      goto fail;
   }
 
   int r;
@@ -9116,17 +9113,14 @@ end:
   goto cleanup;
 fail:
   r = 1;
+  goto cleanup;
+
+cleanup:
   if (g_errmsg[0] != '\0')
   {
     fprintf(stderr, "\nerror: %s\n", get_error());
   }
-  else
-  {
-    fprintf(stderr, "\nerror: unknown\n");
-  }
-  goto cleanup;
 
-cleanup:
   free_utf8_argv(utf8_argv, argc);
   gemm_free_thread_scratch();
   if (model != NULL)

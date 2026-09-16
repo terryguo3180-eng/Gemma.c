@@ -47,7 +47,7 @@ ifeq ($(IS_MSVC),1)
 
   # /openmp:experimental enables omp simd; /openmp:llvm (VS 2022+) is better
   # when available but experimental is the widely-working choice you used.
-  CFLAGS  := /nologo /O2 /std:c11 /openmp:experimental /D_CRT_SECURE_NO_WARNINGS
+  CFLAGS  := /nologo /O2 /std:c11 /fp:fast /openmp:experimental
   CFLAGS  += /DDTYPE=$(DTYPE)
   LDFLAGS :=
   LDLIBS  := shell32.lib
@@ -60,7 +60,7 @@ ifeq ($(IS_MSVC),1)
 	$(CC) $(CFLAGS) $< /Fe:$@ /link $(LDLIBS)
 
   # MSVC debug: /Od /Zi, no OpenMP so single-stepping stays sane.
-  debug: CFLAGS := /nologo /Od /Zi /std:c11 /D_CRT_SECURE_NO_WARNINGS /DDTYPE=$(DTYPE)
+  debug: CFLAGS := /nologo /Od /Zi /std:c11 /DDTYPE=$(DTYPE)
   debug: LDLIBS := shell32.lib
   debug: $(TARGET)
 
@@ -73,12 +73,7 @@ ifeq ($(IS_MSVC),1)
 # ---------------------------------------------------------------------------
 else
 
-  # -Ofast completely breaks the code in Clang and I'm not sure why
-  ifeq ($(IS_CLANG),1)
-    OPT := -O3
-  else
-    OPT := -Ofast
-  endif
+  OPT := -Ofast
 
   # -march=native isn't understood everywhere (Apple Silicon Clang, some
   # distro-patched cross-compilers, emulated CI runners), so probe for it
