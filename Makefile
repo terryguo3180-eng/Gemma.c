@@ -9,7 +9,7 @@
 #
 #   make CC=clang           # force a specific compiler
 #   make CC=cl              # force MSVC (from an MSVC developer shell)
-#   make DTYPE=BF16         # compile weights as bfloat16 instead of fp16
+#   make DTYPE=BF16         # compile weights as bfloat16 instead of float32
 #   make DTYPE=FP32         # recommended default when building with MSVC
 #   make debug              # -O0 -g build for use with gdb/lldb (GCC/Clang)
 #
@@ -45,9 +45,14 @@ ifeq ($(IS_MSVC),1)
     DTYPE := FP32
   endif
 
-  # /openmp:experimental enables omp simd; /openmp:llvm (VS 2022+) is better
-  # when available but experimental is the widely-working choice you used.
-  CFLAGS  := /nologo /O2 /std:c11 /fp:fast /openmp:experimental
+  STATIC ?= 1
+  ifeq ($(STATIC),1)
+    CRTFLAG := /MT
+  else
+    CRTFLAG := /MD
+  endif
+
+  CFLAGS  := /nologo /O2 /std:c11 /fp:fast /openmp:experimental $(CRTFLAG)
   CFLAGS  += /DDTYPE=$(DTYPE)
   LDFLAGS :=
   LDLIBS  := shell32.lib
@@ -60,7 +65,7 @@ ifeq ($(IS_MSVC),1)
 	$(CC) $(CFLAGS) $< /Fe:$@ /link $(LDLIBS)
 
   # MSVC debug: /Od /Zi, no OpenMP so single-stepping stays sane.
-  debug: CFLAGS := /nologo /Od /Zi /std:c11 /DDTYPE=$(DTYPE)
+  debug: CFLAGS := /nologo /Od /Zi /std:c11 /DDTYPE=$(DTYPE) $(CRTFLAG)
   debug: LDLIBS := shell32.lib
   debug: $(TARGET)
 
@@ -73,12 +78,12 @@ ifeq ($(IS_MSVC),1)
 # ---------------------------------------------------------------------------
 else
 
-  OPT := -Ofast
+  OPT := -O3 -ffast-math
 
-  # -march=native isn't understood everywhere (Apple Silicon Clang, some
-  # distro-patched cross-compilers, emulated CI runners), so probe for it
-  # instead of hard-coding it and breaking the build on those targets.
+  # -march=native & -mtune=native isn't understood everywhere, so probe for
+  # it instead of hard-coding it and breaking the build on those targets.
   MARCH_NATIVE := $(shell $(CC) -march=native -E -x c /dev/null >/dev/null 2>&1 && echo -march=native)
+  MTUNE_NATIVE := $(shell $(CC) -mtune=native -E -x c /dev/null >/dev/null 2>&1 && echo -mtune=native)
 
   # Same story for OpenMP: not every Clang install ships libomp out of the
   # box (notably Xcode's clang on macOS), so probe rather than assume, and
@@ -89,21 +94,36 @@ else
     $(warning Install gcc's libgomp, or on macOS 'brew install libomp', to enable multithreading.)
   endif
 
-  WARNFLAGS := -Wall -Wextra -Wno-unused-parameter
-  CFLAGS    := -std=gnu11 $(WARNFLAGS) $(OPT) $(MARCH_NATIVE) $(OPENMP)
-  LDLIBS    := -lm
+  WARNFLAGS := -Wall -Wextra
+  CFLAGS    := -std=c11 $(WARNFLAGS) $(OPT) $(MARCH_NATIVE) $(MTUNE_NATIVE) $(OPENMP)
+  
+  ifeq ($(OS),Windows_NT)
+    STATIC ?= 1
+  else
+    STATIC ?= 0
+  endif
+
+  ifeq ($(STATIC),1)
+    LDLIBS := -static
+  else
+    LDLIBS :=
+  endif
 
   ifneq ($(strip $(DTYPE)),)
     CFLAGS += -DDTYPE=$(DTYPE)
   endif
 
   ifeq ($(OS),Windows_NT)
-    # Statically link the runtime so the .exe doesn't need libgcc /
-    # libwinpthread DLLs sitting next to it to run on a machine without MinGW
-    # installed.
-    LDFLAGS += -static
+    ifeq ($(IS_MSVC),1)
+      LDLIBS += shell32.lib
+    else
+      LDLIBS += -lshell32
+    endif
   else
-    ifeq ($(OPENMP),-fopenmp)
+    LDLIBS += -lm
+    ifeq ($(IS_CLANG),1)
+      LDLIBS += -fopenmp=libgomp
+    else
       LDLIBS += -lgomp
     endif
   endif

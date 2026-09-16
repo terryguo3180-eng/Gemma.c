@@ -22,7 +22,7 @@
  *     FlashAttention-style causal tiling scheme
  *   - Full SigLIP vision encoder with bidirectional image-token attention,
  *     plus a pan & scan crop utility for high-aspect-ratio images
- *   - mmap'd weight loading (falls back to a plain read on `--disable-mmap`)
+ *   - mmap'd weight loading (falls back to a plain read on `--no-mmap`)
  *   - KV-cache streaming generation, chunked prefill
  *   - Temperature / top-k / top-p / repetition-penalty sampling
  *   - float32 / float16 / bfloat16 weights, selectable at compile time
@@ -45,8 +45,8 @@
  * If you'd rather invoke the compiler directly:
  *
  *   ```bash
- *   gcc   -Ofast -march=native -fopenmp gemma.c -lm -o gemma   # gcc
- *   clang -Ofast -march=native -fopenmp gemma.c -lm -o gemma   # clang
+ *   gcc   -Ofast          -march=native -fopenmp gemma.c -lm -o gemma  # gcc
+ *   clang -O3 -ffast-math -march=native -fopenmp gemma.c -lm -o gemma  # clang
  *   ```
  *
  * Or if you are using msvc:
@@ -91,15 +91,15 @@
  * The image gets decoded, resized to the model's expected input size, run
  * through the vision encoder, and the resulting soft tokens get spliced into
  * the text sequence between <start_of_image>/<end_of_image>. Pass
- * `--disable-mm` to skip loading the vision tower entirely and save memory on
+ * `--text-only` to skip loading the vision tower entirely and save memory on
  * a text-only workload.
  *
- * For very wide/tall images, @image_pas{...} runs Gemma 3's pan & scan crop
+ * For very wide/tall images, @longimage{...} runs Gemma 3's pan & scan crop
  * utility first, so the model gets both the full downsized image and a few
  * higher-resolution crops of it:
  *
  *   ```
- *   > What's happening at the bottom of @image_pas{long_screenshot.png}?
+ *   > What's happening at the bottom of @longimage{long_screenshot.png}?
  *   ```
  *
  * `--seqlen`, `--temperature`, `--topk`, `--topp`, `--rpen`, `--seed` and
@@ -124,6 +124,8 @@
 // Kill MSVC CRT "use *_s instead" deprecation spam on Windows (clang + cl)
 #if defined(_WIN32) && !defined(_CRT_SECURE_NO_WARNINGS)
 #  define _CRT_SECURE_NO_WARNINGS
+#else
+#  define _POSIX_C_SOURCE 200809L
 #endif
 
 #include <errno.h>
@@ -454,9 +456,6 @@ console_handler_(DWORD dwCtrlType)
 }
 
 #else
-#  undef _POSIX_C_SOURCE
-#  define _POSIX_C_SOURCE 199309L
-
 #  include <sys/mman.h>
 #  include <time.h>
 #  include <unistd.h>
@@ -2523,21 +2522,12 @@ load_image_utf8(const char *utf8_path, int *w, int *h, int *ch, int req_comp)
 
 // The actual inference code starts here :D
 
-// Default values for cli
-#define DEFAULT_SEQLEN      16384
-#define DEFAULT_TOPK        0
-#define DEFAULT_CHUNK_SIZE  1024
-#define DEFAULT_TEMPERATURE 1.0
-#define DEFAULT_TOPP        1.0
-#define DEFAULT_RPEN        1.0
-#define DEFAULT_PROMPT      "Once upon a time"
-
 // Block size of blockwise causal masking
 #define QK_BLOCK_SIZE 64
 
 // OpenMP parameters
-#define OMP_NUM_THREADS   8
-#define OMP_PARALLEL_ARGS num_threads(OMP_NUM_THREADS)
+#define OMP_NUM_THREADS 8
+#define OMP_PARA_ARGS   num_threads(OMP_NUM_THREADS)
 #if defined(__MSVC__) && !defined(MSVC_OMP_COLLAPSE)
 // Most versions of MSVC does not support the `collapse` clause
 #  define OMP_COLLAPSE2
@@ -2622,6 +2612,8 @@ min(int a, int b)
 // I usually use a trailing underscore to indicate a variable/function/macro is
 // temporary
 #define STRINGIFY_(x) #x
+
+#define ARRAYLEN(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 // Error logger
 
@@ -2819,7 +2811,8 @@ read_vision_config(FILE *fp)
       !read_uint16_ckd(fp, &vcfg->mlp_dim) ||
       !read_uint16_ckd(fp, &vcfg->hidden_dim) ||
       !read_uint16_ckd(fp, &vcfg->image_size) ||
-      !read_uint16_ckd(fp, &vcfg->patch_size) || !read_fp32_ckd(fp, &vcfg->eps))
+      !read_uint16_ckd(fp, &vcfg->patch_size) ||
+      !read_fp32_ckd(fp, &vcfg->eps))
     goto fail;
 
   return vcfg;
@@ -2856,59 +2849,60 @@ typedef struct
 
 /* */
 static void
-free_text_config(TextConfig *cfg)
+free_text_config(TextConfig *tcfg)
 {
-  if (cfg == NULL) return;
-  free(cfg->att_layers);
-  free(cfg);
+  if (tcfg == NULL) return;
+  free(tcfg->att_layers);
+  free(tcfg);
 }
 
 /* */
 static TextConfig *
 read_text_config(FILE *fp, bool *support_mm)
 {
-  TextConfig *cfg            = NULL;
+  TextConfig *tcfg           = NULL;
   char       *att_layers_buf = NULL;
 
-  if (!(cfg = calloc_ckd(1, sizeof(*cfg))) ||
-      !read_uint8_ckd(fp, &cfg->n_layers) ||
-      !read_uint8_ckd(fp, &cfg->n_heads) ||
-      !read_uint8_ckd(fp, &cfg->n_kv_heads) ||
-      !read_uint16_ckd(fp, &cfg->head_dim) ||
-      !read_uint16_ckd(fp, &cfg->embed_dim) ||
-      !read_uint16_ckd(fp, &cfg->mlp_dim) ||
-      !read_uint16_ckd(fp, &cfg->q_scale) ||
-      !read_uint16_ckd(fp, &cfg->slide_len) ||
-      !read_uint16_ckd(fp, &cfg->image_toks) ||
-      !read_uint32_ckd(fp, &cfg->max_seqlen) ||
-      !read_uint32_ckd(fp, &cfg->vocab_size) ||
-      !read_fp32_ckd(fp, &cfg->local_theta) ||
-      !read_fp32_ckd(fp, &cfg->global_theta) || !read_fp32_ckd(fp, &cfg->eps) ||
-      !read_fp32_ckd(fp, &cfg->att_softcap) ||
-      !read_fp32_ckd(fp, &cfg->logit_softcap))
+  if (!(tcfg = calloc_ckd(1, sizeof(*tcfg))) ||
+      !read_uint8_ckd(fp, &tcfg->n_layers) ||
+      !read_uint8_ckd(fp, &tcfg->n_heads) ||
+      !read_uint8_ckd(fp, &tcfg->n_kv_heads) ||
+      !read_uint16_ckd(fp, &tcfg->head_dim) ||
+      !read_uint16_ckd(fp, &tcfg->embed_dim) ||
+      !read_uint16_ckd(fp, &tcfg->mlp_dim) ||
+      !read_uint16_ckd(fp, &tcfg->q_scale) ||
+      !read_uint16_ckd(fp, &tcfg->slide_len) ||
+      !read_uint16_ckd(fp, &tcfg->image_toks) ||
+      !read_uint32_ckd(fp, &tcfg->max_seqlen) ||
+      !read_uint32_ckd(fp, &tcfg->vocab_size) ||
+      !read_fp32_ckd(fp, &tcfg->local_theta) ||
+      !read_fp32_ckd(fp, &tcfg->global_theta) ||
+      !read_fp32_ckd(fp, &tcfg->eps) ||
+      !read_fp32_ckd(fp, &tcfg->att_softcap) ||
+      !read_fp32_ckd(fp, &tcfg->logit_softcap))
     goto fail;
 
   // Packed bit-field of which layers use sliding-window attention
   // A terrible terrible idea, wish I didn't do this
   uint8_t n_bytes;
   if (!read_uint8_ckd(fp, &n_bytes)) goto fail;
-  if (n_bytes * 8 < cfg->n_layers)
+  if (n_bytes * 8 < tcfg->n_layers)
   {
     log_error("insufficient att_layers bytes");
     goto fail;
   }
   if (!(att_layers_buf = malloc_ckd(n_bytes, sizeof(*att_layers_buf))) ||
-      !(cfg->att_layers =
-          malloc_ckd(cfg->n_layers, sizeof(*cfg->att_layers))) ||
+      !(tcfg->att_layers =
+          malloc_ckd(tcfg->n_layers, sizeof(*tcfg->att_layers))) ||
       !fread_ckd(att_layers_buf, n_bytes, sizeof(*att_layers_buf), fp))
     goto fail;
 
-  for (int i = 0; i < cfg->n_layers; i++)
+  for (int i = 0; i < tcfg->n_layers; i++)
   {
-    int pos            = i;
-    int byte_idx       = pos / 8;
-    int bit_idx        = 7 - (pos % 8);
-    cfg->att_layers[i] = (att_layers_buf[byte_idx] >> bit_idx) & 1;
+    int pos             = i;
+    int byte_idx        = pos / 8;
+    int bit_idx         = 7 - (pos % 8);
+    tcfg->att_layers[i] = (att_layers_buf[byte_idx] >> bit_idx) & 1;
   }
   free(att_layers_buf);
   att_layers_buf = NULL;
@@ -2916,15 +2910,15 @@ read_text_config(FILE *fp, bool *support_mm)
   // Extra feature flags packed into one byte
   uint8_t extra_flags;
   if (!read_uint8_ckd(fp, &extra_flags)) goto fail;
-  *support_mm       = (extra_flags & 8) == 8;
-  cfg->qk_norm      = (extra_flags & 4) == 4;
-  cfg->pre_mlp_norm = (extra_flags & 2) == 2;
-  cfg->pst_mlp_norm = (extra_flags & 1) == 1;
+  *support_mm        = (extra_flags & 8) == 8;
+  tcfg->qk_norm      = (extra_flags & 4) == 4;
+  tcfg->pre_mlp_norm = (extra_flags & 2) == 2;
+  tcfg->pst_mlp_norm = (extra_flags & 1) == 1;
 
-  return cfg;
+  return tcfg;
 
 fail:
-  free_text_config(cfg);
+  free_text_config(tcfg);
   free(att_layers_buf);
   return NULL;
 }
@@ -3027,12 +3021,12 @@ free_tokenizer(GemmaTokenizer *tok)
 
 /* */
 static GemmaTokenizer *
-read_tokenizer(FILE *fp, TextConfig *cfg, bool support_mm)
+read_tokenizer(FILE *fp, TextConfig *tcfg, bool support_mm)
 {
   GemmaTokenizer *tok;
   if (!(tok = calloc_ckd(1, sizeof(*tok)))) goto fail;
 
-  tok->vocab_size = cfg->vocab_size;
+  tok->vocab_size = tcfg->vocab_size;
   if (support_mm)
   {
     tok->vocab_size++;
@@ -3416,26 +3410,20 @@ typedef struct
   QTensor *wk;  // (hidden_dim, hidden_dim).T
   QTensor *wv;  // (hidden_dim, hidden_dim).T
   QTensor *wo;  // (hidden_dim, hidden_dim).T
-
-  // ViT attention biases
-  floatx *bq;  // (hidden_dim,)
-  floatx *bk;  // (hidden_dim,)
-  floatx *bv;  // (hidden_dim,)
-  floatx *bo;  // (hidden_dim,)
+  floatx  *bq;  // (hidden_dim,)
+  floatx  *bk;  // (hidden_dim,)
+  floatx  *bv;  // (hidden_dim,)
+  floatx  *bo;  // (hidden_dim,)
 
   // ViT feedforward weights
   QTensor *w1;  // (hidden_dim, mlp_dim).T
   QTensor *w2;  // (hidden_dim, mlp_dim).T
-
-  // ViT feedforward biases
-  floatx *b1;  // (mlp_dim,)
-  floatx *b2;  // (mlp_dim,)
+  floatx  *b1;  // (mlp_dim,)
+  floatx  *b2;  // (mlp_dim,)
 
   // ViT layernorm weights
-  floatx *n1;  // (hidden_dim,)
-  floatx *n2;  // (hidden_dim,)
-
-  // ViT layernorm biases
+  floatx *n1;    // (hidden_dim,)
+  floatx *n2;    // (hidden_dim,)
   floatx *n1_b;  // (hidden_dim,)
   floatx *n2_b;  // (hidden_dim,)
 } VisionEncoderLayer;
@@ -3490,55 +3478,55 @@ typedef struct
 
 /* */
 size_t
-get_text_decoder_size(const TextConfig *cfg, bool quant)
+get_text_decoder_size(const TextConfig *tcfg, bool quant)
 {
-  size_t size = 0;
-  int    C    = cfg->embed_dim;
-  int    CM   = cfg->mlp_dim;
-  int    Cq   = cfg->n_heads * cfg->head_dim;
-  int    Ckv  = cfg->n_kv_heads * cfg->head_dim;
-  int    vs   = cfg->vocab_size;
+  size_t size       = 0;
+  int    embed_dim  = tcfg->embed_dim;
+  int    mlp_dim    = tcfg->mlp_dim;
+  int    q_size     = tcfg->n_heads * tcfg->head_dim;
+  int    kv_size    = tcfg->n_kv_heads * tcfg->head_dim;
+  int    vocab_size = tcfg->vocab_size;
 
-  // embedding: linear (C -> vs)
-  size += qtensor_size(C, vs, quant);
+  // embedding: linear (embed_dim -> vocab_size)
+  size += qtensor_size(embed_dim, vocab_size, quant);
 
-  for (int l = 0; l < cfg->n_layers; l++)
+  for (int l = 0; l < tcfg->n_layers; l++)
   {
     // wq, wk, wv, wo
-    size += qtensor_size(C, Cq, quant);
-    size += qtensor_size(C, Ckv, quant);
-    size += qtensor_size(C, Ckv, quant);
-    size += qtensor_size(Cq, C, quant);
+    size += qtensor_size(embed_dim, q_size, quant);
+    size += qtensor_size(embed_dim, kv_size, quant);
+    size += qtensor_size(embed_dim, kv_size, quant);
+    size += qtensor_size(q_size, embed_dim, quant);
 
     // optional nq, nk
-    if (cfg->qk_norm)
+    if (tcfg->qk_norm)
     {
-      size += (size_t)cfg->head_dim * sizeof(floatx);
-      size += (size_t)cfg->head_dim * sizeof(floatx);
+      size += (size_t)tcfg->head_dim * sizeof(floatx);
+      size += (size_t)tcfg->head_dim * sizeof(floatx);
     }
 
     // w1, w2, w3
-    size += qtensor_size(C, CM, quant);
-    size += qtensor_size(C, CM, quant);
-    size += qtensor_size(CM, C, quant);
+    size += qtensor_size(embed_dim, mlp_dim, quant);
+    size += qtensor_size(embed_dim, mlp_dim, quant);
+    size += qtensor_size(mlp_dim, embed_dim, quant);
 
     // n1, n2
-    size += (size_t)C * sizeof(floatx);
-    size += (size_t)C * sizeof(floatx);
+    size += (size_t)embed_dim * sizeof(floatx);
+    size += (size_t)embed_dim * sizeof(floatx);
 
     // optional n3, n4
-    if (cfg->pre_mlp_norm)
+    if (tcfg->pre_mlp_norm)
     {
-      size += (size_t)C * sizeof(floatx);
+      size += (size_t)embed_dim * sizeof(floatx);
     }
-    if (cfg->pst_mlp_norm)
+    if (tcfg->pst_mlp_norm)
     {
-      size += (size_t)C * sizeof(floatx);
+      size += (size_t)embed_dim * sizeof(floatx);
     }
   }
 
   // final_norm
-  size += (size_t)C * sizeof(floatx);
+  size += (size_t)embed_dim * sizeof(floatx);
 
   return size;
 }
@@ -3590,17 +3578,17 @@ free_text_decoder_wrapper(TextDecoder *dec, bool free_cfg)
 
 /* */
 static TextDecoder *
-read_text_decoder(FILE *fp, TextConfig *cfg, bool quant)
+read_text_decoder(FILE *fp, TextConfig *tcfg, bool quant)
 {
   TextDecoder *dec;
   if (!(dec = calloc_ckd(1, sizeof(*dec)))) goto fail;
-  dec->config = cfg;
+  dec->config = tcfg;
 
-  int C   = cfg->embed_dim;
-  int CM  = cfg->mlp_dim;
-  int Cq  = cfg->n_heads * cfg->head_dim;
-  int Ckv = cfg->n_kv_heads * cfg->head_dim;
-  int vs  = cfg->vocab_size;
+  int embed_dim  = tcfg->embed_dim;
+  int mlp_dim    = tcfg->mlp_dim;
+  int q_size     = tcfg->n_heads * tcfg->head_dim;
+  int kv_size    = tcfg->n_kv_heads * tcfg->head_dim;
+  int vocab_size = tcfg->vocab_size;
 
   /* The embedding shape is (vocab_size, embed_dim), but it uses per-tensor
    * quantization rather than per-channel like other weights. Gemma uses tied
@@ -3608,14 +3596,14 @@ read_text_decoder(FILE *fp, TextConfig *cfg, bool quant)
    * embedding table, but transposed. So it becomes per-channel quantization in
    * the final lm_head. */
 
-  if (!(dec->embedding = read_qtensor(fp, C, vs, quant)) ||
+  if (!(dec->embedding = read_qtensor(fp, embed_dim, vocab_size, quant)) ||
       !(dec->layers = calloc_ckd(
-          cfg->n_layers, sizeof(*dec->layers)  // NOLINT
+          tcfg->n_layers, sizeof(*dec->layers)  // NOLINT
         )))
     goto fail;
 
   // Read all the layers
-  for (int l = 0; l < cfg->n_layers; l++)
+  for (int l = 0; l < tcfg->n_layers; l++)
   {
     TextDecoderLayer *layer = NULL;
 
@@ -3625,18 +3613,19 @@ read_text_decoder(FILE *fp, TextConfig *cfg, bool quant)
 
     if (
       // Attention weights
-      !(layer->wq = read_qtensor(fp, C, Cq, quant)) ||
-      !(layer->wk = read_qtensor(fp, C, Ckv, quant)) ||
-      !(layer->wv = read_qtensor(fp, C, Ckv, quant)) ||
-      !(layer->wo = read_qtensor(fp, Cq, C, quant)))
+      !(layer->wq = read_qtensor(fp, embed_dim, q_size, quant)) ||
+      !(layer->wk = read_qtensor(fp, embed_dim, kv_size, quant)) ||
+      !(layer->wv = read_qtensor(fp, embed_dim, kv_size, quant)) ||
+      !(layer->wo = read_qtensor(fp, q_size, embed_dim, quant)))
       goto fail;
 
-    if (cfg->qk_norm)
+    if (tcfg->qk_norm)
     {
       // QK RMSNorms
       if (!(layer->nq =
-              read_tensor_ckd(cfg->head_dim, sizeof(*layer->nq), fp)) ||
-          !(layer->nk = read_tensor_ckd(cfg->head_dim, sizeof(*layer->nk), fp)))
+              read_tensor_ckd(tcfg->head_dim, sizeof(*layer->nq), fp)) ||
+          !(layer->nk =
+              read_tensor_ckd(tcfg->head_dim, sizeof(*layer->nk), fp)))
         goto fail;
     }
     else
@@ -3647,25 +3636,27 @@ read_text_decoder(FILE *fp, TextConfig *cfg, bool quant)
 
     if (
       // Feedforward weights
-      !(layer->w1 = read_qtensor(fp, C, CM, quant)) ||
-      !(layer->w2 = read_qtensor(fp, C, CM, quant)) ||
-      !(layer->w3 = read_qtensor(fp, CM, C, quant)) ||
+      !(layer->w1 = read_qtensor(fp, embed_dim, mlp_dim, quant)) ||
+      !(layer->w2 = read_qtensor(fp, embed_dim, mlp_dim, quant)) ||
+      !(layer->w3 = read_qtensor(fp, mlp_dim, embed_dim, quant)) ||
       // RMSNorm weights
-      !(layer->n1 = read_tensor_ckd(C, sizeof(*layer->n1), fp)) ||
-      !(layer->n2 = read_tensor_ckd(C, sizeof(*layer->n2), fp)))
+      !(layer->n1 = read_tensor_ckd(embed_dim, sizeof(*layer->n1), fp)) ||
+      !(layer->n2 = read_tensor_ckd(embed_dim, sizeof(*layer->n2), fp)))
       goto fail;
 
-    if (cfg->pre_mlp_norm)
+    if (tcfg->pre_mlp_norm)
     {
-      if (!(layer->n3 = read_tensor_ckd(C, sizeof(*layer->n3), fp))) goto fail;
+      if (!(layer->n3 = read_tensor_ckd(embed_dim, sizeof(*layer->n3), fp)))
+        goto fail;
     }
     else
     {
       layer->n3 = NULL;
     }
-    if (cfg->pst_mlp_norm)
+    if (tcfg->pst_mlp_norm)
     {
-      if (!(layer->n4 = read_tensor_ckd(C, sizeof(*layer->n4), fp))) goto fail;
+      if (!(layer->n4 = read_tensor_ckd(embed_dim, sizeof(*layer->n4), fp)))
+        goto fail;
     }
     else
     {
@@ -3674,7 +3665,8 @@ read_text_decoder(FILE *fp, TextConfig *cfg, bool quant)
     dec->layers[l] = layer;
   }
 
-  if (!(dec->final_norm = read_tensor_ckd(C, sizeof(*dec->final_norm), fp)))
+  if (!(dec->final_norm =
+          read_tensor_ckd(embed_dim, sizeof(*dec->final_norm), fp)))
     goto fail;
 
   return dec;
@@ -3686,30 +3678,30 @@ fail:
 
 /* */
 static TextDecoder *
-mmap_text_decoder(void *data, TextConfig *cfg, size_t *offset, bool quant)
+mmap_text_decoder(void *data, TextConfig *tcfg, size_t *offset, bool quant)
 {
   TextDecoder *dec;
   if (!(dec = calloc_ckd(1, sizeof(*dec)))) goto fail;
-  dec->config = cfg;
+  dec->config = tcfg;
 
   uint8_t *base = (uint8_t *)data;
 
-  int C   = cfg->embed_dim;
-  int CM  = cfg->mlp_dim;
-  int Cq  = cfg->n_heads * cfg->head_dim;
-  int Ckv = cfg->n_kv_heads * cfg->head_dim;
-  int vs  = cfg->vocab_size;
+  int embed_dim  = tcfg->embed_dim;
+  int mlp_dim    = tcfg->mlp_dim;
+  int q_size     = tcfg->n_heads * tcfg->head_dim;
+  int kv_size    = tcfg->n_kv_heads * tcfg->head_dim;
+  int vocab_size = tcfg->vocab_size;
 
-  // Embedding: linear (C -> vs)
+  // Embedding: linear (embed_dim -> vocab_size)
   if (!(dec->embedding = calloc_ckd(1, sizeof(*dec->embedding)))) goto fail;
-  mmap_qtensor(dec->embedding, base, offset, C, vs, quant);
+  mmap_qtensor(dec->embedding, base, offset, embed_dim, vocab_size, quant);
 
   // Layers array
   if (!(dec->layers =
-          calloc_ckd(cfg->n_layers, sizeof(*dec->layers))))  // NOLINT
+          calloc_ckd(tcfg->n_layers, sizeof(*dec->layers))))  // NOLINT
     goto fail;
 
-  for (int l = 0; l < cfg->n_layers; l++)
+  for (int l = 0; l < tcfg->n_layers; l++)
   {
     TextDecoderLayer *layer = NULL;
     if (!(layer = calloc_ckd(1, sizeof(*layer)))) goto fail;
@@ -3717,24 +3709,24 @@ mmap_text_decoder(void *data, TextConfig *cfg, size_t *offset, bool quant)
 
     // Attention weights
     if (!(layer->wq = calloc_ckd(1, sizeof(*layer->wq)))) goto fail;
-    mmap_qtensor(layer->wq, base, offset, C, Cq, quant);
+    mmap_qtensor(layer->wq, base, offset, embed_dim, q_size, quant);
 
     if (!(layer->wk = calloc_ckd(1, sizeof(*layer->wk)))) goto fail;
-    mmap_qtensor(layer->wk, base, offset, C, Ckv, quant);
+    mmap_qtensor(layer->wk, base, offset, embed_dim, kv_size, quant);
 
     if (!(layer->wv = calloc_ckd(1, sizeof(*layer->wv)))) goto fail;
-    mmap_qtensor(layer->wv, base, offset, C, Ckv, quant);
+    mmap_qtensor(layer->wv, base, offset, embed_dim, kv_size, quant);
 
     if (!(layer->wo = calloc_ckd(1, sizeof(*layer->wo)))) goto fail;
-    mmap_qtensor(layer->wo, base, offset, Cq, C, quant);
+    mmap_qtensor(layer->wo, base, offset, q_size, embed_dim, quant);
 
     // QK normalization (optional)
-    if (cfg->qk_norm)
+    if (tcfg->qk_norm)
     {
       layer->nq = (floatx *)(base + *offset);
-      *offset += (size_t)cfg->head_dim * sizeof(floatx);
+      *offset += (size_t)tcfg->head_dim * sizeof(floatx);
       layer->nk = (floatx *)(base + *offset);
-      *offset += (size_t)cfg->head_dim * sizeof(floatx);
+      *offset += (size_t)tcfg->head_dim * sizeof(floatx);
     }
     else
     {
@@ -3744,35 +3736,35 @@ mmap_text_decoder(void *data, TextConfig *cfg, size_t *offset, bool quant)
 
     // Feedforward weights
     if (!(layer->w1 = calloc_ckd(1, sizeof(*layer->w1)))) goto fail;
-    mmap_qtensor(layer->w1, base, offset, C, CM, quant);
+    mmap_qtensor(layer->w1, base, offset, embed_dim, mlp_dim, quant);
 
     if (!(layer->w2 = calloc_ckd(1, sizeof(*layer->w2)))) goto fail;
-    mmap_qtensor(layer->w2, base, offset, C, CM, quant);
+    mmap_qtensor(layer->w2, base, offset, embed_dim, mlp_dim, quant);
 
     if (!(layer->w3 = calloc_ckd(1, sizeof(*layer->w3)))) goto fail;
-    mmap_qtensor(layer->w3, base, offset, CM, C, quant);
+    mmap_qtensor(layer->w3, base, offset, mlp_dim, embed_dim, quant);
 
     // RMSNorm weights
     layer->n1 = (floatx *)(base + *offset);
-    *offset += (size_t)C * sizeof(floatx);
+    *offset += (size_t)embed_dim * sizeof(floatx);
     layer->n2 = (floatx *)(base + *offset);
-    *offset += (size_t)C * sizeof(floatx);
+    *offset += (size_t)embed_dim * sizeof(floatx);
 
     // Optional pre/post MLP norms
-    if (cfg->pre_mlp_norm)
+    if (tcfg->pre_mlp_norm)
     {
       layer->n3 = (floatx *)(base + *offset);
-      *offset += (size_t)C * sizeof(floatx);
+      *offset += (size_t)embed_dim * sizeof(floatx);
     }
     else
     {
       layer->n3 = NULL;
     }
 
-    if (cfg->pst_mlp_norm)
+    if (tcfg->pst_mlp_norm)
     {
       layer->n4 = (floatx *)(base + *offset);
-      *offset += (size_t)C * sizeof(floatx);
+      *offset += (size_t)embed_dim * sizeof(floatx);
     }
     else
     {
@@ -3784,7 +3776,7 @@ mmap_text_decoder(void *data, TextConfig *cfg, size_t *offset, bool quant)
 
   // Final norm
   dec->final_norm = (floatx *)(base + *offset);
-  *offset += (size_t)C * sizeof(floatx);
+  *offset += (size_t)embed_dim * sizeof(floatx);
 
   return dec;
 
@@ -3813,65 +3805,65 @@ typedef struct
 /* */
 size_t
 get_vision_encoder_size(
-  const VisionConfig *vcfg, const TextConfig *cfg, bool quant
+  const VisionConfig *vcfg, const TextConfig *tcfg, bool quant
 )
 {
-  size_t size = 0;
-  int    P    = vcfg->patch_size;
-  int    C    = vcfg->hidden_dim;
-  int    CM   = vcfg->mlp_dim;
-  int    N    = vcfg->image_size / P;
-  N *= N;
+  size_t size      = 0;
+  int    P         = vcfg->patch_size;
+  int    embed_dim = vcfg->hidden_dim;
+  int    mlp_dim   = vcfg->mlp_dim;
+  int    n_patches = vcfg->image_size / P;
+  n_patches *= n_patches;
 
   // patch_emb
-  size += (size_t)C * 3 * P * P * sizeof(floatx);
+  size += (size_t)embed_dim * 3 * P * P * sizeof(floatx);
   // patch_emb_b
-  size += (size_t)C * sizeof(floatx);
+  size += (size_t)embed_dim * sizeof(floatx);
 
-  // pos_embedding: linear (C -> N)
-  size += qtensor_size(C, N, quant);
+  // pos_embedding: linear (embed_dim -> n_patches)
+  size += qtensor_size(embed_dim, n_patches, quant);
 
   // each layer
   for (int l = 0; l < vcfg->n_layers; l++)
   {
     // n1, n1_b
-    size += (size_t)C * sizeof(floatx);
-    size += (size_t)C * sizeof(floatx);
+    size += (size_t)embed_dim * sizeof(floatx);
+    size += (size_t)embed_dim * sizeof(floatx);
 
-    // wq, wk, wv, wo: linear (C -> C)
-    size += qtensor_size(C, C, quant);
-    size += qtensor_size(C, C, quant);
-    size += qtensor_size(C, C, quant);
-    size += qtensor_size(C, C, quant);
+    // wq, wk, wv, wo: linear (embed_dim -> embed_dim)
+    size += qtensor_size(embed_dim, embed_dim, quant);
+    size += qtensor_size(embed_dim, embed_dim, quant);
+    size += qtensor_size(embed_dim, embed_dim, quant);
+    size += qtensor_size(embed_dim, embed_dim, quant);
 
     // bq, bk, bv, bo
-    size += (size_t)C * sizeof(floatx);
-    size += (size_t)C * sizeof(floatx);
-    size += (size_t)C * sizeof(floatx);
-    size += (size_t)C * sizeof(floatx);
+    size += (size_t)embed_dim * sizeof(floatx);
+    size += (size_t)embed_dim * sizeof(floatx);
+    size += (size_t)embed_dim * sizeof(floatx);
+    size += (size_t)embed_dim * sizeof(floatx);
 
     // n2, n2_b
-    size += (size_t)C * sizeof(floatx);
-    size += (size_t)C * sizeof(floatx);
+    size += (size_t)embed_dim * sizeof(floatx);
+    size += (size_t)embed_dim * sizeof(floatx);
 
-    // w1: linear (C -> CM), w2: linear (CM -> C)
-    size += qtensor_size(C, CM, quant);
-    size += qtensor_size(CM, C, quant);
+    // w1: linear (embed_dim -> mlp_dim), w2: linear (mlp_dim -> embed_dim)
+    size += qtensor_size(embed_dim, mlp_dim, quant);
+    size += qtensor_size(mlp_dim, embed_dim, quant);
 
-    // b1 (CM), b2 (C)
-    size += (size_t)CM * sizeof(floatx);
-    size += (size_t)C * sizeof(floatx);
+    // b1 (mlp_dim), b2 (embed_dim)
+    size += (size_t)mlp_dim * sizeof(floatx);
+    size += (size_t)embed_dim * sizeof(floatx);
   }
 
   // post_norm, post_norm_b
-  size += (size_t)C * sizeof(floatx);
-  size += (size_t)C * sizeof(floatx);
+  size += (size_t)embed_dim * sizeof(floatx);
+  size += (size_t)embed_dim * sizeof(floatx);
 
   // norm
-  size += (size_t)C * sizeof(floatx);
+  size += (size_t)embed_dim * sizeof(floatx);
 
-  // proj: linear (C -> cfg->embed_dim)
-  size += qtensor_size(C, cfg->embed_dim, quant);
+  // proj: linear (embed_dim -> tcfg->embed_dim)
+  size += qtensor_size(embed_dim, tcfg->embed_dim, quant);
 
   return size;
 }
@@ -3928,25 +3920,26 @@ free_vision_encoder_wrapper(VisionEncoder *enc, bool free_cfg)
 
 /* */
 static VisionEncoder *
-read_vision_encoder(FILE *fp, TextConfig *cfg, VisionConfig *vcfg, bool quant)
+read_vision_encoder(FILE *fp, TextConfig *tcfg, VisionConfig *vcfg, bool quant)
 {
   VisionEncoder *enc;
   if (!(enc = calloc_ckd(1, sizeof(*enc)))) goto fail;
 
   enc->config = vcfg;
 
-  int P  = vcfg->patch_size;
-  int C  = vcfg->hidden_dim;
-  int CM = vcfg->mlp_dim;
-  int N  = vcfg->image_size / P;
+  int P         = vcfg->patch_size;
+  int embed_dim = vcfg->hidden_dim;
+  int mlp_dim   = vcfg->mlp_dim;
+  int n_patches = vcfg->image_size / P;
 
-  N *= N;
+  n_patches *= n_patches;
 
   if (!(enc->patch_emb =
-          read_tensor_ckd((size_t)C * 3 * P * P, sizeof(floatx), fp)) ||
-      !(enc->patch_emb_b = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
-      // Same as here, the real shape is (N, C)
-      !(enc->pos_embedding = read_qtensor(fp, C, N, quant)) ||
+          read_tensor_ckd((size_t)embed_dim * 3 * P * P, sizeof(floatx), fp)) ||
+      !(enc->patch_emb_b =
+          read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
+      // Same as here, the real shape is (n_patches, embed_dim)
+      !(enc->pos_embedding = read_qtensor(fp, embed_dim, n_patches, quant)) ||
       !(enc->layers = calloc_ckd(
           vcfg->n_layers, sizeof(*enc->layers)  // NOLINT
         )))
@@ -3963,27 +3956,27 @@ read_vision_encoder(FILE *fp, TextConfig *cfg, VisionConfig *vcfg, bool quant)
 
     if (
       // First LayerNorm
-      !(layer->n1 = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
-      !(layer->n1_b = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      !(layer->n1 = read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
+      !(layer->n1_b = read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
       // Attention weights
-      !(layer->wq = read_qtensor(fp, C, C, quant)) ||
-      !(layer->wk = read_qtensor(fp, C, C, quant)) ||
-      !(layer->wv = read_qtensor(fp, C, C, quant)) ||
-      !(layer->wo = read_qtensor(fp, C, C, quant)) ||
+      !(layer->wq = read_qtensor(fp, embed_dim, embed_dim, quant)) ||
+      !(layer->wk = read_qtensor(fp, embed_dim, embed_dim, quant)) ||
+      !(layer->wv = read_qtensor(fp, embed_dim, embed_dim, quant)) ||
+      !(layer->wo = read_qtensor(fp, embed_dim, embed_dim, quant)) ||
       // Attention biases
-      !(layer->bq = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
-      !(layer->bk = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
-      !(layer->bv = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
-      !(layer->bo = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      !(layer->bq = read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
+      !(layer->bk = read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
+      !(layer->bv = read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
+      !(layer->bo = read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
       // Second LayerNorm
-      !(layer->n2 = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
-      !(layer->n2_b = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+      !(layer->n2 = read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
+      !(layer->n2_b = read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
       // Feedforward weights
-      !(layer->w1 = read_qtensor(fp, C, CM, quant)) ||
-      !(layer->w2 = read_qtensor(fp, CM, C, quant)) ||
+      !(layer->w1 = read_qtensor(fp, embed_dim, mlp_dim, quant)) ||
+      !(layer->w2 = read_qtensor(fp, mlp_dim, embed_dim, quant)) ||
       // Feedforward biases
-      !(layer->b1 = read_tensor_ckd((size_t)CM, sizeof(floatx), fp)) ||
-      !(layer->b2 = read_tensor_ckd((size_t)C, sizeof(floatx), fp)))
+      !(layer->b1 = read_tensor_ckd((size_t)mlp_dim, sizeof(floatx), fp)) ||
+      !(layer->b2 = read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)))
       goto fail;
 
     enc->layers[l] = layer;
@@ -3991,12 +3984,14 @@ read_vision_encoder(FILE *fp, TextConfig *cfg, VisionConfig *vcfg, bool quant)
 
   if (
     // Post layernorm
-    !(enc->post_norm = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
-    !(enc->post_norm_b = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+    !(enc->post_norm =
+        read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
+    !(enc->post_norm_b =
+        read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
     // Soft embedding RMSNorm
-    !(enc->norm = read_tensor_ckd((size_t)C, sizeof(floatx), fp)) ||
+    !(enc->norm = read_tensor_ckd((size_t)embed_dim, sizeof(floatx), fp)) ||
     // Final projection
-    !(enc->proj = read_qtensor(fp, C, cfg->embed_dim, quant)))
+    !(enc->proj = read_qtensor(fp, embed_dim, tcfg->embed_dim, quant)))
     goto fail;
 
   return enc;
@@ -4009,7 +4004,7 @@ fail:
 /* */
 static VisionEncoder *
 mmap_vision_encoder(
-  void *data, TextConfig *cfg, VisionConfig *vcfg, size_t *offset, bool quant
+  void *data, TextConfig *tcfg, VisionConfig *vcfg, size_t *offset, bool quant
 )
 {
   VisionEncoder *enc;
@@ -4018,25 +4013,25 @@ mmap_vision_encoder(
 
   uint8_t *base = (uint8_t *)data;
 
-  int P  = vcfg->patch_size;
-  int C  = vcfg->hidden_dim;
-  int CM = vcfg->mlp_dim;
-  int N  = vcfg->image_size / P;
+  int P         = vcfg->patch_size;
+  int embed_dim = vcfg->hidden_dim;
+  int mlp_dim   = vcfg->mlp_dim;
+  int n_patches = vcfg->image_size / P;
 
-  N *= N;
+  n_patches *= n_patches;
 
-  // patch_emb: C * 3 * P * P floats
+  // patch_emb: embed_dim * 3 * P * P floats
   enc->patch_emb = (floatx *)(base + *offset);
-  *offset += (size_t)C * 3 * P * P * sizeof(floatx);
+  *offset += (size_t)embed_dim * 3 * P * P * sizeof(floatx);
 
-  // patch_emb_b: C floats
+  // patch_emb_b: embed_dim floats
   enc->patch_emb_b = (floatx *)(base + *offset);
-  *offset += (size_t)C * sizeof(floatx);
+  *offset += (size_t)embed_dim * sizeof(floatx);
 
-  // pos_embedding: linear (C -> N)
+  // pos_embedding: linear (embed_dim -> n_patches)
   if (!(enc->pos_embedding = calloc_ckd(1, sizeof(*enc->pos_embedding))))
     goto fail;
-  mmap_qtensor(enc->pos_embedding, base, offset, C, N, quant);
+  mmap_qtensor(enc->pos_embedding, base, offset, embed_dim, n_patches, quant);
 
   // layers array
   if (!(enc->layers = calloc_ckd(
@@ -4052,68 +4047,68 @@ mmap_vision_encoder(
 
     // n1, n1_b
     layer->n1 = (floatx *)(base + *offset);
-    *offset += (size_t)C * sizeof(floatx);
+    *offset += (size_t)embed_dim * sizeof(floatx);
     layer->n1_b = (floatx *)(base + *offset);
-    *offset += (size_t)C * sizeof(floatx);
+    *offset += (size_t)embed_dim * sizeof(floatx);
 
-    // attention weights: wq, wk, wv, wo (linear C -> C)
+    // attention weights: wq, wk, wv, wo (linear embed_dim -> embed_dim)
     if (!(layer->wq = calloc_ckd(1, sizeof(*layer->wq)))) goto fail;
-    mmap_qtensor(layer->wq, base, offset, C, C, quant);
+    mmap_qtensor(layer->wq, base, offset, embed_dim, embed_dim, quant);
 
     if (!(layer->wk = calloc_ckd(1, sizeof(*layer->wk)))) goto fail;
-    mmap_qtensor(layer->wk, base, offset, C, C, quant);
+    mmap_qtensor(layer->wk, base, offset, embed_dim, embed_dim, quant);
 
     if (!(layer->wv = calloc_ckd(1, sizeof(*layer->wv)))) goto fail;
-    mmap_qtensor(layer->wv, base, offset, C, C, quant);
+    mmap_qtensor(layer->wv, base, offset, embed_dim, embed_dim, quant);
 
     if (!(layer->wo = calloc_ckd(1, sizeof(*layer->wo)))) goto fail;
-    mmap_qtensor(layer->wo, base, offset, C, C, quant);
+    mmap_qtensor(layer->wo, base, offset, embed_dim, embed_dim, quant);
 
     // attention biases: bq, bk, bv, bo
     layer->bq = (floatx *)(base + *offset);
-    *offset += (size_t)C * sizeof(floatx);
+    *offset += (size_t)embed_dim * sizeof(floatx);
     layer->bk = (floatx *)(base + *offset);
-    *offset += (size_t)C * sizeof(floatx);
+    *offset += (size_t)embed_dim * sizeof(floatx);
     layer->bv = (floatx *)(base + *offset);
-    *offset += (size_t)C * sizeof(floatx);
+    *offset += (size_t)embed_dim * sizeof(floatx);
     layer->bo = (floatx *)(base + *offset);
-    *offset += (size_t)C * sizeof(floatx);
+    *offset += (size_t)embed_dim * sizeof(floatx);
 
     // n2, n2_b
     layer->n2 = (floatx *)(base + *offset);
-    *offset += (size_t)C * sizeof(floatx);
+    *offset += (size_t)embed_dim * sizeof(floatx);
     layer->n2_b = (floatx *)(base + *offset);
-    *offset += (size_t)C * sizeof(floatx);
+    *offset += (size_t)embed_dim * sizeof(floatx);
 
-    // feedforward weights: w1 (C -> CM), w2 (CM -> C)
+    // feedforward weights: w1 (embed_dim -> mlp_dim), w2 (mlp_dim -> embed_dim)
     if (!(layer->w1 = calloc_ckd(1, sizeof(*layer->w1)))) goto fail;
-    mmap_qtensor(layer->w1, base, offset, C, CM, quant);
+    mmap_qtensor(layer->w1, base, offset, embed_dim, mlp_dim, quant);
 
     if (!(layer->w2 = calloc_ckd(1, sizeof(*layer->w2)))) goto fail;
-    mmap_qtensor(layer->w2, base, offset, CM, C, quant);
+    mmap_qtensor(layer->w2, base, offset, mlp_dim, embed_dim, quant);
 
-    // feedforward biases: b1 (CM), b2 (C)
+    // feedforward biases: b1 (mlp_dim), b2 (embed_dim)
     layer->b1 = (floatx *)(base + *offset);
-    *offset += (size_t)CM * sizeof(floatx);
+    *offset += (size_t)mlp_dim * sizeof(floatx);
     layer->b2 = (floatx *)(base + *offset);
-    *offset += (size_t)C * sizeof(floatx);
+    *offset += (size_t)embed_dim * sizeof(floatx);
 
     enc->layers[l] = layer;
   }
 
   // post_norm, post_norm_b
   enc->post_norm = (floatx *)(base + *offset);
-  *offset += (size_t)C * sizeof(floatx);
+  *offset += (size_t)embed_dim * sizeof(floatx);
   enc->post_norm_b = (floatx *)(base + *offset);
-  *offset += (size_t)C * sizeof(floatx);
+  *offset += (size_t)embed_dim * sizeof(floatx);
 
   // norm
   enc->norm = (floatx *)(base + *offset);
-  *offset += (size_t)C * sizeof(floatx);
+  *offset += (size_t)embed_dim * sizeof(floatx);
 
-  // proj: linear (C -> embed_dim)
+  // proj: linear (embed_dim -> embed_dim)
   if (!(enc->proj = calloc_ckd(1, sizeof(*enc->proj)))) goto fail;
-  mmap_qtensor(enc->proj, base, offset, C, cfg->embed_dim, quant);
+  mmap_qtensor(enc->proj, base, offset, embed_dim, tcfg->embed_dim, quant);
 
   return enc;
 
@@ -4201,7 +4196,7 @@ mmap_gemma_model(const char *filename, bool enable_mm)
 {
   FILE         *fp         = fopen(filename, "rb");
   GemmaModel   *model      = NULL;
-  TextConfig   *cfg        = NULL;
+  TextConfig   *tcfg       = NULL;
   VisionConfig *vcfg       = NULL;
   bool          cfg_owned  = false;
   bool          vcfg_owned = false;
@@ -4220,8 +4215,8 @@ mmap_gemma_model(const char *filename, bool enable_mm)
   model->quant = (bool)quant;
 
   // Text config
-  cfg = read_text_config(fp, &model->support_mm);
-  if (cfg == NULL) goto fail;
+  tcfg = read_text_config(fp, &model->support_mm);
+  if (tcfg == NULL) goto fail;
 
   bool use_mm = model->support_mm && enable_mm;
 
@@ -4241,7 +4236,7 @@ mmap_gemma_model(const char *filename, bool enable_mm)
   }
 
   // Tokenizer
-  GemmaTokenizer *tok = read_tokenizer(fp, cfg, model->support_mm);
+  GemmaTokenizer *tok = read_tokenizer(fp, tcfg, model->support_mm);
   if (tok == NULL) goto fail;
   model->tokenizer = tok;
 
@@ -4261,10 +4256,10 @@ mmap_gemma_model(const char *filename, bool enable_mm)
   }
 
   // Get the total amount of bytes for the weights
-  size_t mmap_size = offset + get_text_decoder_size(cfg, model->quant);
+  size_t mmap_size = offset + get_text_decoder_size(tcfg, model->quant);
   if (use_mm)
   {
-    mmap_size += get_vision_encoder_size(vcfg, cfg, model->quant);
+    mmap_size += get_vision_encoder_size(vcfg, tcfg, model->quant);
   }
 
   void *data = mmap(NULL, mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -4280,11 +4275,11 @@ mmap_gemma_model(const char *filename, bool enable_mm)
   close(fd);
 
   // Text decoder
-  TextDecoder *dec = mmap_text_decoder(data, cfg, &offset, model->quant);
+  TextDecoder *dec = mmap_text_decoder(data, tcfg, &offset, model->quant);
   if (dec == NULL) goto fail;
   model->decoder = dec;
   cfg_owned      = true;
-  cfg            = NULL;
+  tcfg           = NULL;
 
   // Vision encoder
   if (use_mm)
@@ -4306,7 +4301,7 @@ fail:
   }
   if (!cfg_owned)
   {
-    free_text_config(cfg);
+    free_text_config(tcfg);
   }
   if (!vcfg_owned)
   {
@@ -4322,7 +4317,7 @@ read_gemma_model(const char *filename, bool enable_mm)
 {
   FILE         *fp         = fopen(filename, "rb");
   GemmaModel   *model      = NULL;
-  TextConfig   *cfg        = NULL;
+  TextConfig   *tcfg       = NULL;
   VisionConfig *vcfg       = NULL;
   bool          cfg_owned  = false;
   bool          vcfg_owned = false;
@@ -4340,8 +4335,8 @@ read_gemma_model(const char *filename, bool enable_mm)
   model->quant = (bool)quant;
 
   // Text config
-  cfg = read_text_config(fp, &model->support_mm);
-  if (cfg == NULL) goto fail;
+  tcfg = read_text_config(fp, &model->support_mm);
+  if (tcfg == NULL) goto fail;
 
   bool use_mm = model->support_mm && enable_mm;
 
@@ -4361,16 +4356,16 @@ read_gemma_model(const char *filename, bool enable_mm)
   }
 
   // Tokenizer
-  GemmaTokenizer *tok = read_tokenizer(fp, cfg, model->support_mm);
+  GemmaTokenizer *tok = read_tokenizer(fp, tcfg, model->support_mm);
   if (tok == NULL) goto fail;
   model->tokenizer = tok;
 
   // Text decoder
-  TextDecoder *dec = read_text_decoder(fp, cfg, model->quant);
+  TextDecoder *dec = read_text_decoder(fp, tcfg, model->quant);
   if (dec == NULL) goto fail;
   model->decoder = dec;
-  cfg_owned      = true;  // cfg is now owned by dec
-  cfg            = NULL;
+  cfg_owned      = true;  // tcfg is now owned by dec
+  tcfg           = NULL;
 
   // Vision encoder
   if (use_mm)
@@ -4393,7 +4388,7 @@ fail:
   }
   if (!cfg_owned)
   {
-    free_text_config(cfg);
+    free_text_config(tcfg);
   }
   if (!vcfg_owned)
   {
@@ -4405,172 +4400,189 @@ fail:
 
 // Runtime buffers (allocated once, reused every step)
 
-/**
- * SigLIP vision model runtime buffer
- * N       = n_patches
- * C       = hidden_dim
- * CM      = mlp_dim
- * tpi     = image_toks
- * C_embed = embed_dim
- */
 typedef struct
 {
-  int8_t *x_i8;        // (N, C)
-  floatx *x_scales;    // (N,)
-  int8_t *mlp_i8;      // (N, CM)
-  floatx *mlp_scales;  // (N)
+  int8_t *x_i8;        // (n_patches, embed_dim)
+  floatx *x_scales;    // (n_patches,)
+  int8_t *mlp_i8;      // (n_patches, mlp_dim)
+  floatx *mlp_scales;  // (n_patches)
 
-  floatx *x;           // (N, C)
-  floatx *resid;       // (N, C)
-  floatx *xq;          // (N, C)
-  floatx *xk;          // (N, C)
-  floatx *xv;          // (N, C)
-  floatx *att_out;     // (N, C)
-  floatx *mlp_hidden;  // (N, CM)
-  floatx *scores;      // (NH, N, N)
+  floatx *x;           // (n_patches, embed_dim)
+  floatx *resid;       // (n_patches, embed_dim)
+  floatx *xq;          // (n_patches, embed_dim)
+  floatx *xk;          // (n_patches, embed_dim)
+  floatx *xv;          // (n_patches, embed_dim)
+  floatx *att_out;     // (n_patches, embed_dim)
+  floatx *mlp_hidden;  // (n_patches, mlp_dim)
+  floatx *scores;      // (n_heads, n_patches, n_patches)
 } VisionBuffer;
 
 /* */
 void
-free_vision_buffer(VisionBuffer *buf, bool quant)
+free_vision_buffer(VisionBuffer *vbuf, bool quant)
 {
-  if (buf == NULL) return;
+  if (vbuf == NULL) return;
   if (quant)
   {
-    free(buf->x_i8);
-    free(buf->x_scales);
-    free(buf->mlp_i8);
-    free(buf->mlp_scales);
+    free(vbuf->x_i8);
+    free(vbuf->x_scales);
+    free(vbuf->mlp_i8);
+    free(vbuf->mlp_scales);
   }
-  free(buf->x);
-  free(buf->resid);
-  free(buf->xq);
-  free(buf->xk);
-  free(buf->xv);
-  free(buf->att_out);
-  free(buf->mlp_hidden);
-  free(buf->scores);
-  free(buf);
+  free(vbuf->x);
+  free(vbuf->resid);
+  free(vbuf->xq);
+  free(vbuf->xk);
+  free(vbuf->xv);
+  free(vbuf->att_out);
+  free(vbuf->mlp_hidden);
+  free(vbuf->scores);
+  free(vbuf);
+}
+
+size_t
+get_vision_buffer_size(VisionConfig *vcfg, bool quant)
+{
+  size_t size = 0;
+
+  int ppi       = vcfg->image_size / vcfg->patch_size;
+  int n_patches = ppi * ppi;
+
+  // Quantized buffers
+  if (quant)
+  {
+    size += n_patches * (
+      sizeof(int8_t) * (vcfg->hidden_dim + vcfg->mlp_dim) +  // x_i8 & mlp_i8
+      sizeof(floatx) * 2  // x_scales & mlp_scales
+    );
+  }
+
+  // Main buffers
+  size += n_patches * sizeof(floatx) * (
+    vcfg->hidden_dim * 6 +     // x & resid & xq & xk & xv & att_out
+    vcfg->mlp_dim +            // mlp_hidden
+    n_patches * vcfg->n_heads  // scores
+  );
+
+  return size;
 }
 
 /* */
 VisionBuffer *
 malloc_vision_buffer(VisionConfig *vcfg, bool quant)
 {
-  VisionBuffer *buf = NULL;
-  if (!(buf = calloc_ckd(1, sizeof(*buf)))) goto fail;
+  VisionBuffer *vbuf = NULL;
+  if (!(vbuf = calloc_ckd(1, sizeof(*vbuf)))) goto fail;
 
-  size_t C   = (size_t)vcfg->hidden_dim;
-  size_t ppi = (size_t)vcfg->image_size / vcfg->patch_size;
-  size_t N   = (size_t)ppi * ppi;
-  size_t CM  = (size_t)vcfg->mlp_dim;
-  size_t NH  = (size_t)vcfg->n_heads;
+  size_t embed_dim = (size_t)vcfg->hidden_dim;
+  size_t ppi       = (size_t)vcfg->image_size / vcfg->patch_size;
+  size_t n_patches = (size_t)ppi * ppi;
+  size_t mlp_dim   = (size_t)vcfg->mlp_dim;
+  size_t n_heads   = (size_t)vcfg->n_heads;
 
   if (quant)
   {
     // Quantization buffers
-    if (!(buf->x_i8 = malloc_ckd(N * C, sizeof(*buf->x_i8))) ||
-        !(buf->mlp_i8 = malloc_ckd(N * CM, sizeof(*buf->mlp_i8))) ||
-        !(buf->x_scales = malloc_ckd(N, sizeof(*buf->x_scales))) ||
-        !(buf->mlp_scales = malloc_ckd(N, sizeof(*buf->mlp_scales))))
+    if (!(vbuf->x_i8 =
+            malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->x_i8))) ||
+        !(vbuf->mlp_i8 =
+            malloc_ckd(n_patches * mlp_dim, sizeof(*vbuf->mlp_i8))) ||
+        !(vbuf->x_scales = malloc_ckd(n_patches, sizeof(*vbuf->x_scales))) ||
+        !(vbuf->mlp_scales = malloc_ckd(n_patches, sizeof(*vbuf->mlp_scales))))
       goto fail;
   }
 
-  if (!(buf->x = malloc_ckd(N * C, sizeof(*buf->x))) ||
-      !(buf->resid = malloc_ckd(N * C, sizeof(*buf->resid))) ||
-      !(buf->xq = malloc_ckd(N * C, sizeof(*buf->xq))) ||
-      !(buf->xk = malloc_ckd(N * C, sizeof(*buf->xk))) ||
-      !(buf->xv = malloc_ckd(N * C, sizeof(*buf->xv))) ||
-      !(buf->att_out = malloc_ckd(N * C, sizeof(*buf->att_out))) ||
-      !(buf->mlp_hidden = malloc_ckd(N * CM, sizeof(*buf->mlp_hidden))) ||
-      !(buf->scores = malloc_ckd(NH * N * N, sizeof(*buf->scores))))
+  if (!(vbuf->x = malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->x))) ||
+      !(vbuf->resid =
+          malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->resid))) ||
+      !(vbuf->xq = malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->xq))) ||
+      !(vbuf->xk = malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->xk))) ||
+      !(vbuf->xv = malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->xv))) ||
+      !(vbuf->att_out =
+          malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->att_out))) ||
+      !(vbuf->mlp_hidden =
+          malloc_ckd(n_patches * mlp_dim, sizeof(*vbuf->mlp_hidden))) ||
+      !(vbuf->scores =
+          malloc_ckd(n_heads * n_patches * n_patches, sizeof(*vbuf->scores))))
     goto fail;
 
-  return buf;
+  return vbuf;
 
 fail:
-  free_vision_buffer(buf, quant);
+  free_vision_buffer(vbuf, quant);
   return NULL;
 }
 
-/**
- * Gemma language model runtime buffer
- * T     = number of input tokens (used in prefilling)
- * L     = n_layers
- * C     = embed_dim
- * CM    = mlp_dim
- * NH    = n_heads
- * NH_kv = n_kv_heads
- */
+/* Gemma language model runtime buffer */
 typedef struct
 {
   int cache_len;
 
   // Temporary quantized activations (when quant=true)
-  int8_t *x_i8;       // ([T], C,)
-  floatx *x_scales;   // ([T],)
-  int8_t *xo_i8;      // (NH, [T], CH)
-  floatx *xo_scales;  // ([T],)
-  int8_t *xg_i8;      // ([T], CM,)
-  floatx *xg_scales;  // ([T],)
+  int8_t *x_i8;       // ([n_tokens], embed_dim,)
+  floatx *x_scales;   // ([n_tokens],)
+  int8_t *xo_i8;      // (n_heads, [n_tokens], head_dim)
+  floatx *xo_scales;  // ([n_tokens],)
+  int8_t *xg_i8;      // ([n_tokens], mlp_dim,)
+  floatx *xg_scales;  // ([n_tokens],)
 
   // Pre-computed cos/sin for RoPE
-  floatx *csfreqs_slid;  // ([T], CH / 2, 2)
-  floatx *csfreqs_full;  // ([T], CH / 2, 2)
+  floatx *csfreqs_slid;  // ([n_tokens], head_dim / 2, 2)
+  floatx *csfreqs_full;  // ([n_tokens], head_dim / 2, 2)
 
   // Residual stream
-  floatx *x;      // ([T], C,)
-  floatx *resid;  // ([T], C,)
+  floatx *x;      // ([n_tokens], embed_dim,)
+  floatx *resid;  // ([n_tokens], embed_dim,)
 
   // Attention buffers
-  floatx *xq;        // (NH, [T], CH)
-  floatx *xk;        // (NH_kv, [T], CH)
-  floatx *xv;        // (NH_kv, CH, [T])
-  floatx *xo;        // ([T], NH, CH)
-  floatx *att;       // (NH, [T], cache_len)
-  floatx *kv_cache;  // (L, 2, NH_kv, cache_len, CH)
+  floatx *xq;        // (n_heads, [n_tokens], head_dim)
+  floatx *xk;        // (n_kv_heads, [n_tokens], head_dim)
+  floatx *xv;        // (n_kv_heads, head_dim, [n_tokens])
+  floatx *xo;        // ([n_tokens], n_heads, head_dim)
+  floatx *att;       // (n_heads, [n_tokens], cache_len)
+  floatx *kv_cache;  // (n_layers, 2, n_kv_heads, cache_len, head_dim)
 
   // MLP buffers
-  floatx *xg;      // ([T], CM,)
-  floatx *xu;      // ([T], CM,)
+  floatx *xg;      // ([n_tokens], mlp_dim,)
+  floatx *xu;      // ([n_tokens], mlp_dim,)
   floatx *logits;  // (vocab_size,)
 } TextBuffer;
 
 /* */
 void
-free_text_buffer(TextBuffer *buf, bool quant)
+free_text_buffer(TextBuffer *tbuf, bool quant)
 {
-  if (buf == NULL) return;
+  if (tbuf == NULL) return;
 
-  free(buf->x);
-  free(buf->resid);
-  free(buf->xq);
-  free(buf->xk);
-  free(buf->csfreqs_slid);
-  free(buf->csfreqs_full);
-  free(buf->xv);
-  free(buf->xo);
-  free(buf->att);
-  free(buf->kv_cache);
-  free(buf->xg);
-  free(buf->xu);
-  free(buf->logits);
+  free(tbuf->x);
+  free(tbuf->resid);
+  free(tbuf->xq);
+  free(tbuf->xk);
+  free(tbuf->csfreqs_slid);
+  free(tbuf->csfreqs_full);
+  free(tbuf->xv);
+  free(tbuf->xo);
+  free(tbuf->att);
+  free(tbuf->kv_cache);
+  free(tbuf->xg);
+  free(tbuf->xu);
+  free(tbuf->logits);
   if (quant)
   {
-    free(buf->x_i8);
-    free(buf->x_scales);
-    free(buf->xo_i8);
-    free(buf->xo_scales);
-    free(buf->xg_i8);
-    free(buf->xg_scales);
+    free(tbuf->x_i8);
+    free(tbuf->x_scales);
+    free(tbuf->xo_i8);
+    free(tbuf->xo_scales);
+    free(tbuf->xg_i8);
+    free(tbuf->xg_scales);
   }
-  free(buf);
+  free(tbuf);
 }
 
 /* */
-TextBuffer *
-malloc_text_buffer(
-  TextConfig   *cfg,
+size_t
+get_text_buffer_size(
+  TextConfig   *tcfg,
   VisionConfig *vcfg,
   int           cache_len,
   int           chunk_size,
@@ -4578,27 +4590,70 @@ malloc_text_buffer(
   bool          quant
 )
 {
-  TextBuffer *buf = NULL;
-  if (!(buf = calloc_ckd(1, sizeof(*buf)))) goto fail;  // Init to all NULL
+  size_t size    = 0;
+  int    q_size  = tcfg->n_heads * tcfg->head_dim;
+  int    kv_size = tcfg->n_kv_heads * tcfg->head_dim;
+  int    ppi     = vcfg->image_size / vcfg->patch_size;
+  int    mult    = use_mm ? max(ppi * ppi, chunk_size) : chunk_size;
 
-  buf->cache_len = cache_len;
+  // Quantized buffers
+  if (quant)
+  {
+    // x_i8 & xo_i8 & xg_i8
+    size += sizeof(int8_t) * (tcfg->embed_dim + q_size + tcfg->mlp_dim);
+  }
 
-  int C  = cfg->embed_dim;
-  int L  = cfg->n_layers;
-  int CH = cfg->head_dim;
-  int NH = cfg->n_heads;
-  int CM = cfg->mlp_dim;
+  // Main buffers
+  size += sizeof(floatx) * (
+    tcfg->n_layers * 2 * cache_len * kv_size +  // kv_cache
+    tcfg->vocab_size +                          // logits
+    mult * tcfg->embed_dim +                    // x
+    mult * tcfg->embed_dim +                    // resid
+    mult * q_size +                             // xq
+    mult * kv_size +                            // xk
+    mult * tcfg->head_dim +                     // csfreqs_slid
+    mult * tcfg->head_dim +                     // csfreqs_full
+    mult * kv_size +                            // xv
+    mult * q_size +                             // xo
+    mult * tcfg->n_heads * cache_len +          // att
+    mult * tcfg->mlp_dim +                      // xg
+    mult * tcfg->mlp_dim                        // xu
+  );
 
-  int Cq  = NH * CH;
-  int Ckv = cfg->n_kv_heads * CH;
+  return size;
+}
 
-  if (!(buf->kv_cache = malloc_ckd(
-          (size_t)L * 2 * (size_t)cache_len * (size_t)Ckv,
-          sizeof(*buf->kv_cache)
+/* */
+TextBuffer *
+malloc_text_buffer(
+  TextConfig   *tcfg,
+  VisionConfig *vcfg,
+  int           cache_len,
+  int           chunk_size,
+  bool          use_mm,
+  bool          quant
+)
+{
+  TextBuffer *tbuf = NULL;
+  if (!(tbuf = calloc_ckd(1, sizeof(*tbuf)))) goto fail;  // Init to all NULL
+
+  tbuf->cache_len = cache_len;
+
+  int embed_dim = tcfg->embed_dim;
+  int n_layers  = tcfg->n_layers;
+  int head_dim  = tcfg->head_dim;
+  int n_heads   = tcfg->n_heads;
+  int mlp_dim   = tcfg->mlp_dim;
+  int q_size    = n_heads * head_dim;
+  int kv_size   = tcfg->n_kv_heads * head_dim;
+
+  if (!(tbuf->kv_cache = malloc_ckd(
+          (size_t)n_layers * 2 * (size_t)cache_len * (size_t)kv_size,
+          sizeof(*tbuf->kv_cache)
         )))
     goto fail;
 
-  if (!(buf->logits = malloc_ckd(cfg->vocab_size, sizeof(*buf->logits))))
+  if (!(tbuf->logits = malloc_ckd(tcfg->vocab_size, sizeof(*tbuf->logits))))
     goto fail;
 
   int mult = chunk_size;
@@ -4606,40 +4661,41 @@ malloc_text_buffer(
   // Multimodal models need space for a whole image worth of tokens
   if (use_mm && vcfg != NULL)
   {
-    mult = max(mult, cfg->image_toks);
+    mult = max(mult, tcfg->image_toks);
   }
 
   if (quant)
   {
     // Quantization buffers
-    if (!(buf->x_i8 = malloc_ckd(mult * C, sizeof(*buf->x_i8))) ||
-        !(buf->xo_i8 = malloc_ckd(mult * Cq, sizeof(*buf->xo_i8))) ||
-        !(buf->xg_i8 = malloc_ckd(mult * CM, sizeof(*buf->xg_i8))) ||
-        !(buf->x_scales = malloc_ckd(mult, sizeof(*buf->x_scales))) ||
-        !(buf->xo_scales = malloc_ckd(mult, sizeof(*buf->xo_scales))) ||
-        !(buf->xg_scales = malloc_ckd(mult, sizeof(*buf->xg_scales))))
+    if (!(tbuf->x_i8 = malloc_ckd(mult * embed_dim, sizeof(*tbuf->x_i8))) ||
+        !(tbuf->xo_i8 = malloc_ckd(mult * q_size, sizeof(*tbuf->xo_i8))) ||
+        !(tbuf->xg_i8 = malloc_ckd(mult * mlp_dim, sizeof(*tbuf->xg_i8))) ||
+        !(tbuf->x_scales = malloc_ckd(mult, sizeof(*tbuf->x_scales))) ||
+        !(tbuf->xo_scales = malloc_ckd(mult, sizeof(*tbuf->xo_scales))) ||
+        !(tbuf->xg_scales = malloc_ckd(mult, sizeof(*tbuf->xg_scales))))
       goto fail;
   }
 
-  if (!(buf->x = malloc_ckd(mult * C, sizeof(*buf->x))) ||
-      !(buf->resid = malloc_ckd(mult * C, sizeof(*buf->resid))) ||
-      !(buf->xq = malloc_ckd(mult * Cq, sizeof(*buf->xq))) ||
-      !(buf->xk = malloc_ckd(mult * Ckv, sizeof(*buf->xk))) ||
-      !(buf->csfreqs_slid =
-          malloc_ckd(mult * CH, sizeof(*buf->csfreqs_slid))) ||
-      !(buf->csfreqs_full =
-          malloc_ckd(mult * CH, sizeof(*buf->csfreqs_full))) ||
-      !(buf->xv = malloc_ckd(mult * Ckv, sizeof(*buf->xv))) ||
-      !(buf->xo = malloc_ckd(mult * Cq, sizeof(*buf->xo))) ||
-      !(buf->att = malloc_ckd(mult * NH * cache_len, sizeof(*buf->att))) ||
-      !(buf->xg = malloc_ckd(mult * CM, sizeof(*buf->xg))) ||
-      !(buf->xu = malloc_ckd(mult * CM, sizeof(*buf->xu))))
+  if (!(tbuf->x = malloc_ckd(mult * embed_dim, sizeof(*tbuf->x))) ||
+      !(tbuf->resid = malloc_ckd(mult * embed_dim, sizeof(*tbuf->resid))) ||
+      !(tbuf->xq = malloc_ckd(mult * q_size, sizeof(*tbuf->xq))) ||
+      !(tbuf->xk = malloc_ckd(mult * kv_size, sizeof(*tbuf->xk))) ||
+      !(tbuf->csfreqs_slid =
+          malloc_ckd(mult * head_dim, sizeof(*tbuf->csfreqs_slid))) ||
+      !(tbuf->csfreqs_full =
+          malloc_ckd(mult * head_dim, sizeof(*tbuf->csfreqs_full))) ||
+      !(tbuf->xv = malloc_ckd(mult * kv_size, sizeof(*tbuf->xv))) ||
+      !(tbuf->xo = malloc_ckd(mult * q_size, sizeof(*tbuf->xo))) ||
+      !(tbuf->att =
+          malloc_ckd(mult * n_heads * cache_len, sizeof(*tbuf->att))) ||
+      !(tbuf->xg = malloc_ckd(mult * mlp_dim, sizeof(*tbuf->xg))) ||
+      !(tbuf->xu = malloc_ckd(mult * mlp_dim, sizeof(*tbuf->xu))))
     goto fail;
 
-  return buf;
+  return tbuf;
 
 fail:
-  free_text_buffer(buf, quant);
+  free_text_buffer(tbuf, quant);
   return NULL;
 }
 
@@ -4715,8 +4771,10 @@ layernorm(
   }
 }
 
-/* Symmetric per-vector quantization into int8 [-127, 127]
- * Q(fpx src (dim,)) ~= int8 dst (dim,) * fpx vec_scale (1,) */
+/**
+ * Symmetric per-vector quantization into int8 [-127, 127]
+ * Q(fpx src (dim,)) ~= int8 dst (dim,) * fpx vec_scale (1,)
+ */
 static floatx
 quantize_act(int8_t *dst, const floatx *vec, int dim)
 {
@@ -4752,8 +4810,10 @@ quantize_act(int8_t *dst, const floatx *vec, int dim)
   return (floatx)vec_scale;
 }
 
-/* Symmetric int8 quantization for a matrix of rows
- * Q(fpx src (m, n)) ~= int8 dst (m, n) * fpx dst_scales (m,) */
+/**
+ * Symmetric int8 quantization for a matrix of rows
+ * Q(fpx src (m, n)) ~= int8 dst (m, n) * fpx dst_scales (m,)
+ */
 static void
 quantize_acts(
   int8_t *RESTRICT       dst,
@@ -4773,7 +4833,7 @@ quantize_acts(
   if (omp)
   {
     int i;
-    #pragma omp parallel for OMP_PARALLEL_ARGS
+    #pragma omp parallel for OMP_PARA_ARGS
     for (i = 0; i < m; i++)
     {
       dst_scales[i] = quantize_act(dst + i * n, src + i * src_stride, n);
@@ -4802,9 +4862,11 @@ gemv_fpx_row(
   return (floatx)sum;
 }
 
-/* fpx matrix-vector multiply (NT)
- * fpx vec (n,) @ fpx mat (m, n).T = fpx dst (m,) */
- NO_FAST_MATH_BEGIN
+/**
+ * fpx matrix-vector multiply (NT)
+ * fpx vec (n,) @ fpx mat (m, n).T = fpx dst (m,)
+ */
+NO_FAST_MATH_BEGIN
 static void
 gemv_fpx(
   floatx *RESTRICT       dst,
@@ -4819,7 +4881,7 @@ gemv_fpx(
   {
     int i;  // Loop vars are not automatically privatized in MSVC, have to keep
             // it explicit
-    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(i) OMP_PARA_ARGS
     for (i = 0; i < m; i++)
     {
       dst[i] = gemv_fpx_row(vec, mat, n, i);
@@ -4853,9 +4915,11 @@ gemv_int8_row(
   return (floatx)((float)sum * (float)vec_scale * (float)mat_scales[i]);
 }
 
-/* int8 matrix-vector multiply + dequant (NT)
+/**
+ * int8 matrix-vector multiply + dequant (NT)
  *   (int8 vec (n,)   * fpx vec_scale  (1,))
- * @ (int8 mat (m, n) * fpx mat_scales (m,)).T = fpx dst (m,) */
+ * @ (int8 mat (m, n) * fpx mat_scales (m,)).T = fpx dst (m,)
+ */
 static void
 gemv_int8(
   floatx *RESTRICT       dst,
@@ -4871,7 +4935,7 @@ gemv_int8(
   if (omp)
   {
     int i;
-    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(i) OMP_PARA_ARGS
     for (i = 0; i < m; i++)
     {
       dst[i] = gemv_int8_row(vec, vec_scale, mat, mat_scales, n, i);
@@ -4929,10 +4993,12 @@ gemv_fpx_nn(
   }
 }
 
-/* Copy `rows` rows (stride `row_stride`, length k each) of `src` into a
+/**
+ * Copy `rows` rows (stride `row_stride`, length k each) of `src` into a
  * contiguous, already-upcast-to-float buffer laid out as `packed[l*rows + r]`,
  * so the micro-kernel can read all `rows` values for a fixed `l` with one
- * contiguous load instead of `rows` separate strided reads. */
+ * contiguous load instead of `rows` separate strided reads.
+ */
 static inline void
 pack_panel(
   float *RESTRICT        packed,
@@ -4952,9 +5018,11 @@ pack_panel(
   }
 }
 
-/* Pack every R-row panel of a (total_rows x k) matrix, back to back, into one
+/**
+ * Pack every R-row panel of a (total_rows x k) matrix, back to back, into one
  * contiguous buffer. Parallelized because for large prefill chunks this alone
- * touches every element of `mat` once. */
+ * touches every element of `mat` once.
+ */
 static void
 pack_all(
   float *RESTRICT        packed_full,
@@ -4969,7 +5037,7 @@ pack_all(
   if (omp)
   {
     int b;
-    #pragma omp parallel for private(b) OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(b) OMP_PARA_ARGS
     for (b = 0; b < total_rows; b += R)
     {
       pack_panel(
@@ -4988,12 +5056,14 @@ pack_all(
   }
 }
 
-/* Compute one 8x8 tile of dst = src @ mat.T from PACKED, contiguous
+/**
+ * Compute one 8x8 tile of dst = src @ mat.T from PACKED, contiguous
  * MR/NR-major panels (see pack_panel/pack_all). The 64 FMAs are spelled out by
  * hand rather than as a nested i/j loop. GCC vectorizes the nested-loop form
  * just fine, but Clang's optimizer can only produces good code once the
  * accumulation is fully unrolled with compile-time-constant indices :'D. So I
- * just hardcoded for 8x8. */
+ * just hardcoded for 8x8.
+ */
 static inline void
 gemm_fpx_kernel(
   floatx *RESTRICT      dst,
@@ -5110,7 +5180,7 @@ gemm_fpx_scalar(
   if (omp)
   {
     int i, j;
-    #pragma omp parallel for private(i, j) OMP_COLLAPSE2 OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(i, j) OMP_COLLAPSE2 OMP_PARA_ARGS
     for (i = 0; i < m; i++)
       for (j = 0; j < n; j++)
       {
@@ -5137,7 +5207,7 @@ _Thread_local static size_t gemm_fpx_pack_scratch_cap = 0;  // in floats
 
 /* */
 static float *
-gemm_pack_scratch_get(size_t needed_floats)
+gemm_fpx_pack_scratch_get(size_t needed_floats)
 {
   if (needed_floats > gemm_fpx_pack_scratch_cap)
   {
@@ -5149,9 +5219,11 @@ gemm_pack_scratch_get(size_t needed_floats)
   return gemm_fpx_pack_scratch;
 }
 
-/* fpx matrix-matrix multiply (NT)
- * fpx src (m, k) @ fpx mat.T (k, n) = fpx dst (m, n) */
-static void
+/**
+ * fpx matrix-matrix multiply (NT)
+ * fpx src (m, k) @ fpx mat.T (k, n) = fpx dst (m, n)
+ */
+static int
 gemm_fpx(
   floatx *RESTRICT       dst,
   int                    dst_stride,
@@ -5175,11 +5247,11 @@ gemm_fpx(
   if (m_full > 0 && n_full > 0)
   {
     size_t needed  = (size_t)(m_full + n_full) * k;
-    float *scratch = gemm_pack_scratch_get(needed);
+    float *scratch = gemm_fpx_pack_scratch_get(needed);
     if (scratch == NULL)
     {
       log_error("gemm packing scratch allocation failed");
-      return;
+      return 1;
     }
     float *Ap_full = scratch;
     float *Bp_full = scratch + (size_t)m_full * k;
@@ -5191,7 +5263,7 @@ gemm_fpx(
     {
       int jb, ib;
       #pragma omp parallel for private(ib, jb) OMP_COLLAPSE2
-      // OMP_PARALLEL_ARGS
+      //        OMP_PARA_ARGS
       for (jb = 0; jb < n_full; jb += 8)
         for (ib = 0; ib < m_full; ib += 8)
         {
@@ -5230,12 +5302,16 @@ gemm_fpx(
       src_stride, m_full, n - n_full, k, omp
     );
   }
+
+  return 0;
 }
 
-/* Compute an `mr`x`n` (mr <= 8) block of dst = src @ mat.
+/**
+ * Compute an `mr`x`n` (mr <= 8) block of dst = src @ mat.
  * `mat` is converted from floatx -> float once per `l` (into `row`) and
  * then reused across all `mr` accumulator rows, instead of being
- * re-read/re-converted once per row like the naive version. */
+ * re-read/re-converted once per row like the naive version.
+ */
 static inline void
 gemm_fpx_nn_kernel(
   floatx *RESTRICT       dst,
@@ -5293,11 +5369,15 @@ gemm_fpx_nn_kernel(
       dst_row[j] = (floatx)ACC(ii, j);
     }
   }
+
+#undef ACC
 }
 
-/* fpx matrix-matrix multiply (NN)
- * fpx src (m, k) @ fpx mat (k, n) = fpx dst (m, n) */
-static void
+/**
+ * fpx matrix-matrix multiply (NN)
+ * fpx src (m, k) @ fpx mat (k, n) = fpx dst (m, n)
+ */
+static int
 gemm_fpx_nn(
   floatx *RESTRICT       dst,
   int                    dst_stride,
@@ -5320,7 +5400,7 @@ gemm_fpx_nn(
   if (omp)
   {
     int ib;
-    #pragma omp parallel for private(ib) OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(ib) OMP_PARA_ARGS
     for (ib = 0; ib < m_full; ib += 8)
     {
       gemm_fpx_nn_kernel(
@@ -5348,6 +5428,8 @@ gemm_fpx_nn(
       src + m_full * src_stride, src_stride, m - m_full, n, k
     );
   }
+
+  return 0;
 }
 
 static _Thread_local int8_t *gemm_i8_pack_scratch     = NULL;
@@ -5380,8 +5462,10 @@ gemm_free_thread_scratch(void)
   gemm_i8_pack_scratch_cap = 0;
 }
 
-/* Same idea as pack_panel/pack_all for fpx, but source/dest are int8_t, no
- * upcast needed, this is a pure gather-to-contiguous transpose. */
+/**
+ * Same idea as pack_panel/pack_all for fpx, but source/dest are int8_t, no
+ * upcast needed, this is a pure gather-to-contiguous transpose.
+ */
 static inline void
 pack_panel_i8(
   int8_t *RESTRICT       packed,
@@ -5416,7 +5500,7 @@ pack_all_i8(
   if (omp)
   {
     int b;
-    #pragma omp parallel for private(b) OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(b) OMP_PARA_ARGS
     for (b = 0; b < total_rows; b += R)
     {
       pack_panel_i8(
@@ -5567,7 +5651,7 @@ gemm_int8_scalar(
   if (omp)
   {
     int i, j;
-    #pragma omp parallel for private(i, j) OMP_COLLAPSE2 OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(i, j) OMP_COLLAPSE2 OMP_PARA_ARGS
     for (i = 0; i < m; i++)
       for (j = 0; j < n; j++)
       {
@@ -5590,11 +5674,13 @@ gemm_int8_scalar(
   }
 }
 
-/* int8 matrix-matrix multiply (NT) + dequant
+/**
+ * int8 matrix-matrix multiply (NT) + dequant
  *
  *   (int8 src (m, k) * fpx src_scales (m,))
- * @ (int8 mat (n, k) * fpx mat_scales (n,)).T = (fpx dst (m, n)) */
-static void
+ * @ (int8 mat (n, k) * fpx mat_scales (n,)).T = (fpx dst (m, n))
+ */
+static int
 gemm_int8(
   floatx *RESTRICT       dst,
   int                    dst_stride,
@@ -5623,7 +5709,7 @@ gemm_int8(
     if (scratch == NULL)
     {
       log_error("gemm_int8 packing scratch allocation failed");
-      return;
+      return 1;
     }
     int8_t *Ap_full = scratch;
     int8_t *Bp_full = scratch + (size_t)m_full * k;
@@ -5635,7 +5721,7 @@ gemm_int8(
     {
       int jb, ib;
       #pragma omp parallel for private(ib, jb) OMP_COLLAPSE2
-      // OMP_PARALLEL_ARGS
+      //        OMP_PARA_ARGS
       for (jb = 0; jb < n_full; jb += 8)
         for (ib = 0; ib < m_full; ib += 8)
         {
@@ -5676,6 +5762,8 @@ gemm_int8(
       omp
     );
   }
+
+  return 0;
 }
 
 /* */
@@ -5749,7 +5837,7 @@ prepare_image(const char *path, int image_size)
 
 /* */
 floatx *
-prepare_image_pas(
+prepare_longimage(
   const char *path,
   int         image_size,
   int         min_crop_size,
@@ -5877,13 +5965,15 @@ fail:
 
 NO_FAST_MATH_BEGIN;
 
-/* Vision forward pass (SigLIP)
- * img: (img_sz, img_sz, 3) */
+/**
+ * Vision forward pass (SigLIP)
+ * img: (image_size, image_size, 3)
+ */
 int
 forward_vision(
   VisionEncoder *enc,
-  TextConfig    *cfg,
-  TextBuffer    *buf,
+  TextConfig    *tcfg,
+  TextBuffer    *tbuf,
   VisionBuffer  *vbuf,
   const floatx  *img,
   bool           quant
@@ -5891,18 +5981,17 @@ forward_vision(
 {
   VisionConfig *vcfg = enc->config;
 
-  int C        = vcfg->hidden_dim;
-  int P        = vcfg->patch_size;
-  int img_sz   = vcfg->image_size;
-  int ppi      = img_sz / P;
-  int N        = ppi * ppi;
-  int tpi      = cfg->image_toks;
-  int side_len = (int)roundf(sqrtf((float)tpi));
-  int K        = (img_sz / vcfg->patch_size) / side_len;
-
-  int CH     = C / vcfg->n_heads;
-  int CM     = vcfg->mlp_dim;
-  int in_dim = 3 * P * P;
+  int embed_dim   = vcfg->hidden_dim;
+  int patch_size  = vcfg->patch_size;
+  int image_size  = vcfg->image_size;
+  int ppi         = image_size / patch_size;
+  int n_patches   = ppi * ppi;
+  int image_toks  = tcfg->image_toks;
+  int side_len    = (int)roundf(sqrtf((float)image_toks));
+  int kernal_size = (image_size / vcfg->patch_size) / side_len;
+  int head_dim    = embed_dim / vcfg->n_heads;
+  int mlp_dim     = vcfg->mlp_dim;
+  int input_dim   = 3 * patch_size * patch_size;
 
   // Patch Embedding
 
@@ -5910,32 +5999,37 @@ forward_vision(
   // Can be further optimized by reusing GEMM, but this part is executed only
   // once per call, the cost is acceptable
   int oy, ox;
-  #pragma omp parallel for private(oy, ox) OMP_COLLAPSE2 OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(oy, ox) OMP_COLLAPSE2 OMP_PARA_ARGS
   for (oy = 0; oy < ppi; oy++)
     for (ox = 0; ox < ppi; ox++)
     {
       int patch_idx = oy * ppi + ox;
 
       // Compute the embed vector for the current patch
-      for (int oc = 0; oc < C; oc++)
+      for (int oc = 0; oc < embed_dim; oc++)
       {
         float sum = 0.0f;
 
         // equivalent to Conv2d(
-        //   in_channels=3, out_channels=C, kernal_size=P, stride=P, bias=True)
+        //   in_channels=3, out_channels=embed_dim, kernal_size=patch_size,
+        //   stride=patch_size, bias=True)
 
-        for (int py = 0; py < P; py++)
-          for (int px = 0; px < P; px++)
+        for (int py = 0; py < patch_size; py++)
+          for (int px = 0; px < patch_size; px++)
             for (int c = 0; c < 3; c++)
             {
-              // img[c, oy*P + py, ox*P + px]
-              int in_idx = ((oy * P + py) * img_sz + (ox * P + px)) * 3 + c;
+              // img[c, oy*patch_size + py, ox*patch_size + px]
+              int in_idx =
+                ((oy * patch_size + py) * image_size + (ox * patch_size + px)) *
+                  3 +
+                c;
               // patch_emb[oc, c, py, px]
-              int w_idx = oc * in_dim + c * P * P + py * P + px;
+              int w_idx = oc * input_dim + c * patch_size * patch_size +
+                          py * patch_size + px;
               sum += (float)enc->patch_emb[w_idx] * (float)img[in_idx];
             }
 
-        vbuf->x[patch_idx * C + oc] =
+        vbuf->x[patch_idx * embed_dim + oc] =
           clamp_fpx((floatx)(sum + (float)enc->patch_emb_b[oc]));
       }
     }
@@ -5945,7 +6039,7 @@ forward_vision(
   // Position Embedding
   if (!quant)
   {
-    for (int d = 0; d < N * C; d++)
+    for (int d = 0; d < n_patches * embed_dim; d++)
     {
       vbuf->x[d] = clamp_fpx(vbuf->x[d] + enc->pos_embedding->fpx[d]);
     }
@@ -5953,12 +6047,13 @@ forward_vision(
   else
   {
     // Dequantize per row
-    for (int i = 0; i < N; i++)
-      for (int j = 0; j < C; j++)
+    for (int i = 0; i < n_patches; i++)
+      for (int j = 0; j < embed_dim; j++)
       {
-        float scale        = (float)enc->pos_embedding->i8.scales[i];
-        float val          = (float)enc->pos_embedding->i8.q[i * C + j] * scale;
-        vbuf->x[i * C + j] = clamp_fpx(vbuf->x[i * C + j] + (floatx)val);
+        float scale = (float)enc->pos_embedding->i8.scales[i];
+        float val = (float)enc->pos_embedding->i8.q[i * embed_dim + j] * scale;
+        vbuf->x[i * embed_dim + j] =
+          clamp_fpx(vbuf->x[i * embed_dim + j] + (floatx)val);
       }
   }
 
@@ -5969,47 +6064,60 @@ forward_vision(
   {
     VisionEncoderLayer *layer = enc->layers[l];
 
-    memcpy(vbuf->resid, vbuf->x, N * C * sizeof(floatx));
+    memcpy(vbuf->resid, vbuf->x, n_patches * embed_dim * sizeof(floatx));
 
     int i;
-    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
-    for (i = 0; i < N; i++)
+    #pragma omp parallel for private(i) OMP_PARA_ARGS
+    for (i = 0; i < n_patches; i++)
     {
-      floatx *row = vbuf->x + i * C;
-      layernorm(row, row, layer->n1, layer->n1_b, C, vcfg->eps);
+      floatx *row = vbuf->x + i * embed_dim;
+      layernorm(row, row, layer->n1, layer->n1_b, embed_dim, vcfg->eps);
     }
     if (is_interrupted()) return 1;
 
     // QKV projections
     if (!quant)
     {
-      gemm_fpx(vbuf->xq, 0, layer->wq->fpx, 0, vbuf->x, 0, N, C, C, true);
-      gemm_fpx(vbuf->xk, 0, layer->wk->fpx, 0, vbuf->x, 0, N, C, C, true);
-      gemm_fpx(vbuf->xv, 0, layer->wv->fpx, 0, vbuf->x, 0, N, C, C, true);
+      if (gemm_fpx(
+            vbuf->xq, 0, layer->wq->fpx, 0, vbuf->x, 0, n_patches, embed_dim,
+            embed_dim, true
+          ) == 1 ||
+          gemm_fpx(
+            vbuf->xk, 0, layer->wk->fpx, 0, vbuf->x, 0, n_patches, embed_dim,
+            embed_dim, true
+          ) == 1 ||
+          gemm_fpx(
+            vbuf->xv, 0, layer->wv->fpx, 0, vbuf->x, 0, n_patches, embed_dim,
+            embed_dim, true
+          ) == 1)
+        return 1;
     }
     else
     {
-      quantize_acts(vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, N, C, true);
-      gemm_int8(
-        vbuf->xq, 0, layer->wq->i8.q, 0, layer->wq->i8.scales, vbuf->x_i8, 0,
-        vbuf->x_scales, N, C, C, true
+      quantize_acts(
+        vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, n_patches, embed_dim, true
       );
-      gemm_int8(
-        vbuf->xk, 0, layer->wk->i8.q, 0, layer->wk->i8.scales, vbuf->x_i8, 0,
-        vbuf->x_scales, N, C, C, true
-      );
-      gemm_int8(
-        vbuf->xv, 0, layer->wv->i8.q, 0, layer->wv->i8.scales, vbuf->x_i8, 0,
-        vbuf->x_scales, N, C, C, true
-      );
+      if (gemm_int8(
+            vbuf->xq, 0, layer->wq->i8.q, 0, layer->wq->i8.scales, vbuf->x_i8,
+            0, vbuf->x_scales, n_patches, embed_dim, embed_dim, true
+          ) == 1 ||
+          gemm_int8(
+            vbuf->xk, 0, layer->wk->i8.q, 0, layer->wk->i8.scales, vbuf->x_i8,
+            0, vbuf->x_scales, n_patches, embed_dim, embed_dim, true
+          ) == 1 ||
+          gemm_int8(
+            vbuf->xv, 0, layer->wv->i8.q, 0, layer->wv->i8.scales, vbuf->x_i8,
+            0, vbuf->x_scales, n_patches, embed_dim, embed_dim, true
+          ) == 1)
+        return 1;
     }
     if (is_interrupted()) return 1;
 
     // Add biases
-    for (int i = 0; i < N; i++)
-      for (int j = 0; j < C; j++)
+    for (int i = 0; i < n_patches; i++)
+      for (int j = 0; j < embed_dim; j++)
       {
-        int idx = i * C + j;
+        int idx = i * embed_dim + j;
         vbuf->xq[idx] += layer->bq[j];
         vbuf->xk[idx] += layer->bk[j];
         vbuf->xv[idx] += layer->bv[j];
@@ -6017,141 +6125,167 @@ forward_vision(
     if (is_interrupted()) return 1;
 
     // Attention
-    memset(vbuf->att_out, 0, N * C * sizeof(floatx));
-    float scale = 1.0f / sqrtf((float)CH);
+    memset(vbuf->att_out, 0, n_patches * embed_dim * sizeof(floatx));
+    float scale = 1.0f / sqrtf((float)head_dim);
 
-    int h;
-    #pragma omp parallel for private(h) OMP_PARALLEL_ARGS
+    int  h;
+    bool quit = false;
+
+    #pragma omp parallel for private(h) reduction(|| : quit) OMP_PARA_ARGS
     for (h = 0; h < vcfg->n_heads; h++)
     {
-      floatx *scores = vbuf->scores + h * N * N;  // (N, N) for this head
+      floatx *scores =
+        vbuf->scores +
+        h * n_patches * n_patches;  // (n_patches, n_patches) for this head
 
       // scores = Q @ K^T * scale
-      gemm_fpx(
-        scores, /*dst_stride=*/N, vbuf->xk + h * CH, /*mat_stride=*/C,
-        vbuf->xq + h * CH, /*src_stride=*/C, N, N, CH, false
-      );
+      if (gemm_fpx(
+            scores, /*dst_stride=*/n_patches, vbuf->xk + h * head_dim,
+            /*mat_stride=*/embed_dim, vbuf->xq + h * head_dim,
+            /*src_stride=*/embed_dim, n_patches, n_patches, head_dim, false
+          ) == 1)
+        quit = true;
 
       // Apply scale and softmax per row
-      for (int i = 0; i < N; i++)
+      for (int i = 0; i < n_patches; i++)
       {
-        floatx *row = scores + i * N;
-        for (int j = 0; j < N; j++)
+        floatx *row = scores + i * n_patches;
+        for (int j = 0; j < n_patches; j++)
         {
           row[j] *= scale;
         }
-        softmax(row, row, N);
+        softmax(row, row, n_patches);
       }
 
       // Weighted sum of values: out = scores @ V
-      gemm_fpx_nn(
-        vbuf->att_out + h * CH, /*dst_stride=*/C, vbuf->xv + h * CH,
-        /*mat_stride=*/C, scores, /*src_stride=*/N, N, CH, N, false
-      );
+      if (gemm_fpx_nn(
+            vbuf->att_out + h * head_dim, /*dst_stride=*/embed_dim,
+            vbuf->xv + h * head_dim,
+            /*mat_stride=*/embed_dim, scores, /*src_stride=*/n_patches,
+            n_patches, head_dim, n_patches, false
+          ) == 1)
+        quit = true;
     }
     if (is_interrupted()) return 1;
 
     // Output projection
     if (!quant)
     {
-      gemm_fpx(vbuf->x, 0, layer->wo->fpx, 0, vbuf->att_out, 0, N, C, C, true);
+      if (gemm_fpx(
+            vbuf->x, 0, layer->wo->fpx, 0, vbuf->att_out, 0, n_patches,
+            embed_dim, embed_dim, true
+          ) == 1)
+        return 1;
     }
     else
     {
-      quantize_acts(vbuf->x_i8, vbuf->x_scales, vbuf->att_out, 0, N, C, true);
-      gemm_int8(
-        vbuf->x, 0, layer->wo->i8.q, 0, layer->wo->i8.scales, vbuf->x_i8, 0,
-        vbuf->x_scales, N, C, C, true
+      quantize_acts(
+        vbuf->x_i8, vbuf->x_scales, vbuf->att_out, 0, n_patches, embed_dim, true
       );
+      if (gemm_int8(
+            vbuf->x, 0, layer->wo->i8.q, 0, layer->wo->i8.scales, vbuf->x_i8, 0,
+            vbuf->x_scales, n_patches, embed_dim, embed_dim, true
+          ) == 1)
+        return 1;
     }
     if (is_interrupted()) return 1;
 
     // Add output bias
-    for (int i = 0; i < N; i++)
-      for (int j = 0; j < C; j++)
+    for (int i = 0; i < n_patches; i++)
+      for (int j = 0; j < embed_dim; j++)
       {
-        vbuf->x[i * C + j] += layer->bo[j];
+        vbuf->x[i * embed_dim + j] += layer->bo[j];
       }
     if (is_interrupted()) return 1;
 
     // Residual connection
-    for (int i = 0; i < N * C; i++)
+    for (int i = 0; i < n_patches * embed_dim; i++)
     {
       vbuf->x[i] = clamp_fpx(vbuf->x[i] + vbuf->resid[i]);
     }
     if (is_interrupted()) return 1;
 
-    memcpy(vbuf->resid, vbuf->x, N * C * sizeof(floatx));
+    memcpy(vbuf->resid, vbuf->x, n_patches * embed_dim * sizeof(floatx));
 
-    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
-    for (i = 0; i < N; i++)
+    #pragma omp parallel for private(i) OMP_PARA_ARGS
+    for (i = 0; i < n_patches; i++)
     {
-      floatx *row = vbuf->x + i * C;
-      layernorm(row, row, layer->n2, layer->n2_b, C, vcfg->eps);
+      floatx *row = vbuf->x + i * embed_dim;
+      layernorm(row, row, layer->n2, layer->n2_b, embed_dim, vcfg->eps);
     }
     if (is_interrupted()) return 1;
 
     // x @ fc1 = mlp_hidden
     if (!quant)
     {
-      gemm_fpx(
-        vbuf->mlp_hidden, 0, layer->w1->fpx, 0, vbuf->x, 0, N, CM, C, true
-      );
+      if (gemm_fpx(
+            vbuf->mlp_hidden, 0, layer->w1->fpx, 0, vbuf->x, 0, n_patches,
+            mlp_dim, embed_dim, true
+          ) == 1)
+        return 1;
     }
     else
     {
-      quantize_acts(vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, N, C, true);
-      gemm_int8(
-        vbuf->mlp_hidden, 0, layer->w1->i8.q, 0, layer->w1->i8.scales,
-        vbuf->x_i8, 0, vbuf->x_scales, N, CM, C, true
+      quantize_acts(
+        vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, n_patches, embed_dim, true
       );
+      if (gemm_int8(
+            vbuf->mlp_hidden, 0, layer->w1->i8.q, 0, layer->w1->i8.scales,
+            vbuf->x_i8, 0, vbuf->x_scales, n_patches, mlp_dim, embed_dim, true
+          ) == 1)
+        return 1;
     }
     if (is_interrupted()) return 1;
 
-    for (int i = 0; i < N; i++)
-      for (int j = 0; j < CM; j++)
+    for (int i = 0; i < n_patches; i++)
+      for (int j = 0; j < mlp_dim; j++)
       {
         // Apply fc1 biases
-        float val = (float)vbuf->mlp_hidden[i * CM + j] + (float)layer->b1[j];
+        float val =
+          (float)vbuf->mlp_hidden[i * mlp_dim + j] + (float)layer->b1[j];
         // GELU tanh approximation
         float c = 0.79788456080287f;
         val =
           0.5f * val * (1.0f + tanhf(c * (val + 0.044715f * val * val * val)));
-        vbuf->mlp_hidden[i * CM + j] = (floatx)val;
+        vbuf->mlp_hidden[i * mlp_dim + j] = (floatx)val;
       }
     if (is_interrupted()) return 1;
 
     // mlp_hidden @ fc2 = x
     if (!quant)
     {
-      gemm_fpx(
-        vbuf->x, 0, layer->w2->fpx, 0, vbuf->mlp_hidden, 0, N, C, CM, true
-      );
+      if (gemm_fpx(
+            vbuf->x, 0, layer->w2->fpx, 0, vbuf->mlp_hidden, 0, n_patches,
+            embed_dim, mlp_dim, true
+          ) == 1)
+        return 1;
     }
     else
     {
       quantize_acts(
-        vbuf->mlp_i8, vbuf->mlp_scales, vbuf->mlp_hidden, 0, N, CM, true
+        vbuf->mlp_i8, vbuf->mlp_scales, vbuf->mlp_hidden, 0, n_patches, mlp_dim,
+        true
       );
-      gemm_int8(
-        vbuf->x, 0, layer->w2->i8.q, 0, layer->w2->i8.scales, vbuf->mlp_i8, 0,
-        vbuf->mlp_scales, N, C, CM, true
-      );
+      if (gemm_int8(
+            vbuf->x, 0, layer->w2->i8.q, 0, layer->w2->i8.scales, vbuf->mlp_i8,
+            0, vbuf->mlp_scales, n_patches, embed_dim, mlp_dim, true
+          ) == 1)
+        return 1;
     }
     if (is_interrupted()) return 1;
 
     // x += b2
-    for (int i = 0; i < N; i++)
-      for (int j = 0; j < C; j++)
+    for (int i = 0; i < n_patches; i++)
+      for (int j = 0; j < embed_dim; j++)
       {
-        vbuf->x[i * C + j] += layer->b2[j];
+        vbuf->x[i * embed_dim + j] += layer->b2[j];
       }
 
     if (is_interrupted()) return 1;
 
     // Residual connection
-    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
-    for (i = 0; i < N * C; i++)
+    #pragma omp parallel for private(i) OMP_PARA_ARGS
+    for (i = 0; i < n_patches * embed_dim; i++)
     {
       vbuf->x[i] = clamp_fpx(vbuf->x[i] + vbuf->resid[i]);
     }
@@ -6160,11 +6294,11 @@ forward_vision(
 
   // Post-norm + average pooling down to image_toks tokens
   int i;
-  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
-  for (i = 0; i < N; i++)
+  #pragma omp parallel for private(i) OMP_PARA_ARGS
+  for (i = 0; i < n_patches; i++)
   {
-    floatx *row = vbuf->x + i * C;
-    layernorm(row, row, enc->post_norm, enc->post_norm_b, C, vcfg->eps);
+    floatx *row = vbuf->x + i * embed_dim;
+    layernorm(row, row, enc->post_norm, enc->post_norm_b, embed_dim, vcfg->eps);
   }
   if (is_interrupted()) return 1;
 
@@ -6177,51 +6311,57 @@ forward_vision(
   for (int oy = 0; oy < side_len; oy++)
     for (int ox = 0; ox < side_len; ox++)
     {
-      int out_idx = (oy * side_len + ox) * C;
-      for (int d = 0; d < C; d++)
+      int out_idx = (oy * side_len + ox) * embed_dim;
+      for (int d = 0; d < embed_dim; d++)
       {
         float sum = 0.0f;
-        for (int ky = 0; ky < K; ky++)
+        for (int ky = 0; ky < kernal_size; ky++)
         {
-          for (int kx = 0; kx < K; kx++)
+          for (int kx = 0; kx < kernal_size; kx++)
           {
-            int py        = oy * K + ky;
-            int px        = ox * K + kx;
-            int token_idx = (py * ppi + px) * C + d;
+            int py        = oy * kernal_size + ky;
+            int px        = ox * kernal_size + kx;
+            int token_idx = (py * ppi + px) * embed_dim + d;
             sum += (float)vbuf->x[token_idx];
           }
         }
-        vbuf->x[out_idx + d] = (floatx)(sum / (K * K));
+        vbuf->x[out_idx + d] = (floatx)(sum / (kernal_size * kernal_size));
       }
     }
 
   if (is_interrupted()) return 1;
-  // buf->x now becomes (tpi, C)
+  // tbuf->x now becomes (image_toks, embed_dim)
 
   // Final RMSNorm
-  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
-  for (i = 0; i < tpi; i++)
+  #pragma omp parallel for private(i) OMP_PARA_ARGS
+  for (i = 0; i < image_toks; i++)
   {
-    floatx *row = vbuf->x + i * C;
-    rmsnorm(row, row, enc->norm, C, vcfg->eps);
+    floatx *row = vbuf->x + i * embed_dim;
+    rmsnorm(row, row, enc->norm, embed_dim, vcfg->eps);
   }
   if (is_interrupted()) return 1;
 
   // Final projection into language model embedding space
-  // x (tpi, embed_dim) = x (tpi, C) @ proj (C, embed_dim)
+  // x (image_toks, embed_dim) = x (image_toks, embed_dim) @ proj (embed_dim,
+  // embed_dim)
   if (!quant)
   {
-    gemm_fpx(
-      buf->x, 0, enc->proj->fpx, 0, vbuf->x, 0, tpi, cfg->embed_dim, C, true
-    );
+    if (gemm_fpx(
+          tbuf->x, 0, enc->proj->fpx, 0, vbuf->x, 0, image_toks,
+          tcfg->embed_dim, embed_dim, true
+        ) == 1)
+      return 1;
   }
   else
   {
-    quantize_acts(vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, tpi, C, true);
-    gemm_int8(
-      buf->x, 0, enc->proj->i8.q, 0, enc->proj->i8.scales, vbuf->x_i8, 0,
-      vbuf->x_scales, tpi, cfg->embed_dim, C, true
+    quantize_acts(
+      vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, image_toks, embed_dim, true
     );
+    if (gemm_int8(
+          tbuf->x, 0, enc->proj->i8.q, 0, enc->proj->i8.scales, vbuf->x_i8, 0,
+          vbuf->x_scales, image_toks, tcfg->embed_dim, embed_dim, true
+        ) == 1)
+      return 1;
   }
   if (is_interrupted()) return 1;
 
@@ -6231,177 +6371,180 @@ forward_vision(
 /* Language model forward (one token) */
 int
 forward_text_decode(
-  TextDecoder *dec, TextBuffer *buf, int pos, bool quant, bool compute_logits
+  TextDecoder *dec, TextBuffer *tbuf, int pos, bool quant, bool compute_logits
 )
 {
-  TextConfig *cfg = dec->config;
+  TextConfig *tcfg = dec->config;
 
-  int C     = cfg->embed_dim;
-  int NH    = cfg->n_heads;
-  int NH_kv = cfg->n_kv_heads;
-  int CH    = cfg->head_dim;
-  int Cq    = NH * CH;
-  int Ckv   = NH_kv * CH;
+  int embed_dim  = tcfg->embed_dim;
+  int n_heads    = tcfg->n_heads;
+  int n_kv_heads = tcfg->n_kv_heads;
+  int head_dim   = tcfg->head_dim;
+  int q_size     = n_heads * head_dim;
+  int kv_size    = n_kv_heads * head_dim;
 
-  int CH_half = CH / 2;
-
-  if (pos >= buf->cache_len)
+  if (pos >= tbuf->cache_len)
   {
     log_error("kv cache is full");
     return 1;
   }
 
   // Precompute cos & sin for all frequencies (used in RoPE)
-  for (int d = 0; d < CH_half; d++)
+  for (int d = 0; d < head_dim / 2; d++)
   {
     float freq;
-    float e = (float)(-2 * d) / (float)CH;  // exponent
+    float e = (float)(-2 * d) / (float)head_dim;  // exponent
 
     // Rotation angles for sliding window attentions
-    freq                         = powf(cfg->local_theta, e);
-    buf->csfreqs_slid[d * 2]     = (floatx)cosf(freq * (float)pos);
-    buf->csfreqs_slid[d * 2 + 1] = (floatx)sinf(freq * (float)pos);
+    freq                          = powf(tcfg->local_theta, e);
+    tbuf->csfreqs_slid[d * 2]     = (floatx)cosf(freq * (float)pos);
+    tbuf->csfreqs_slid[d * 2 + 1] = (floatx)sinf(freq * (float)pos);
 
     // Rotation angles for full attentions
-    freq                         = powf(cfg->global_theta, e);
-    buf->csfreqs_full[d * 2]     = (floatx)cosf(freq * (float)pos);
-    buf->csfreqs_full[d * 2 + 1] = (floatx)sinf(freq * (float)pos);
+    freq                          = powf(tcfg->global_theta, e);
+    tbuf->csfreqs_full[d * 2]     = (floatx)cosf(freq * (float)pos);
+    tbuf->csfreqs_full[d * 2 + 1] = (floatx)sinf(freq * (float)pos);
   }
   if (is_interrupted()) return 1;
 
   // Forward all the layers
-  for (int l = 0; l < cfg->n_layers; l++)
+  for (int l = 0; l < tcfg->n_layers; l++)
   {
     TextDecoderLayer *layer = dec->layers[l];
 
-    memcpy(buf->resid, buf->x, C * sizeof(*buf->x));
+    memcpy(tbuf->resid, tbuf->x, embed_dim * sizeof(*tbuf->x));
 
-    rmsnorm(buf->x, buf->x, layer->n1, C, cfg->eps);
+    rmsnorm(tbuf->x, tbuf->x, layer->n1, embed_dim, tcfg->eps);
     if (is_interrupted()) return 1;
 
     // The attention block
     if (!quant)
     {
-      gemv_fpx(buf->xq, layer->wq->fpx, buf->x, Cq, C, true);  // (NH, CH)
-      // (NH_kv, CH)
-      gemv_fpx(buf->xk, layer->wk->fpx, buf->x, Ckv, C, true);
-      gemv_fpx(buf->xv, layer->wv->fpx, buf->x, Ckv, C, true);
+      gemv_fpx(
+        tbuf->xq, layer->wq->fpx, tbuf->x, q_size, embed_dim, true
+      );  // (n_heads, head_dim)
+      // (n_kv_heads, head_dim)
+      gemv_fpx(tbuf->xk, layer->wk->fpx, tbuf->x, kv_size, embed_dim, true);
+      gemv_fpx(tbuf->xv, layer->wv->fpx, tbuf->x, kv_size, embed_dim, true);
     }
     else
     {
-      floatx x_scale = quantize_act(buf->x_i8, buf->x, C);
+      floatx x_scale = quantize_act(tbuf->x_i8, tbuf->x, embed_dim);
       gemv_int8(
-        buf->xq, layer->wq->i8.q, layer->wq->i8.scales, buf->x_i8, x_scale, Cq,
-        C, true
+        tbuf->xq, layer->wq->i8.q, layer->wq->i8.scales, tbuf->x_i8, x_scale,
+        q_size, embed_dim, true
       );
       gemv_int8(
-        buf->xk, layer->wk->i8.q, layer->wk->i8.scales, buf->x_i8, x_scale, Ckv,
-        C, true
+        tbuf->xk, layer->wk->i8.q, layer->wk->i8.scales, tbuf->x_i8, x_scale,
+        kv_size, embed_dim, true
       );
       gemv_int8(
-        buf->xv, layer->wv->i8.q, layer->wv->i8.scales, buf->x_i8, x_scale, Ckv,
-        C, true
+        tbuf->xv, layer->wv->i8.q, layer->wv->i8.scales, tbuf->x_i8, x_scale,
+        kv_size, embed_dim, true
       );
     }
     if (is_interrupted()) return 1;
 
-    if (cfg->qk_norm)
+    if (tcfg->qk_norm)
     {
       // Query RMSNorm
-      for (int h = 0; h < NH; h++)
+      for (int h = 0; h < n_heads; h++)
       {
-        floatx *xq_head = buf->xq + h * CH;
+        floatx *xq_head = tbuf->xq + h * head_dim;
         // Use the non-threading version here since we are running this over
         // every head
-        rmsnorm(xq_head, xq_head, layer->nq, CH, cfg->eps);
+        rmsnorm(xq_head, xq_head, layer->nq, head_dim, tcfg->eps);
       }
       // Key RMSNorm
-      for (int h = 0; h < NH_kv; h++)
+      for (int h = 0; h < n_kv_heads; h++)
       {
-        floatx *xk_head = buf->xk + h * CH;
-        rmsnorm(xk_head, xk_head, layer->nk, CH, cfg->eps);
+        floatx *xk_head = tbuf->xk + h * head_dim;
+        rmsnorm(xk_head, xk_head, layer->nk, head_dim, tcfg->eps);
       }
     }
     if (is_interrupted()) return 1;
 
-    bool    is_local = cfg->att_layers[l];
-    floatx *freqs_cs = is_local ? buf->csfreqs_slid : buf->csfreqs_full;
+    bool    is_local = tcfg->att_layers[l];
+    floatx *freqs_cs = is_local ? tbuf->csfreqs_slid : tbuf->csfreqs_full;
 
     // Apply RoPE to queries & keys
-    for (int idx = 0; idx < NH + NH_kv; idx++)
+    for (int idx = 0; idx < n_heads + n_kv_heads; idx++)
     {
       floatx *data;
-      if (idx < NH)
+      if (idx < n_heads)
       {
-        data = buf->xq + idx * CH;  // Apply to queries
+        data = tbuf->xq + idx * head_dim;  // Apply to queries
       }
       else
       {
-        data = buf->xk + (idx - NH) * CH;  // Apply to keys
+        data = tbuf->xk + (idx - n_heads) * head_dim;  // Apply to keys
       }
 
-      for (int d = 0; d < CH_half; d++)
+      for (int d = 0; d < head_dim / 2; d++)
       {
         float cfr = (float)freqs_cs[2 * d];
         float sfr = (float)freqs_cs[2 * d + 1];
-        float a   = (float)data[d];            // Index in the first half vector
-        float b   = (float)data[d + CH_half];  // ... second half vector
+        float a   = (float)data[d];  // Index in the first half vector
+        float b   = (float)data[d + head_dim / 2];  // ... second half vector
 
-        data[d]           = (floatx)(a * cfr - b * sfr);
-        data[d + CH_half] = (floatx)(a * sfr + b * cfr);
+        data[d]                = (floatx)(a * cfr - b * sfr);
+        data[d + head_dim / 2] = (floatx)(a * sfr + b * cfr);
       }
     }
     if (is_interrupted()) return 1;
 
-    // (NH_kv, cache_len, CH)
-    floatx *k_cache = buf->kv_cache + l * 2 * buf->cache_len * Ckv;
-    floatx *v_cache = k_cache + buf->cache_len * Ckv;
+    // (n_kv_heads, cache_len, head_dim)
+    floatx *k_cache = tbuf->kv_cache + l * 2 * tbuf->cache_len * kv_size;
+    floatx *v_cache = k_cache + tbuf->cache_len * kv_size;
 
     // Write to kv_cache
-    for (int h = 0; h < NH_kv; h++)
+    for (int h = 0; h < n_kv_heads; h++)
     {
-      floatx *xk_head = k_cache + h * buf->cache_len * CH + pos * CH;
-      floatx *xv_head = v_cache + h * buf->cache_len * CH + pos * CH;
-      memcpy(xk_head, buf->xk + h * CH, CH * sizeof(*buf->xk));
-      memcpy(xv_head, buf->xv + h * CH, CH * sizeof(*buf->xv));
+      floatx *xk_head =
+        k_cache + h * tbuf->cache_len * head_dim + pos * head_dim;
+      floatx *xv_head =
+        v_cache + h * tbuf->cache_len * head_dim + pos * head_dim;
+      memcpy(xk_head, tbuf->xk + h * head_dim, head_dim * sizeof(*tbuf->xk));
+      memcpy(xv_head, tbuf->xv + h * head_dim, head_dim * sizeof(*tbuf->xv));
     }
     if (is_interrupted()) return 1;
 
     // Sliding-window (true) or full attention (false)?
-    bool local_att = is_local && pos >= cfg->slide_len;
+    bool local_att = is_local && pos >= tcfg->slide_len;
     // Starting position of kv_cache
-    int spos   = local_att ? (pos + 1 - cfg->slide_len) : 0;
+    int spos   = local_att ? (pos + 1 - tcfg->slide_len) : 0;
     int attlen = pos + 1 - spos;  // Include the current pos
 
-    floatx att_scale = (floatx)(1.0f / sqrtf((float)cfg->q_scale));
+    floatx att_scale = (floatx)(1.0f / sqrtf((float)tcfg->q_scale));
 
     // Iterate over all the attention heads
     int h;
-    #pragma omp parallel for private(h) OMP_PARALLEL_ARGS
-    for (h = 0; h < NH; h++)
+    #pragma omp parallel for private(h) OMP_PARA_ARGS
+    for (h = 0; h < n_heads; h++)
     {
-      int h_kv = h * NH_kv / NH;  // GQA mapping
+      int h_kv = h * n_kv_heads / n_heads;  // GQA mapping
 
-      floatx *xq_head = buf->xq + h * CH;  // xq[h, :]
+      floatx *xq_head = tbuf->xq + h * head_dim;  // xq[h, :]
       // k_cache[h_kv, spos:, :]
-      floatx *xk_head = k_cache + h_kv * buf->cache_len * CH + spos * CH;
+      floatx *xk_head =
+        k_cache + h_kv * tbuf->cache_len * head_dim + spos * head_dim;
       // att[h, spos:]
-      floatx *att_head = buf->att + h * attlen + spos;
+      floatx *att_head = tbuf->att + h * attlen + spos;
 
       // Compute dot product of the current query across all the keys
-      gemv_fpx(att_head, xk_head, xq_head, attlen, CH, false);
+      gemv_fpx(att_head, xk_head, xq_head, attlen, head_dim, false);
       for (int t = 0; t < attlen; t++)
       {
         att_head[t] *= att_scale;
       }
 
       // Attention score softcapping
-      if (cfg->att_softcap != 0.0f)
+      if (tcfg->att_softcap != 0.0f)
       {
         for (int t = 0; t < attlen; t++)
         {
-          float val   = (float)att_head[t] / cfg->att_softcap;
-          att_head[t] = (floatx)(tanhf(val) * cfg->att_softcap);
+          float val   = (float)att_head[t] / tcfg->att_softcap;
+          att_head[t] = (floatx)(tanhf(val) * tcfg->att_softcap);
         }
       }
 
@@ -6410,37 +6553,38 @@ forward_text_decode(
 
       // Compute output as weighted sum of values
       // v_cache[h_kv, spos:, :]
-      floatx *xv_head = v_cache + h_kv * buf->cache_len * CH + spos * CH;
-      floatx *xo_head = buf->xo + h * CH;
+      floatx *xv_head =
+        v_cache + h_kv * tbuf->cache_len * head_dim + spos * head_dim;
+      floatx *xo_head = tbuf->xo + h * head_dim;
 
-      // xo_head (CH,) = att_head (attlen,) @ xv_head (attlen, CH)
-      gemv_fpx_nn(xo_head, att_head, xv_head, 0, attlen, CH);
+      // xo_head (head_dim,) = att_head (attlen,) @ xv_head (attlen, head_dim)
+      gemv_fpx_nn(xo_head, att_head, xv_head, 0, attlen, head_dim);
     }
     if (is_interrupted()) return 1;
 
     // Output projection maps xo back to x
-    // x (C,) = xo (CH,) @ wo.T (CH, C)
+    // x (embed_dim,) = xo (head_dim,) @ wo.T (head_dim, embed_dim)
     if (!quant)
     {
-      gemv_fpx(buf->x, layer->wo->fpx, buf->xo, C, Cq, true);
+      gemv_fpx(tbuf->x, layer->wo->fpx, tbuf->xo, embed_dim, q_size, true);
     }
     else
     {
-      floatx xo_scale = quantize_act(buf->xo_i8, buf->xo, Cq);
+      floatx xo_scale = quantize_act(tbuf->xo_i8, tbuf->xo, q_size);
       gemv_int8(
-        buf->x, layer->wo->i8.q, layer->wo->i8.scales, buf->xo_i8, xo_scale, C,
-        Cq, true
+        tbuf->x, layer->wo->i8.q, layer->wo->i8.scales, tbuf->xo_i8, xo_scale,
+        embed_dim, q_size, true
       );
     }
     if (is_interrupted()) return 1;
 
-    rmsnorm(buf->x, buf->x, layer->n2, C, cfg->eps);
+    rmsnorm(tbuf->x, tbuf->x, layer->n2, embed_dim, tcfg->eps);
     if (is_interrupted()) return 1;
 
     // Combine the residual stream
-    floatx *RESTRICT x     = buf->x;
-    floatx *RESTRICT resid = buf->resid;
-    for (int d = 0; d < C; d++)
+    floatx *RESTRICT x     = tbuf->x;
+    floatx *RESTRICT resid = tbuf->resid;
+    for (int d = 0; d < embed_dim; d++)
     {
       /* Sometimes the residual stream accumulates huge values on certain
        * channels, especially in pretrained/bigger models (Sun et al., 2024,
@@ -6452,86 +6596,92 @@ forward_text_decode(
        * scalers afterwards (see export.py), the clamp here is more of a
        * last-resort safety net. */
 
-      buf->x[d] = clamp_fpx(x[d] + resid[d]);
+      tbuf->x[d] = clamp_fpx(x[d] + resid[d]);
     }
     if (is_interrupted()) return 1;
 
-    memcpy(buf->resid, buf->x, C * sizeof(*buf->x));
+    memcpy(tbuf->resid, tbuf->x, embed_dim * sizeof(*tbuf->x));
 
     // Pre feedforward RMSNorm
-    if (cfg->pre_mlp_norm)
+    if (tcfg->pre_mlp_norm)
     {
-      rmsnorm(buf->x, buf->x, layer->n3, C, cfg->eps);
+      rmsnorm(tbuf->x, tbuf->x, layer->n3, embed_dim, tcfg->eps);
     }
     if (is_interrupted()) return 1;
 
     // MLP feedforward layer (SwiGLU-style)
     if (!quant)
     {
-      gemv_fpx(buf->xu, layer->w1->fpx, buf->x, cfg->mlp_dim, C, true);
-      gemv_fpx(buf->xg, layer->w2->fpx, buf->x, cfg->mlp_dim, C, true);
+      gemv_fpx(
+        tbuf->xu, layer->w1->fpx, tbuf->x, tcfg->mlp_dim, embed_dim, true
+      );
+      gemv_fpx(
+        tbuf->xg, layer->w2->fpx, tbuf->x, tcfg->mlp_dim, embed_dim, true
+      );
     }
     else
     {
-      floatx x_scale = quantize_act(buf->x_i8, buf->x, C);
+      floatx x_scale = quantize_act(tbuf->x_i8, tbuf->x, embed_dim);
       gemv_int8(
-        buf->xg, layer->w2->i8.q, layer->w2->i8.scales, buf->x_i8, x_scale,
-        cfg->mlp_dim, C, true
+        tbuf->xg, layer->w2->i8.q, layer->w2->i8.scales, tbuf->x_i8, x_scale,
+        tcfg->mlp_dim, embed_dim, true
       );
       gemv_int8(
-        buf->xu, layer->w1->i8.q, layer->w1->i8.scales, buf->x_i8, x_scale,
-        cfg->mlp_dim, C, true
+        tbuf->xu, layer->w1->i8.q, layer->w1->i8.scales, tbuf->x_i8, x_scale,
+        tcfg->mlp_dim, embed_dim, true
       );
     }
     if (is_interrupted()) return 1;
 
     // GELU gate
     int d;
-    #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
-    for (d = 0; d < cfg->mlp_dim; d++)
+    #pragma omp parallel for private(d) OMP_PARA_ARGS
+    for (d = 0; d < tcfg->mlp_dim; d++)
     {
       // Tanh approximation of GELU
-      float x    = (float)buf->xg[d];
-      float c    = 0.79788456080287f;  // = sqrt(2 / pi)
-      x          = 0.5 * x * (1 + tanhf(c * (x + 0.044715 * x * x * x)));
-      buf->xg[d] = (floatx)x;
-      buf->xg[d] *= buf->xu[d];  // Fuse xg * xu into xg
+      float x     = (float)tbuf->xg[d];
+      float c     = 0.79788456080287f;  // = sqrt(2 / pi)
+      x           = 0.5 * x * (1 + tanhf(c * (x + 0.044715 * x * x * x)));
+      tbuf->xg[d] = (floatx)x;
+      tbuf->xg[d] *= tbuf->xu[d];  // Fuse xg * xu into xg
     }
     if (is_interrupted()) return 1;
 
     if (!quant)
     {
-      gemv_fpx(buf->x, layer->w3->fpx, buf->xg, C, cfg->mlp_dim, true);
+      gemv_fpx(
+        tbuf->x, layer->w3->fpx, tbuf->xg, embed_dim, tcfg->mlp_dim, true
+      );
     }
     else
     {
-      floatx xscale = quantize_act(buf->xg_i8, buf->xg, cfg->mlp_dim);
+      floatx xscale = quantize_act(tbuf->xg_i8, tbuf->xg, tcfg->mlp_dim);
       gemv_int8(
-        buf->x, layer->w3->i8.q, layer->w3->i8.scales, buf->xg_i8, xscale, C,
-        cfg->mlp_dim, true
+        tbuf->x, layer->w3->i8.q, layer->w3->i8.scales, tbuf->xg_i8, xscale,
+        embed_dim, tcfg->mlp_dim, true
       );
     }
     if (is_interrupted()) return 1;
 
     // Post feedforward RMSNorm
-    if (cfg->pst_mlp_norm)
+    if (tcfg->pst_mlp_norm)
     {
-      rmsnorm(buf->x, buf->x, layer->n4, C, cfg->eps);
+      rmsnorm(tbuf->x, tbuf->x, layer->n4, embed_dim, tcfg->eps);
     }
     if (is_interrupted()) return 1;
 
     // Second residual
-    x     = buf->x;
-    resid = buf->resid;
-    for (int d = 0; d < C; d++)
+    x     = tbuf->x;
+    resid = tbuf->resid;
+    for (int d = 0; d < embed_dim; d++)
     {
-      buf->x[d] = clamp_fpx(x[d] + resid[d]);
+      tbuf->x[d] = clamp_fpx(x[d] + resid[d]);
     }
     if (is_interrupted()) return 1;
   }
 
   // Final RMSNorm
-  rmsnorm(buf->x, buf->x, dec->final_norm, C, cfg->eps);
+  rmsnorm(tbuf->x, tbuf->x, dec->final_norm, embed_dim, tcfg->eps);
   if (is_interrupted()) return 1;
 
   // Compute logits (tied embedding)
@@ -6540,26 +6690,27 @@ forward_text_decode(
     if (!quant)
     {
       gemv_fpx(
-        buf->logits, dec->embedding->fpx, buf->x, cfg->vocab_size, C, true
+        tbuf->logits, dec->embedding->fpx, tbuf->x, tcfg->vocab_size, embed_dim,
+        true
       );
     }
     else
     {
-      floatx xscale = quantize_act(buf->x_i8, buf->x, C);
+      floatx xscale = quantize_act(tbuf->x_i8, tbuf->x, embed_dim);
       gemv_int8(
-        buf->logits, dec->embedding->i8.q, dec->embedding->i8.scales, buf->x_i8,
-        xscale, cfg->vocab_size, C, true
+        tbuf->logits, dec->embedding->i8.q, dec->embedding->i8.scales,
+        tbuf->x_i8, xscale, tcfg->vocab_size, embed_dim, true
       );
     }
     if (is_interrupted()) return 1;
 
     // Optional logit softcapping
-    if (cfg->logit_softcap != 0.0f)
+    if (tcfg->logit_softcap != 0.0f)
     {
-      for (uint32_t d = 0; d < cfg->vocab_size; d++)
+      for (uint32_t d = 0; d < tcfg->vocab_size; d++)
       {
-        float val      = (float)buf->logits[d] / cfg->logit_softcap;
-        buf->logits[d] = (floatx)(tanhf(val) * cfg->logit_softcap);
+        float val       = (float)tbuf->logits[d] / tcfg->logit_softcap;
+        tbuf->logits[d] = (floatx)(tanhf(val) * tcfg->logit_softcap);
       }
     }
     if (is_interrupted()) return 1;
@@ -6571,34 +6722,33 @@ forward_text_decode(
 static int
 forward_text_chunk(
   TextDecoder *dec,
-  TextBuffer  *buf,
+  TextBuffer  *tbuf,
   int          spos,
-  int          T,
+  int          n_tokens,
   bool         mask,
   bool         quant,
   bool         compute_logits
 )
 {
-  TextConfig *cfg = dec->config;
+  TextConfig *tcfg = dec->config;
 
-  if (quant && (buf->x_scales == NULL || buf->xo_scales == NULL ||
-                 buf->xg_scales == NULL))
+  if (quant && (tbuf->x_scales == NULL || tbuf->xo_scales == NULL ||
+                 tbuf->xg_scales == NULL))
   {
     log_error("scale buffers are not allocated");
     return 1;
   }
 
-  int C       = cfg->embed_dim;
-  int NH      = cfg->n_heads;
-  int NH_kv   = cfg->n_kv_heads;
-  int CH      = cfg->head_dim;
-  int Cq      = NH * CH;
-  int Ckv     = NH_kv * CH;
-  int CH_half = CH / 2;
+  int embed_dim  = tcfg->embed_dim;
+  int n_heads    = tcfg->n_heads;
+  int n_kv_heads = tcfg->n_kv_heads;
+  int head_dim   = tcfg->head_dim;
+  int q_size     = n_heads * head_dim;
+  int kv_size    = n_kv_heads * head_dim;
 
-  int epos = spos + T - 1;
+  int epos = spos + n_tokens - 1;
 
-  if (epos >= buf->cache_len)
+  if (epos >= tbuf->cache_len)
   {
     log_error("kv cache is full");
     return 1;
@@ -6606,44 +6756,44 @@ forward_text_chunk(
 
   // Precompute RoPE angles
   int t;
-  #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
-  for (t = 0; t < T; t++)
+  #pragma omp parallel for private(t) OMP_PARA_ARGS
+  for (t = 0; t < n_tokens; t++)
   {
     int pos = spos + t;
-    int off = t * CH;
+    int off = t * head_dim;
 
-    for (int d = 0; d < CH_half; d++)
+    for (int d = 0; d < head_dim / 2; d++)
     {
       float freq;
-      float e = (float)(-2 * d) / (float)CH;
+      float e = (float)(-2 * d) / (float)head_dim;
 
       // Sliding window angles
-      freq                               = powf(cfg->local_theta, e);
-      buf->csfreqs_slid[off + d * 2]     = (floatx)cosf(freq * (float)pos);
-      buf->csfreqs_slid[off + d * 2 + 1] = (floatx)sinf(freq * (float)pos);
+      freq                                = powf(tcfg->local_theta, e);
+      tbuf->csfreqs_slid[off + d * 2]     = (floatx)cosf(freq * (float)pos);
+      tbuf->csfreqs_slid[off + d * 2 + 1] = (floatx)sinf(freq * (float)pos);
 
       // Full attention angles
-      freq                               = powf(cfg->global_theta, e);
-      buf->csfreqs_full[off + d * 2]     = (floatx)cosf(freq * (float)pos);
-      buf->csfreqs_full[off + d * 2 + 1] = (floatx)sinf(freq * (float)pos);
+      freq                                = powf(tcfg->global_theta, e);
+      tbuf->csfreqs_full[off + d * 2]     = (floatx)cosf(freq * (float)pos);
+      tbuf->csfreqs_full[off + d * 2 + 1] = (floatx)sinf(freq * (float)pos);
     }
   }
   if (is_interrupted()) return 1;
 
-  floatx att_scale = (floatx)(1.0f / sqrtf((float)cfg->q_scale));
+  floatx att_scale = (floatx)(1.0f / sqrtf((float)tcfg->q_scale));
 
-  for (int l = 0; l < cfg->n_layers; l++)
+  for (int l = 0; l < tcfg->n_layers; l++)
   {
     TextDecoderLayer *layer = dec->layers[l];
 
-    memcpy(buf->resid, buf->x, T * C * sizeof(*buf->x));
+    memcpy(tbuf->resid, tbuf->x, n_tokens * embed_dim * sizeof(*tbuf->x));
 
     int t;
-    #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
-    for (t = 0; t < T; t++)
+    #pragma omp parallel for private(t) OMP_PARA_ARGS
+    for (t = 0; t < n_tokens; t++)
     {
-      floatx *x_row = buf->x + t * C;
-      rmsnorm(x_row, x_row, layer->n1, C, cfg->eps);
+      floatx *x_row = tbuf->x + t * embed_dim;
+      rmsnorm(x_row, x_row, layer->n1, embed_dim, tcfg->eps);
     }
     if (is_interrupted()) return 1;
 
@@ -6651,150 +6801,174 @@ forward_text_chunk(
 
     if (quant)
     {
-      quantize_acts(buf->x_i8, buf->x_scales, buf->x, 0, T, C, true);
+      quantize_acts(
+        tbuf->x_i8, tbuf->x_scales, tbuf->x, 0, n_tokens, embed_dim, true
+      );
     }
 
     // Compute xq & xk & xv
-    int h;
-    #pragma omp parallel for private(h) OMP_PARALLEL_ARGS
-    for (h = 0; h < NH; h++)
+    int  h;
+    bool quit = false;
+
+    #pragma omp parallel for private(h) reduction(|| : quit) OMP_PARA_ARGS
+    for (h = 0; h < n_heads; h++)
     {
-      floatx *xq_head = buf->xq + h * T * CH;  // (T, CH)
+      floatx *xq_head =
+        tbuf->xq + h * n_tokens * head_dim;  // (n_tokens, head_dim)
       if (!quant)
       {
-        gemm_fpx(
-          xq_head, 0, layer->wq->fpx + h * CH * C, 0, buf->x, 0, T, CH, C, false
-        );
+        if (gemm_fpx(
+              xq_head, 0, layer->wq->fpx + h * head_dim * embed_dim, 0, tbuf->x,
+              0, n_tokens, head_dim, embed_dim, false
+            ) == 1)
+          quit = true;
       }
       else
       {
-        gemm_int8(
-          xq_head, 0, layer->wq->i8.q + h * CH * C, 0,
-          layer->wq->i8.scales + h * CH, buf->x_i8, 0, buf->x_scales, T, CH, C,
-          false
-        );
+        if (gemm_int8(
+              xq_head, 0, layer->wq->i8.q + h * head_dim * embed_dim, 0,
+              layer->wq->i8.scales + h * head_dim, tbuf->x_i8, 0,
+              tbuf->x_scales, n_tokens, head_dim, embed_dim, false
+            ) == 1)
+          quit = true;
       }
-      if (h >= NH_kv) continue;
+      if (h >= n_kv_heads) continue;
 
-      floatx *xk_head = buf->xk + h * T * CH;
-      floatx *xv_head = buf->xv + h * T * CH;
+      floatx *xk_head = tbuf->xk + h * n_tokens * head_dim;
+      floatx *xv_head = tbuf->xv + h * n_tokens * head_dim;
 
       if (!quant)
       {
-        // (T, NH_kv, CH)
-        gemm_fpx(
-          xk_head, 0, layer->wk->fpx + h * CH * C, 0, buf->x, 0, T, CH, C, false
-        );
-        gemm_fpx(
-          xv_head, 0, layer->wv->fpx + h * CH * C, 0, buf->x, 0, T, CH, C, false
-        );
+        // (n_tokens, n_kv_heads, head_dim)
+        if (gemm_fpx(
+              xk_head, 0, layer->wk->fpx + h * head_dim * embed_dim, 0, tbuf->x,
+              0, n_tokens, head_dim, embed_dim, false
+            ) == 1 ||
+            gemm_fpx(
+              xv_head, 0, layer->wv->fpx + h * head_dim * embed_dim, 0, tbuf->x,
+              0, n_tokens, head_dim, embed_dim, false
+            ) == 1)
+          quit = true;
       }
       else
       {
-        gemm_int8(
-          xk_head, 0, layer->wk->i8.q + h * CH * C, 0,
-          layer->wk->i8.scales + h * CH, buf->x_i8, 0, buf->x_scales, T, CH, C,
-          false
-        );
-        gemm_int8(
-          xv_head, 0, layer->wv->i8.q + h * CH * C, 0,
-          layer->wv->i8.scales + h * CH, buf->x_i8, 0, buf->x_scales, T, CH, C,
-          false
-        );
+        if (gemm_int8(
+              xk_head, 0, layer->wk->i8.q + h * head_dim * embed_dim, 0,
+              layer->wk->i8.scales + h * head_dim, tbuf->x_i8, 0,
+              tbuf->x_scales, n_tokens, head_dim, embed_dim, false
+            ) == 1 ||
+            gemm_int8(
+              xv_head, 0, layer->wv->i8.q + h * head_dim * embed_dim, 0,
+              layer->wv->i8.scales + h * head_dim, tbuf->x_i8, 0,
+              tbuf->x_scales, n_tokens, head_dim, embed_dim, false
+            ) == 1)
+          quit = true;
       }
     }
     if (is_interrupted()) return 1;
 
     // Optional q & k norm
-    if (cfg->qk_norm)
+    if (tcfg->qk_norm)
     {
       int h, t;
-      #pragma omp parallel for private(h, t) OMP_COLLAPSE2 OMP_PARALLEL_ARGS
-      for (h = 0; h < NH; h++)
-        for (t = 0; t < T; t++)
+      #pragma omp parallel for private(h, t) OMP_COLLAPSE2 OMP_PARA_ARGS
+      for (h = 0; h < n_heads; h++)
+        for (t = 0; t < n_tokens; t++)
         {
           // Q norm
-          floatx *xq_head = buf->xq + h * T * CH + t * CH;
-          rmsnorm(xq_head, xq_head, layer->nq, CH, cfg->eps);
+          floatx *xq_head = tbuf->xq + h * n_tokens * head_dim + t * head_dim;
+          rmsnorm(xq_head, xq_head, layer->nq, head_dim, tcfg->eps);
 
-          if (h < NH_kv)
+          if (h < n_kv_heads)
           {
             // K norm
-            floatx *xk_head = buf->xk + h * T * CH + t * CH;
-            rmsnorm(xk_head, xk_head, layer->nk, CH, cfg->eps);
+            floatx *xk_head = tbuf->xk + h * n_tokens * head_dim + t * head_dim;
+            rmsnorm(xk_head, xk_head, layer->nk, head_dim, tcfg->eps);
           }
         }
     }
     if (is_interrupted()) return 1;
 
-    bool    is_local = cfg->att_layers[l];
-    floatx *freqs_cs = is_local ? buf->csfreqs_slid : buf->csfreqs_full;
+    bool    is_local = tcfg->att_layers[l];
+    floatx *freqs_cs = is_local ? tbuf->csfreqs_slid : tbuf->csfreqs_full;
 
     // RoPE
-    #pragma omp parallel for private(h, t) OMP_COLLAPSE2 OMP_PARALLEL_ARGS
-    for (h = 0; h < NH + NH_kv; h++)
-      for (t = 0; t < T; t++)
+    #pragma omp parallel for private(h, t) OMP_COLLAPSE2 OMP_PARA_ARGS
+    for (h = 0; h < n_heads + n_kv_heads; h++)
+      for (t = 0; t < n_tokens; t++)
       {
         floatx *data;
-        if (h < NH)
+        if (h < n_heads)
         {
-          data = buf->xq + h * T * CH + t * CH;  // Apply to queries
+          data = tbuf->xq + h * n_tokens * head_dim +
+                 t * head_dim;  // Apply to queries
         }
         else
         {
-          data = buf->xk + (h - NH) * T * CH + t * CH;  // Apply to keys
+          data = tbuf->xk + (h - n_heads) * n_tokens * head_dim +
+                 t * head_dim;  // Apply to keys
         }
 
-        for (int d = 0; d < CH_half; d++)
+        for (int d = 0; d < head_dim / 2; d++)
         {
-          float cfr = (float)freqs_cs[2 * d + t * CH];
-          float sfr = (float)freqs_cs[2 * d + 1 + t * CH];
+          float cfr = (float)freqs_cs[2 * d + t * head_dim];
+          float sfr = (float)freqs_cs[2 * d + 1 + t * head_dim];
           float a   = (float)data[d];  // Index in the first half vector
-          float b   = (float)data[d + CH_half];  // ... second half vector
+          float b   = (float)data[d + head_dim / 2];  // ... second half vector
           float r0  = a * cfr - b * sfr;
           float r1  = a * sfr + b * cfr;
 
           // Apply att_scale beforehand in this step, mathematically equivilant,
-          // but avoided scaling the entire T * max_k attention matrix
-          if (h < NH)
+          // but avoided scaling the entire n_tokens * max_k attention matrix
+          if (h < n_heads)
           {
             r0 *= (float)att_scale;
             r1 *= (float)att_scale;
           }
 
-          data[d]           = (floatx)r0;
-          data[d + CH_half] = (floatx)r1;
+          data[d]                = (floatx)r0;
+          data[d + head_dim / 2] = (floatx)r1;
         }
       }
 
     if (is_interrupted()) return 1;
 
-    // (NH_kv, cache_len, CH)
-    floatx *k_cache = buf->kv_cache + l * 2 * buf->cache_len * Ckv;
-    floatx *v_cache = k_cache + buf->cache_len * Ckv;
+    // (n_kv_heads, cache_len, head_dim)
+    floatx *k_cache = tbuf->kv_cache + l * 2 * tbuf->cache_len * kv_size;
+    floatx *v_cache = k_cache + tbuf->cache_len * kv_size;
 
     // Write to kv_cache
-    for (int h = 0; h < NH_kv; h++)
+    for (int h = 0; h < n_kv_heads; h++)
     {
-      floatx *xk_head = k_cache + h * buf->cache_len * CH + spos * CH;
-      floatx *xv_head = v_cache + h * buf->cache_len * CH + spos * CH;
-      memcpy(xk_head, buf->xk + h * T * CH, T * CH * sizeof(*buf->xk));
-      memcpy(xv_head, buf->xv + h * T * CH, T * CH * sizeof(*buf->xv));
+      floatx *xk_head =
+        k_cache + h * tbuf->cache_len * head_dim + spos * head_dim;
+      floatx *xv_head =
+        v_cache + h * tbuf->cache_len * head_dim + spos * head_dim;
+      memcpy(
+        xk_head, tbuf->xk + h * n_tokens * head_dim,
+        n_tokens * head_dim * sizeof(*tbuf->xk)
+      );
+      memcpy(
+        xv_head, tbuf->xv + h * n_tokens * head_dim,
+        n_tokens * head_dim * sizeof(*tbuf->xv)
+      );
     }
     if (is_interrupted()) return 1;
 
     int max_k = epos + 1;
+    quit      = false;
 
-    #pragma omp parallel for private(h) OMP_PARALLEL_ARGS
-    for (h = 0; h < NH; h++)
+    #pragma omp parallel for private(h) reduction(|| : quit) OMP_PARA_ARGS
+    for (h = 0; h < n_heads; h++)
     {
-      int h_kv = h * NH_kv / NH;  // GQA mapping
+      int h_kv = h * n_kv_heads / n_heads;  // GQA mapping
 
-      // (T, max_k)
-      floatx *att_head = buf->att + h * T * max_k;  // att[h, :, :]
-      // (cache_len, CH)
-      floatx *xv_head = v_cache + h_kv * buf->cache_len * CH;
-      floatx *xo_head = buf->xo + h * CH;  // (T, CH), column stride Cq
+      // (n_tokens, max_k)
+      floatx *att_head = tbuf->att + h * n_tokens * max_k;  // att[h, :, :]
+      // (cache_len, head_dim)
+      floatx *xv_head = v_cache + h_kv * tbuf->cache_len * head_dim;
+      floatx *xo_head =
+        tbuf->xo + h * head_dim;  // (n_tokens, head_dim), column stride q_size
 
       /* Blockwise causal masking, the tiling algorithm used in the
        * FlashAttention paper (Dao et al., 2022,
@@ -6805,7 +6979,7 @@ forward_text_chunk(
        * to provide better performance for causal masking.
        *
        * Naively computing causal attention means either (a) materializing the
-       * full [T, attlen] score matrix and masking out the upper triangle
+       * full [n_tokens, attlen] score matrix and masking out the upper triangle
        * afterwards (wastes ~half the compute), or (b) looping token by token
        * with a triangular schedule (correct FLOP count, but ragged inner loop
        * length basically kills vectorization across threads). So I tile both
@@ -6821,16 +6995,16 @@ forward_text_chunk(
 
       if (mask)  // Only apply tiling if mask=true
       {
-        for (int q_start = 0; q_start < T; q_start += QK_BLOCK_SIZE)
+        for (int q_start = 0; q_start < n_tokens; q_start += QK_BLOCK_SIZE)
         {
-          // xq[h, q_start:q_end, :] (q_end - q_start, CH)
-          floatx *qb          = buf->xq + h * T * CH + q_start * CH;
-          int     q_end       = min(q_start + QK_BLOCK_SIZE, T);
+          // xq[h, q_start:q_end, :] (q_end - q_start, head_dim)
+          floatx *qb = tbuf->xq + h * n_tokens * head_dim + q_start * head_dim;
+          int     q_end       = min(q_start + QK_BLOCK_SIZE, n_tokens);
           int     abs_q_end   = spos + q_end;
           int     abs_q_start = spos + q_start;
-          if (is_local && abs_q_start >= cfg->slide_len)
+          if (is_local && abs_q_start >= tcfg->slide_len)
           {
-            abs_q_start = abs_q_start + 1 - cfg->slide_len;
+            abs_q_start = abs_q_start + 1 - tcfg->slide_len;
           }
           else
           {
@@ -6841,23 +7015,25 @@ forward_text_chunk(
           for (int k_start = spos_b; k_start < abs_q_end;
             k_start += QK_BLOCK_SIZE)
           {
-            // k_cache[h_kv, k_start:k_end, :] (k_end - k_start, CH)
-            floatx *kb    = k_cache + h_kv * buf->cache_len * CH + k_start * CH;
+            // k_cache[h_kv, k_start:k_end, :] (k_end - k_start, head_dim)
+            floatx *kb =
+              k_cache + h_kv * tbuf->cache_len * head_dim + k_start * head_dim;
             int     k_end = min(k_start + QK_BLOCK_SIZE, max_k);
             floatx *att_b = att_head + q_start * max_k + k_start;
 
             // Typically people don't quantize this
-            gemm_fpx(
-              att_b, max_k, kb, 0, qb, 0, q_end - q_start, k_end - k_start, CH,
-              false
-            );
+            if (gemm_fpx(
+                  att_b, max_k, kb, 0, qb, 0, q_end - q_start, k_end - k_start,
+                  head_dim, false
+                ) == 1)
+              quit = true;
 
             // Apply causal mask & sliding window mask
             for (int qi = q_start; qi < q_end; qi++)
             {
               int pos_i  = spos + qi;
-              int spos_i = (is_local && pos_i >= cfg->slide_len)
-                             ? (pos_i + 1 - cfg->slide_len)
+              int spos_i = (is_local && pos_i >= tcfg->slide_len)
+                             ? (pos_i + 1 - tcfg->slide_len)
                              : 0;
               for (int ki = k_start; ki < k_end; ki++)
               {
@@ -6873,113 +7049,128 @@ forward_text_chunk(
           {
             floatx *att_row = att_head + qi * max_k;
             int     pos_i   = spos + qi;
-            int     spos_i  = (is_local && pos_i >= cfg->slide_len)
-                                ? (pos_i + 1 - cfg->slide_len)
+            int     spos_i  = (is_local && pos_i >= tcfg->slide_len)
+                                ? (pos_i + 1 - tcfg->slide_len)
                                 : 0;
 
             // Optional tanh softcapping
-            if (cfg->att_softcap != 0.0f)
+            if (tcfg->att_softcap != 0.0f)
             {
               for (int t = spos_i; t <= pos_i; t++)
               {
-                float val  = (float)att_row[t] / cfg->att_softcap;
-                att_row[t] = (floatx)(tanhf(val) * cfg->att_softcap);
+                float val  = (float)att_row[t] / tcfg->att_softcap;
+                att_row[t] = (floatx)(tanhf(val) * tcfg->att_softcap);
               }
             }
             // only softmax in the range [spos_i, pos_i]
             softmax(att_row + spos_i, att_row + spos_i, pos_i - spos_i + 1);
           }
 
-          // xo_block (qb_len, CH) = att_block (qb_len, qb_len)
-          //                       @ v_block   (qb_len, CH)
-          floatx *xo_block  = xo_head + q_start * Cq;
+          // xo_block (qb_len, head_dim) = att_block (qb_len, qb_len)
+          //                             @ v_block (qb_len, head_dim)
+          floatx *xo_block  = xo_head + q_start * q_size;
           floatx *att_block = att_head + q_start * max_k + spos_b;
-          floatx *v_block   = xv_head + spos_b * CH;
+          floatx *v_block   = xv_head + spos_b * head_dim;
 
           gemm_fpx_nn(
-            xo_block, /*dst_stride=*/Cq, v_block, /*mat_stride=*/0, att_block,
-            /*src_stride=*/max_k, q_end - q_start, CH, abs_q_end - spos_b, false
+            xo_block, /*dst_stride=*/q_size, v_block, /*mat_stride=*/0,
+            att_block,
+            /*src_stride=*/max_k, q_end - q_start, head_dim, abs_q_end - spos_b,
+            false
           );
         }
       }
       else  // mask=false, take the dense path
       {
-        // (T, CH)
-        floatx *xq_head = buf->xq + h * T * CH;  // xq[h, :, :]
-        // k_cache[h_kv, :, :] (cache_len, CH)
-        floatx *xk_head = k_cache + h_kv * buf->cache_len * CH;
+        // (n_tokens, head_dim)
+        floatx *xq_head = tbuf->xq + h * n_tokens * head_dim;  // xq[h, :, :]
+        // k_cache[h_kv, :, :] (cache_len, head_dim)
+        floatx *xk_head = k_cache + h_kv * tbuf->cache_len * head_dim;
         // att_head = xq_head @ xk_head.T
-        gemm_fpx(att_head, max_k, xk_head, 0, xq_head, 0, T, max_k, CH, false);
+        if (gemm_fpx(
+              att_head, max_k, xk_head, 0, xq_head, 0, n_tokens, max_k,
+              head_dim, false
+            ))
+          quit = true;
 
-        for (int qi = 0; qi < T; qi++)
+        for (int qi = 0; qi < n_tokens; qi++)
         {
           floatx *att_row = att_head + qi * max_k;
 
           // Optional tanh softcapping
           for (int t = 0; t < max_k; t++)
           {
-            if (cfg->att_softcap != 0.0f)
+            if (tcfg->att_softcap != 0.0f)
             {
-              float val  = (float)att_row[t] / cfg->att_softcap;
-              att_row[t] = (floatx)(tanhf(val) * cfg->att_softcap);
+              float val  = (float)att_row[t] / tcfg->att_softcap;
+              att_row[t] = (floatx)(tanhf(val) * tcfg->att_softcap);
             }
           }
           // Softmax
           softmax(att_row, att_row, max_k);
         }
-        // xo_head (T, CH) = att_head (T, max_k) @ xv_head[:max_k] (max_k, CH)
+        // xo_head (n_tokens, head_dim) = att_head (n_tokens, max_k)
+        //                              @ xv_head[:max_k] (max_k, head_dim)
         gemm_fpx_nn(
-          xo_head, /*dst_stride=*/Cq, xv_head, /*mat_stride=*/0, att_head,
-          /*src_stride=*/max_k, T, CH, max_k, false
+          xo_head, /*dst_stride=*/q_size, xv_head, /*mat_stride=*/0, att_head,
+          /*src_stride=*/max_k, n_tokens, head_dim, max_k, false
         );
       }
     }
     if (is_interrupted()) return 1;
-    // x (T, C) = xo_head (T, CH) @ wo.T (CH, C)
+    // x (n_tokens, embed_dim) = xo_head (n_tokens, head_dim)
+    //                         @ wo.T (head_dim, embed_dim)
     if (!quant)
     {
-      gemm_fpx(buf->x, 0, layer->wo->fpx, 0, buf->xo, Cq, T, C, Cq, true);
+      if (gemm_fpx(
+            tbuf->x, 0, layer->wo->fpx, 0, tbuf->xo, q_size, n_tokens,
+            embed_dim, q_size, true
+          ) == 1)
+        return 1;
     }
     else
     {
-      quantize_acts(buf->xo_i8, buf->xo_scales, buf->xo, Cq, T, Cq, true);
-      gemm_int8(
-        buf->x, 0, layer->wo->i8.q, 0, layer->wo->i8.scales, buf->xo_i8, 0,
-        buf->xo_scales, T, C, Cq, true
+      quantize_acts(
+        tbuf->xo_i8, tbuf->xo_scales, tbuf->xo, q_size, n_tokens, q_size, true
       );
+      if (gemm_int8(
+            tbuf->x, 0, layer->wo->i8.q, 0, layer->wo->i8.scales, tbuf->xo_i8,
+            0, tbuf->xo_scales, n_tokens, embed_dim, q_size, true
+          ) == 1)
+        return 1;
     }
     if (is_interrupted()) return 1;
 
-    #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
-    for (t = 0; t < T; t++)
+    #pragma omp parallel for private(t) OMP_PARA_ARGS
+    for (t = 0; t < n_tokens; t++)
     {
-      floatx *x_row = buf->x + t * C;
-      rmsnorm(x_row, x_row, layer->n2, C, cfg->eps);
+      floatx *x_row = tbuf->x + t * embed_dim;
+      rmsnorm(x_row, x_row, layer->n2, embed_dim, tcfg->eps);
     }
     if (is_interrupted()) return 1;
 
-    floatx *RESTRICT x     = buf->x;
-    floatx *RESTRICT resid = buf->resid;
+    floatx *RESTRICT x     = tbuf->x;
+    floatx *RESTRICT resid = tbuf->resid;
 
     int d;
-    #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
-    for (d = 0; d < T * C; d++)
+    #pragma omp parallel for private(d) OMP_PARA_ARGS
+    for (d = 0; d < n_tokens * embed_dim; d++)
     {
       // Combine the residual stream
-      buf->x[d] = clamp_fpx(x[d] + resid[d]);
+      tbuf->x[d] = clamp_fpx(x[d] + resid[d]);
     }
     if (is_interrupted()) return 1;
 
-    memcpy(buf->resid, buf->x, T * C * sizeof(*buf->x));
+    memcpy(tbuf->resid, tbuf->x, n_tokens * embed_dim * sizeof(*tbuf->x));
 
-    if (cfg->pre_mlp_norm)
+    if (tcfg->pre_mlp_norm)
     {
       int t;
-      #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
-      for (t = 0; t < T; t++)
+      #pragma omp parallel for private(t) OMP_PARA_ARGS
+      for (t = 0; t < n_tokens; t++)
       {
-        floatx *x_row = buf->x + t * C;
-        rmsnorm(x_row, x_row, layer->n3, C, cfg->eps);
+        floatx *x_row = tbuf->x + t * embed_dim;
+        rmsnorm(x_row, x_row, layer->n3, embed_dim, tcfg->eps);
       }
     }
     if (is_interrupted()) return 1;
@@ -6987,116 +7178,126 @@ forward_text_chunk(
     // MLP
     if (!quant)
     {
-      gemm_fpx(
-        buf->xu, 0, layer->w1->fpx, 0, buf->x, 0, T, cfg->mlp_dim, C, true
-      );
-      gemm_fpx(
-        buf->xg, 0, layer->w2->fpx, 0, buf->x, 0, T, cfg->mlp_dim, C, true
-      );
+      if (gemm_fpx(
+            tbuf->xu, 0, layer->w1->fpx, 0, tbuf->x, 0, n_tokens, tcfg->mlp_dim,
+            embed_dim, true
+          ) == 1 ||
+          gemm_fpx(
+            tbuf->xg, 0, layer->w2->fpx, 0, tbuf->x, 0, n_tokens, tcfg->mlp_dim,
+            embed_dim, true
+          ) == 1)
+        return 1;
     }
     else
     {
-      quantize_acts(buf->x_i8, buf->x_scales, buf->x, 0, T, C, true);
-      gemm_int8(
-        buf->xu, 0, layer->w1->i8.q, 0, layer->w1->i8.scales, buf->x_i8, 0,
-        buf->x_scales, T, cfg->mlp_dim, C, true
+      quantize_acts(
+        tbuf->x_i8, tbuf->x_scales, tbuf->x, 0, n_tokens, embed_dim, true
       );
-      gemm_int8(
-        buf->xg, 0, layer->w2->i8.q, 0, layer->w2->i8.scales, buf->x_i8, 0,
-        buf->x_scales, T, cfg->mlp_dim, C, true
-      );
+      if (gemm_int8(
+            tbuf->xu, 0, layer->w1->i8.q, 0, layer->w1->i8.scales, tbuf->x_i8,
+            0, tbuf->x_scales, n_tokens, tcfg->mlp_dim, embed_dim, true
+          ) == 1 ||
+          gemm_int8(
+            tbuf->xg, 0, layer->w2->i8.q, 0, layer->w2->i8.scales, tbuf->x_i8,
+            0, tbuf->x_scales, n_tokens, tcfg->mlp_dim, embed_dim, true
+          ))
+        return 1;
     }
     if (is_interrupted()) return 1;
 
     // GELU gate
-    #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
-    for (d = 0; d < T * cfg->mlp_dim; d++)
+    #pragma omp parallel for private(d) OMP_PARA_ARGS
+    for (d = 0; d < n_tokens * tcfg->mlp_dim; d++)
     {
       // Tanh approximation of GELU
-      float x    = (float)buf->xg[d];
-      float c    = 0.79788456080287f;  // = sqrt(2 / pi)
-      x          = 0.5 * x * (1 + tanhf(c * (x + 0.044715 * x * x * x)));
-      buf->xg[d] = (floatx)x;
-      buf->xg[d] *= buf->xu[d];  // Fuse xg * xu into xg
+      float x     = (float)tbuf->xg[d];
+      float c     = 0.79788456080287f;  // = sqrt(2 / pi)
+      x           = 0.5 * x * (1 + tanhf(c * (x + 0.044715 * x * x * x)));
+      tbuf->xg[d] = (floatx)x;
+      tbuf->xg[d] *= tbuf->xu[d];  // Fuse xg * xu into xg
     }
     if (is_interrupted()) return 1;
 
     // Down projection
     if (!quant)
     {
-      gemm_fpx(
-        buf->x, 0, layer->w3->fpx, 0, buf->xg, 0, T, C, cfg->mlp_dim, true
-      );
+      if (gemm_fpx(
+            tbuf->x, 0, layer->w3->fpx, 0, tbuf->xg, 0, n_tokens, embed_dim,
+            tcfg->mlp_dim, true
+          ) == 1)
+        return 1;
     }
     else
     {
       quantize_acts(
-        buf->xg_i8, buf->xg_scales, buf->xg, 0, T, cfg->mlp_dim, true
+        tbuf->xg_i8, tbuf->xg_scales, tbuf->xg, 0, n_tokens, tcfg->mlp_dim, true
       );
-      gemm_int8(
-        buf->x, 0, layer->w3->i8.q, 0, layer->w3->i8.scales, buf->xg_i8, 0,
-        buf->xg_scales, T, C, cfg->mlp_dim, true
-      );
+      if (gemm_int8(
+            tbuf->x, 0, layer->w3->i8.q, 0, layer->w3->i8.scales, tbuf->xg_i8,
+            0, tbuf->xg_scales, n_tokens, embed_dim, tcfg->mlp_dim, true
+          ) == 1)
+        return 1;
     }
     if (is_interrupted()) return 1;
 
-    if (cfg->pst_mlp_norm)
+    if (tcfg->pst_mlp_norm)
     {
-      #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
-      for (t = 0; t < T; t++)
+      #pragma omp parallel for private(t) OMP_PARA_ARGS
+      for (t = 0; t < n_tokens; t++)
       {
-        floatx *x_row = buf->x + t * C;
-        rmsnorm(x_row, x_row, layer->n4, C, cfg->eps);
+        floatx *x_row = tbuf->x + t * embed_dim;
+        rmsnorm(x_row, x_row, layer->n4, embed_dim, tcfg->eps);
       }
     }
     if (is_interrupted()) return 1;
 
-    x     = buf->x;
-    resid = buf->resid;
-    #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
-    for (d = 0; d < T * C; d++)
+    x     = tbuf->x;
+    resid = tbuf->resid;
+    #pragma omp parallel for private(d) OMP_PARA_ARGS
+    for (d = 0; d < n_tokens * embed_dim; d++)
     {
       // Second residual
-      buf->x[d] = clamp_fpx(x[d] + resid[d]);
+      tbuf->x[d] = clamp_fpx(x[d] + resid[d]);
     }
     if (is_interrupted()) return 1;
   }
 
   // Final RMSNorm
-  #pragma omp parallel for private(t) OMP_PARALLEL_ARGS
-  for (t = 0; t < T; t++)
+  #pragma omp parallel for private(t) OMP_PARA_ARGS
+  for (t = 0; t < n_tokens; t++)
   {
-    floatx *x_row = buf->x + t * C;
-    rmsnorm(x_row, x_row, dec->final_norm, C, cfg->eps);
+    floatx *x_row = tbuf->x + t * embed_dim;
+    rmsnorm(x_row, x_row, dec->final_norm, embed_dim, tcfg->eps);
   }
 
   // Compute logits (tied embedding)
   if (compute_logits)
   {
-    floatx *last_x = buf->x + (T - 1) * C;
+    floatx *last_x = tbuf->x + (n_tokens - 1) * embed_dim;
     if (!quant)
     {
       gemv_fpx(
-        buf->logits, dec->embedding->fpx, last_x, cfg->vocab_size, C, true
+        tbuf->logits, dec->embedding->fpx, last_x, tcfg->vocab_size, embed_dim,
+        true
       );
     }
     else
     {
-      floatx xscale = quantize_act(buf->x_i8, last_x, C);
+      floatx xscale = quantize_act(tbuf->x_i8, last_x, embed_dim);
       gemv_int8(
-        buf->logits, dec->embedding->i8.q, dec->embedding->i8.scales, buf->x_i8,
-        xscale, cfg->vocab_size, C, true
+        tbuf->logits, dec->embedding->i8.q, dec->embedding->i8.scales,
+        tbuf->x_i8, xscale, tcfg->vocab_size, embed_dim, true
       );
     }
     if (is_interrupted()) return 1;
 
     // Optional logit softcapping
-    if (cfg->logit_softcap != 0.0f)
+    if (tcfg->logit_softcap != 0.0f)
     {
-      for (uint32_t d = 0; d < cfg->vocab_size; d++)
+      for (uint32_t d = 0; d < tcfg->vocab_size; d++)
       {
-        float val      = (float)buf->logits[d] / cfg->logit_softcap;
-        buf->logits[d] = (floatx)(tanhf(val) * cfg->logit_softcap);
+        float val       = (float)tbuf->logits[d] / tcfg->logit_softcap;
+        tbuf->logits[d] = (floatx)(tanhf(val) * tcfg->logit_softcap);
       }
     }
     if (is_interrupted()) return 1;
@@ -7108,7 +7309,7 @@ NO_FAST_MATH_END;
 
 /* Language + vision model forward */
 int
-forward_gemma_decode(GemmaModel *model, TextBuffer *buf, int token, int pos)
+forward_gemma_decode(GemmaModel *model, TextBuffer *tbuf, int token, int pos)
 {
   TextDecoder *dec = model->decoder;
 
@@ -7123,82 +7324,85 @@ forward_gemma_decode(GemmaModel *model, TextBuffer *buf, int token, int pos)
     embed_scale *= dec->embedding->i8.scales[token];
   }
 
-  int C = dec->config->embed_dim;
+  int embed_dim = dec->config->embed_dim;
 
   // x = embedding[tok] * embed_scale
   int d;
-  #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
-  for (d = 0; d < C; d++)
+  #pragma omp parallel for private(d) OMP_PARA_ARGS
+  for (d = 0; d < embed_dim; d++)
   {
     if (!model->quant)
     {
-      buf->x[d] = dec->embedding->fpx[token * C + d] * embed_scale;
+      tbuf->x[d] = dec->embedding->fpx[token * embed_dim + d] * embed_scale;
     }
     else
     {
-      buf->x[d] = (floatx)dec->embedding->i8.q[token * C + d] * embed_scale;
+      tbuf->x[d] =
+        (floatx)dec->embedding->i8.q[token * embed_dim + d] * embed_scale;
     }
   }
   if (is_interrupted()) return 1;
-  return forward_text_decode(model->decoder, buf, pos, model->quant, true);
+  return forward_text_decode(model->decoder, tbuf, pos, model->quant, true);
 }
 
 /* Language model prefill */
 int
 forward_gemma_prefill(
   GemmaModel *model,
-  TextBuffer *buf,
+  TextBuffer *tbuf,
   int        *tokens,
-  int         T,
+  int         n_tokens,
   int        *pos,
   int         chunk_size,
   bool       *rpen_visited,
   bool        compute_logits
 )
 {
-  TextDecoder *dec = model->decoder;
-  int          C   = dec->config->embed_dim;
+  TextDecoder *dec       = model->decoder;
+  int          embed_dim = dec->config->embed_dim;
 
   // Prefill by chunks
-  for (int off = 0; off < T; off += chunk_size)
+  for (int off = 0; off < n_tokens; off += chunk_size)
   {
-    int  cur_len       = min(chunk_size, T - off);
-    bool is_last_chunk = (off + cur_len == T);
+    int  cur_len       = min(chunk_size, n_tokens - off);
+    bool is_last_chunk = (off + cur_len == n_tokens);
 
     // Embedding lookup
     for (int t = 0; t < cur_len; t++)
     {
       int token   = tokens[off + t];
-      int emb_off = t * C;
+      int emb_off = t * embed_dim;
 
       if (rpen_visited != NULL)
       {
         rpen_visited[token] = true;
       }
 
-      for (int d = 0; d < C; d++)
+      for (int d = 0; d < embed_dim; d++)
       {
         if (!model->quant)
         {
-          buf->x[emb_off + d] = dec->embedding->fpx[token * C + d];  // * 1.0f
+          tbuf->x[emb_off + d] =
+            dec->embedding->fpx[token * embed_dim + d];  // * 1.0f
         }
         else
         {
-          buf->x[emb_off + d] = (floatx)dec->embedding->i8.q[token * C + d] *
-                                dec->embedding->i8.scales[token];
+          tbuf->x[emb_off + d] =
+            (floatx)dec->embedding->i8.q[token * embed_dim + d] *
+            dec->embedding->i8.scales[token];
         }
       }
     }
 
     int rc = forward_text_chunk(
-      dec, buf, *pos + off, cur_len, true, model->quant,
+      dec, tbuf, *pos + off, cur_len, true, model->quant,
       is_last_chunk && compute_logits
     );
 
     if (rc != 0) return rc;
   }
 
-  *pos += T;
+  *pos += n_tokens;
   return 0;
 }
 
@@ -7206,7 +7410,7 @@ forward_gemma_prefill(
 int
 forward_gemma_image(
   GemmaModel   *model,
-  TextBuffer   *buf,
+  TextBuffer   *tbuf,
   VisionBuffer *vbuf,
   const floatx *image,
   int          *pos,
@@ -7220,7 +7424,7 @@ forward_gemma_image(
   }
 
   TextDecoder *dec = model->decoder;
-  if (forward_vision(enc, dec->config, buf, vbuf, image, model->quant) == 1)
+  if (forward_vision(enc, dec->config, tbuf, vbuf, image, model->quant) == 1)
   {
     return 1;
   }
@@ -7229,7 +7433,7 @@ forward_gemma_image(
 
   int suc = forward_text_chunk(
     // Gemma 3 models uses bi-directional attention for vision tokens
-    dec, buf, *pos, image_toks, false, model->quant, compute_logits
+    dec, tbuf, *pos, image_toks, false, model->quant, compute_logits
   );
 
   *pos += image_toks;
@@ -7245,7 +7449,7 @@ argmax(floatx *logits, int vocab_size)
   // Pick the index with the max value
   int    max_idx = -1;
   floatx max_val = -FLOATX_MAX;
-  #pragma omp parallel OMP_PARALLEL_ARGS
+  #pragma omp parallel OMP_PARA_ARGS
   {
     int    local_idx = -1;
     floatx local_val = -FLOATX_MAX;
@@ -7359,7 +7563,7 @@ apply_topk(floatx *logits, FloatIdx *logit_indices, int vocab_size, int k)
 
   // Record index info
   int i;
-  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(i) OMP_PARA_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     logit_indices[i].idx = i;
@@ -7368,7 +7572,7 @@ apply_topk(floatx *logits, FloatIdx *logit_indices, int vocab_size, int k)
   quickselect_topk(logit_indices, 0, vocab_size - 1, k - 1);
 
   // Keep the top k channels
-  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(i) OMP_PARA_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     logits[i] = -FLOATX_MAX;
@@ -7437,7 +7641,7 @@ apply_topp(
   if (k == 0)
   {
     int i;
-    #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
+    #pragma omp parallel for private(i) OMP_PARA_ARGS
     for (i = 0; i < vocab_size; i++)
     {
       logit_indices[i].idx = i;
@@ -7459,7 +7663,7 @@ apply_topp(
 
   // Set logits to -inf
   int i;
-  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(i) OMP_PARA_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     logits[i] = -FLOATX_MAX;
@@ -7487,7 +7691,7 @@ apply_rpen(floatx *logits, bool *visited, int vocab_size, float rpen)
 {
   // rpen short for Repetition Penalty
   int i;
-  #pragma omp parallel for private(i) OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(i) OMP_PARA_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     if (!visited[i]) continue;
@@ -7557,7 +7761,7 @@ sample_from_logits(
 
   // Apply the temperature
   int d;
-  #pragma omp parallel for private(d) OMP_PARALLEL_ARGS
+  #pragma omp parallel for private(d) OMP_PARA_ARGS
   for (d = 0; d < vocab_size; d++)
   {
     logits[d] /= (floatx)temperature;
@@ -7599,8 +7803,9 @@ sample_from_logits(
 /* The main sampling loop */
 void
 sample(
+  // Input parameters
   GemmaModel   *model,
-  TextBuffer   *buf,
+  TextBuffer   *tbuf,
   VisionBuffer *vbuf,
   int           seqlen,
   int           chunk_size,
@@ -7608,62 +7813,66 @@ sample(
   int           topk,
   float         topp,
   float         rpen,
-  bool          use_mm,
+  bool          enable_mm,
   void         *inject_ctx,
   InjectData (*inject_callback)(
-    int token, GemmaModel *model, bool use_mm, void *ctx
-  )
+    int token, GemmaModel *model, bool enable_mm, void *ctx
+  ),
+  // Output parameters
+  double *prefill_elapsed,
+  int    *prefill_toks,
+  double *gen_elapsed,
+  int    *gen_toks
 )
 {
-  TextConfig *cfg = model->decoder->config;
-  int         vs  = cfg->vocab_size;
+  TextConfig *tcfg       = model->decoder->config;
+  int         vocab_size = tcfg->vocab_size;
 
-  bool   dosample        = temperature != 0 && topk != 1;
-  bool   use_topk        = dosample && topk != 0;
-  bool   use_topp        = dosample && topp < 1.0f;
-  bool   use_rpen        = dosample && rpen > 1.0f;
-  double prefill_start   = 0.0;
-  double prefill_end     = 0.0;
-  double prefill_elapsed = 0.0;
-  double gen_start       = 0.0;
-  double gen_end         = 0.0;
-  double gen_elapsed     = 0.0;
-  int    prompt_toks     = 0;
-  int    gen_toks        = 0;
-  int    pos             = 0;
-  int    token           = 0;
-
+  double    prefill_start = 0.0;
+  double    prefill_end   = 0.0;
+  double    gen_start     = 0.0;
+  double    gen_end       = 0.0;
+  int       pos           = 0;
+  int       token         = 0;
+  bool      dosample      = temperature != 0 && topk != 1;
+  bool      use_topk      = dosample && topk != 0;
+  bool      use_topp      = dosample && topp < 1.0f;
+  bool      use_rpen      = dosample && rpen > 1.0f;
   bool     *visited       = NULL;
   floatx   *probs         = NULL;
   FloatIdx *logit_indices = NULL;
 
+  *prefill_elapsed = 0.0;
+  *prefill_toks    = 0;
+  *gen_elapsed     = 0.0;
+  *gen_toks        = 0;
+
   if (use_rpen)
   {
-    if (!(visited = calloc_ckd((size_t)vs, sizeof(*visited)))) goto end;
+    if (!(visited = calloc_ckd((size_t)vocab_size, sizeof(*visited)))) goto end;
   }
   if (dosample)
   {
-    if (!(probs = malloc_ckd((size_t)vs, sizeof(*probs)))) goto end;
+    if (!(probs = malloc_ckd((size_t)vocab_size, sizeof(*probs)))) goto end;
   }
   if (use_topk || use_topp)
   {
-    if (!(logit_indices = malloc_ckd((size_t)vs, sizeof(*logit_indices))))
+    if (!(logit_indices =
+            malloc_ckd((size_t)vocab_size, sizeof(*logit_indices))))
       goto end;
   }
 
   // `<bos>` is always the very first token of the sequence
+  int bos_tok = model->tokenizer->bos;
+  if (forward_gemma_prefill(
+        model, tbuf, &bos_tok, 1, &pos, chunk_size, visited, false
+      ) == 1)
   {
-    int bos_tok = model->tokenizer->bos;
-    if (forward_gemma_prefill(
-          model, buf, &bos_tok, 1, &pos, chunk_size, visited, false
-        ) == 1)
-    {
-      goto end;
-    }
-    prompt_toks = 1;
+    goto end;
   }
+  *prefill_toks = 1;
 
-  InjectData injected = inject_callback(EOF, model, use_mm, inject_ctx);
+  InjectData injected = inject_callback(EOF, model, enable_mm, inject_ctx);
 
   while (pos < seqlen && injected.type != INJECT_QUIT)
   {
@@ -7671,10 +7880,10 @@ sample(
     {
       // pure auto-regressive step
       gen_start = now_sec();
-      if (forward_gemma_decode(model, buf, token, pos) == 1) goto end;
+      if (forward_gemma_decode(model, tbuf, token, pos) == 1) goto end;
       pos++;
       gen_end = now_sec();
-      gen_elapsed += gen_end - gen_start;
+      *gen_elapsed += gen_end - gen_start;
 
       if (is_interrupted()) break;
       // Fall through to common sample
@@ -7686,7 +7895,7 @@ sample(
     else
     {
       // Data injection (text / image)
-      InjectData next    = inject_callback(EOF, model, use_mm, inject_ctx);
+      InjectData next    = inject_callback(EOF, model, enable_mm, inject_ctx);
       bool       is_last = (next.type == INJECT_DONE);
 
       int prev_pos  = pos;
@@ -7695,7 +7904,7 @@ sample(
       if (injected.type == INJECT_TEXT)
       {
         if (forward_gemma_prefill(
-              model, buf, injected.tokens, injected.n_tokens, &pos, chunk_size,
+              model, tbuf, injected.tokens, injected.n_tokens, &pos, chunk_size,
               visited, is_last
             ) == 1)
         {
@@ -7705,7 +7914,7 @@ sample(
       else if (injected.type == INJECT_IMAG)
       {
         if (forward_gemma_image(
-              model, buf, vbuf, injected.image, &pos, is_last
+              model, tbuf, vbuf, injected.image, &pos, is_last
             ) == 1)
         {
           goto end;
@@ -7713,8 +7922,8 @@ sample(
       }
 
       prefill_end = now_sec();
-      prefill_elapsed += prefill_end - prefill_start;
-      prompt_toks += pos - prev_pos;
+      *prefill_elapsed += prefill_end - prefill_start;
+      *prefill_toks += pos - prev_pos;
 
       if (is_interrupted()) break;
 
@@ -7729,47 +7938,24 @@ sample(
 
     // Common sample path (both Case A and last-injection)
     token = sample_from_logits(
-      buf->logits, probs, logit_indices, visited, vs, temperature, topk, topp,
-      rpen
+      tbuf->logits, probs, logit_indices, visited, vocab_size, temperature,
+      topk, topp, rpen
     );
     if (use_rpen) visited[token] = true;
-    gen_toks++;
+    (*gen_toks)++;
 
     // only the is_last path needs to close the gen timer here
     // the pure-generation path already closed it before the fall-through
     if (injected.type != INJECT_NONE)
     {
       gen_end = now_sec();
-      gen_elapsed += gen_end - gen_start;
+      *gen_elapsed += gen_end - gen_start;
     }
 
-    injected = inject_callback(token, model, use_mm, inject_ctx);
+    injected = inject_callback(token, model, enable_mm, inject_ctx);
   }
 
 end:
-  if (prefill_elapsed > 0.0)
-  {
-    printf(
-      "\n\nprompt processed %d tokens in %.2f seconds (%.2f tok/s)\n",
-      prompt_toks, prefill_elapsed, prompt_toks / prefill_elapsed
-    );
-  }
-  else
-  {
-    printf("\n\nprompt processed %d tokens instantly\n", prompt_toks);
-  }
-  if (gen_elapsed > 0.0)
-  {
-    printf(
-      "generated %d tokens in %.2f seconds (%.2f tok/s)\n", gen_toks,
-      gen_elapsed, gen_toks / gen_elapsed
-    );
-  }
-  else
-  {
-    printf("generated %d tokens instantly\n", gen_toks);
-  }
-
   free(probs);
   if (use_rpen) free(visited);
   if (use_topk || use_topp) free(logit_indices);
@@ -7810,11 +7996,12 @@ typedef struct
   enum
   {
     COMMAND_IMAGE = 0,
-    COMMAND_IMAGE_PAS,
-    COMMAND_TOTAL,
+    COMMAND_LONGIMAGE,
   } id;
-  bool (*should_ignore)(GemmaModel *model, bool use_mm);
-  InjectData (*inject_next)(GemmaModel *model, InjectContext *ctx, bool use_mm);
+  bool (*should_ignore)(GemmaModel *model, bool enable_mm);
+  InjectData (*inject_next)(
+    GemmaModel *model, InjectContext *ctx, bool enable_mm
+  );
 } CommandType;
 
 /* */
@@ -7883,15 +8070,15 @@ typedef struct
 
 /* */
 bool
-image_should_ignore(GemmaModel *model, bool use_mm)
+image_should_ignore(GemmaModel *model, bool enable_mm)
 {
   (void)model;
-  return !use_mm;
+  return !(model->support_mm && enable_mm);
 }
 
 /* */
 InjectData
-image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
+image_inject_next(GemmaModel *model, InjectContext *ctx, bool enable_mm)
 {
   /* Template:
    * \n\n<start_of_image>[image soft tokens]<end_of_image>\n\n */
@@ -7900,7 +8087,8 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
   GemmaTokenizer *tok     = model->tokenizer;
   CommandContext *cmd_ctx = &ctx->cmd_ctx;
 
-  int spos, epos;
+  int  spos, epos;
+  bool use_mm = model->support_mm && enable_mm;
 
   /* A classic Duff-style hack that fakes a generator/coroutine using an
    * explicit state machine, each call resumes at the `case` matching the
@@ -7918,6 +8106,9 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
       ctx->tokens_buf[ctx->tokens_len++] = tok->soi;
       epos                               = ctx->tokens_len;
 
+      // The following structure can be treated as a `yield`:
+
+      // ----------------------------------------------------
       cmd_ctx->state = 1;
       return (InjectData){
         .type     = INJECT_TEXT,
@@ -7926,9 +8117,11 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
       };
 
     case 1:
+      // ----------------------------------------------------
+
       // Inject image
-      ;  // "label followed by a declaration is a C23 extension"
-      int  img_sz     = (enc && use_mm) ? enc->config->image_size : 0;
+      ;  // "label followed by a declaration is a C23 extension" :P
+      int  image_size = (enc && use_mm) ? enc->config->image_size : 0;
       char path[4096] = {0};
       if ((size_t)cmd_ctx->arg_len >= sizeof(path))
       {
@@ -7937,7 +8130,7 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
         return (InjectData){.type = INJECT_QUIT};
       }
       memcpy(path, cmd_ctx->arg, cmd_ctx->arg_len);
-      cmd_ctx->img = prepare_image(path, img_sz);
+      cmd_ctx->img = prepare_image(path, image_size);
       if (cmd_ctx->img == NULL)
       {
         log_error("failed to prepare image: '%s'", path);
@@ -7972,15 +8165,15 @@ image_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
 
 /* */
 bool
-image_pas_should_ignore(GemmaModel *model, bool use_mm)
+longimage_should_ignore(GemmaModel *model, bool enable_mm)
 {
   (void)model;
-  return !use_mm;
+  return !(model->support_mm && enable_mm);
 }
 
 /* */
 InjectData
-image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
+longimage_inject_next(GemmaModel *model, InjectContext *ctx, bool enable_mm)
 {
   // A funny workaround for long images, crop the full image and send the crops
   // to the model
@@ -8004,8 +8197,9 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
   GemmaTokenizer *tok     = model->tokenizer;
   CommandContext *cmd_ctx = &ctx->cmd_ctx;
 
-  int spos, epos;
-  int img_sz = (enc && use_mm) ? enc->config->image_size : 0;
+  int  spos, epos;
+  bool use_mm     = model->support_mm && enable_mm;
+  int  image_size = (enc && use_mm) ? enc->config->image_size : 0;
 
   switch (cmd_ctx->state)
   {
@@ -8041,8 +8235,9 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
       cmd_ctx->path[cmd_ctx->arg_len] = '\0';
 
       // Save the image to cmd_ctx->crops
-      cmd_ctx->crops = prepare_image_pas(
-        cmd_ctx->path, img_sz, MIN_CROP_SIZE, MAX_NUM_CROPS, &cmd_ctx->n_crops
+      cmd_ctx->crops = prepare_longimage(
+        cmd_ctx->path, image_size, MIN_CROP_SIZE, MAX_NUM_CROPS,
+        &cmd_ctx->n_crops
       );
       if (cmd_ctx->crops == NULL)
       {
@@ -8052,6 +8247,7 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
       }
 
       cmd_ctx->state = 2;
+
       /* Inject the full image.
        * Passing in cmd_ctx->crops is safe here since `sample()` will only take
        * the first `image_size * image_size * 3` elements. */
@@ -8119,9 +8315,9 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
           // Inject image crop
           cmd_ctx->state = 5;
           return (InjectData){
-            .type = INJECT_IMAG,
-            .image =
-              cmd_ctx->crops + (size_t)cmd_ctx->crop_i * img_sz * img_sz * 3,
+            .type  = INJECT_IMAG,
+            .image = cmd_ctx->crops +
+                     (size_t)cmd_ctx->crop_i * image_size * image_size * 3,
           };
 
         case 5:
@@ -8153,7 +8349,7 @@ image_pas_inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
 }
 
 /* */
-CommandType command_types[COMMAND_TOTAL] = {
+CommandType command_types[] = {
   {
     .name          = "image",
     .id            = COMMAND_IMAGE,
@@ -8161,10 +8357,10 @@ CommandType command_types[COMMAND_TOTAL] = {
     .inject_next   = image_inject_next,
   },
   {
-    .name          = "image_pas",
-    .id            = COMMAND_IMAGE_PAS,
-    .should_ignore = image_pas_should_ignore,
-    .inject_next   = image_pas_inject_next,
+    .name          = "longimage",
+    .id            = COMMAND_LONGIMAGE,
+    .should_ignore = longimage_should_ignore,
+    .inject_next   = longimage_inject_next,
   },
 };
 
@@ -8180,7 +8376,7 @@ scan_next_event(const char *text)
   CommandRecord first_cmd = {.raw = NULL};
   char         *closing;
 
-  for (int i = 0; i < COMMAND_TOTAL; i++)
+  for (int i = 0; i < ARRAYLEN(command_types); i++)
   {
     CommandType cmd_type = command_types[i];
 
@@ -8240,7 +8436,7 @@ scan_next_event(const char *text)
 
 /* */
 InjectData
-inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
+inject_next(GemmaModel *model, InjectContext *ctx, bool enable_mm)
 {
   GemmaTokenizer *tok = model->tokenizer;
 
@@ -8248,14 +8444,18 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
 
   switch (ctx->state)
   {
+    // Main loop: consume text from ctx->text until exhausted
     while (ctx->text_len > 0)
     {
       case 0:
+        // Scan for the next event (text / command / done)
         ctx->event = scan_next_event(ctx->text);
 
-        if (ctx->event.type == SCAN_DONE) break;
+        if (ctx->event.type == SCAN_DONE) break;  // No more input, exit loop
+
         if (ctx->event.type == SCAN_TEXT)
         {
+          // Plain text: tokenize it and emit as INJECT_TEXT
           spos = ctx->tokens_len;
           encode(
             tok, ctx->event.text, ctx->event.text_len, ctx->tokens_buf, spos,
@@ -8271,16 +8471,20 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
           };
 
           case 1:
+            // Advance past the consumed text
             ctx->text_len -= ctx->event.remaining - ctx->text;
             ctx->text  = ctx->event.remaining;
             ctx->state = 0;
             continue;
         }
 
+        // Otherwise it's a command event
         char *raw     = ctx->event.cmd.raw;
         int   raw_len = ctx->event.cmd.raw_len;
 
-        if (ctx->event.cmd.type.should_ignore(model, use_mm))
+        // If this command should be ignored for the current mode, just
+        // tokenize its raw text and emit it verbatim
+        if (ctx->event.cmd.type.should_ignore(model, enable_mm))
         {
           spos = ctx->tokens_len;
           encode(tok, raw, raw_len, ctx->tokens_buf, spos, &ctx->tokens_len);
@@ -8299,6 +8503,7 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
             continue;
         }
 
+        // Otherwise, delegate to the command's own inject handler
         ctx->cmd_ctx = (CommandContext){
           .state   = 0,
           .arg     = ctx->event.cmd.arg,
@@ -8308,7 +8513,9 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
         InjectData r;
         for (;;)
         {
-          r = ctx->event.cmd.type.inject_next(model, ctx, use_mm);
+          // Drive the sub-injector until it's done, yielding any intermediate
+          // results up to the caller
+          r = ctx->event.cmd.type.inject_next(model, ctx, enable_mm);
           if (r.type != INJECT_DONE)
           {
             ctx->state = 3;
@@ -8322,6 +8529,7 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
           }
         }
 
+        // Advance past the command in the input text
         ctx->text_len -= ctx->event.remaining - ctx->text;
         ctx->text = ctx->event.remaining;
     }
@@ -8337,13 +8545,15 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool use_mm)
 
 /* */
 InjectData
-generate_inject_callback(int token, GemmaModel *model, bool use_mm, void *ctx)
+generate_inject_callback(
+  int token, GemmaModel *model, bool enable_mm, void *ctx
+)
 {
   GemmaTokenizer *tok = model->tokenizer;
   if (token == EOF)
   {
     // Request for prefilling
-    return inject_next(model, ctx, use_mm);
+    return inject_next(model, ctx, enable_mm);
   }
   if (token == tok->eos || token == tok->eot)
   {
@@ -8352,7 +8562,7 @@ generate_inject_callback(int token, GemmaModel *model, bool use_mm, void *ctx)
 
   // Prints the token to stdout
   char byte_buf[2];
-  printf("%s", decode(tok, token, byte_buf));
+  fputs(decode(tok, token, byte_buf), stdout);
   fflush(stdout);
 
   return (InjectData){.type = INJECT_NONE};
@@ -8361,8 +8571,9 @@ generate_inject_callback(int token, GemmaModel *model, bool use_mm, void *ctx)
 /* */
 int
 generate(
+  // Input parameters
   GemmaModel   *model,
-  TextBuffer   *buf,
+  TextBuffer   *tbuf,
   VisionBuffer *vbuf,
   const char   *prompt,
   int           seqlen,
@@ -8371,10 +8582,15 @@ generate(
   int           topk,
   float         topp,
   float         rpen,
-  bool          enable_mm
+  bool          enable_mm,
+  // Output parameters
+  double *prefill_elapsed,
+  int    *prefill_toks,
+  double *gen_elapsed,
+  int    *gen_toks
 )
 {
-  printf("%s", prompt);
+  fputs(prompt, stdout);
 
   int *tokens_buf;
   int  tokens_cap = seqlen * 50;
@@ -8390,8 +8606,9 @@ generate(
   };
 
   sample(
-    model, buf, vbuf, seqlen, chunk_size, temperature, topk, topp, rpen,
-    enable_mm, &ctx, generate_inject_callback
+    model, tbuf, vbuf, seqlen, chunk_size, temperature, topk, topp, rpen,
+    enable_mm, &ctx, generate_inject_callback, prefill_elapsed, prefill_toks,
+    gen_elapsed, gen_toks
   );
   inject_context_cleanup(&ctx);
 
@@ -8401,7 +8618,7 @@ generate(
 
 /* Build the Gemma chat template */
 static InjectData
-new_turn(GemmaModel *model, bool use_mm, ChatContext *ctx)
+new_turn(GemmaModel *model, bool enable_mm, ChatContext *ctx)
 {
   /* Template (from https://ai.google.dev/gemma/docs/core/prompt-structure):
    * <start_of_turn>user\n
@@ -8468,7 +8685,7 @@ new_turn(GemmaModel *model, bool use_mm, ChatContext *ctx)
 
       for (;;)
       {
-        r = inject_next(model, jctx, use_mm);
+        r = inject_next(model, jctx, enable_mm);
         if (r.type != INJECT_DONE)
         {
           ctx->state = 2;
@@ -8523,7 +8740,7 @@ new_turn(GemmaModel *model, bool use_mm, ChatContext *ctx)
 
 /* */
 static InjectData
-chat_inject_callback(int token, GemmaModel *model, bool use_mm, void *ctx)
+chat_inject_callback(int token, GemmaModel *model, bool enable_mm, void *ctx)
 {
   GemmaTokenizer *tok = model->tokenizer;
   ChatContext    *cc  = (ChatContext *)ctx;
@@ -8532,16 +8749,16 @@ chat_inject_callback(int token, GemmaModel *model, bool use_mm, void *ctx)
   {
     // Model completed the turn
     cc->state = 0;
-    return new_turn(model, use_mm, ctx);
+    return new_turn(model, enable_mm, ctx);
   }
   if (token == EOF)
   {
     // Requesting more injection data
-    return new_turn(model, use_mm, ctx);
+    return new_turn(model, enable_mm, ctx);
   }
 
   char byte_buf[2];
-  printf("%s", decode(tok, token, byte_buf));
+  fputs(decode(tok, token, byte_buf), stdout);
   fflush(stdout);
   return (InjectData){.type = INJECT_NONE};
 }
@@ -8549,8 +8766,9 @@ chat_inject_callback(int token, GemmaModel *model, bool use_mm, void *ctx)
 /* */
 int
 chat(
+  // Input parameters
   GemmaModel   *model,
-  TextBuffer   *buf,
+  TextBuffer   *tbuf,
   VisionBuffer *vbuf,
   int           seqlen,
   int           chunk_size,
@@ -8558,7 +8776,12 @@ chat(
   int           topk,
   float         topp,
   float         rpen,
-  bool          use_mm
+  bool          enable_mm,
+  // Output parameters
+  double *prefill_elapsed,
+  int    *prefill_toks,
+  double *gen_elapsed,
+  int    *gen_toks
 )
 {
   int  *tokens_buf = NULL;
@@ -8584,8 +8807,9 @@ chat(
   };
 
   sample(
-    model, buf, vbuf, seqlen, chunk_size, temperature, topk, topp, rpen, use_mm,
-    &ctx, chat_inject_callback
+    model, tbuf, vbuf, seqlen, chunk_size, temperature, topk, topp, rpen,
+    enable_mm, &ctx, chat_inject_callback, prefill_elapsed, prefill_toks,
+    gen_elapsed, gen_toks
   );
   inject_context_cleanup(&jctx);
 
@@ -8595,29 +8819,109 @@ fail:
   return 1;
 }
 
+/* */
+int
+setup_gemma_model(
+  // Input parameters
+  const char *modelfile,
+  bool        use_mmap,
+  bool        enable_mm,
+  int         seqlen,
+  int         chunk_size,
+  // Output parameters
+  GemmaModel   **model,
+  TextBuffer   **tbuf,
+  VisionBuffer **vbuf
+
+)
+{
+  // Read / mmap model
+  if (use_mmap)
+  {
+    *model = mmap_gemma_model(modelfile, enable_mm);
+  }
+  else
+  {
+    *model = read_gemma_model(modelfile, enable_mm);
+  }
+
+  if (*model == NULL) return 1;
+
+  // Text config & Vision config
+  TextConfig   *tcfg = (*model)->decoder->config;
+  VisionConfig *vcfg = NULL;
+
+  // Vision config
+  if ((*model)->encoder != NULL)
+  {
+    vcfg = (*model)->encoder->config;
+  }
+
+  bool use_mm = enable_mm && (*model)->support_mm;
+
+  // Text buffer
+  *tbuf = malloc_text_buffer(
+    tcfg, vcfg, (int)seqlen, (int)chunk_size, use_mm, (*model)->quant
+  );
+  if (tbuf == NULL) return 1;
+
+  // Vision buffer
+  if (use_mm)
+  {
+    *vbuf = malloc_vision_buffer(vcfg, (*model)->quant);
+    if (vbuf == NULL) return 1;
+  }
+
+  return 0;
+}
+
+/* */
+void
+cleanup_gemma_model(
+  GemmaModel *model, TextBuffer *tbuf, VisionBuffer *vbuf, bool use_mmap
+)
+{
+  gemm_free_thread_scratch();
+  if (model != NULL)
+  {
+    free_text_buffer(tbuf, model->quant);
+    free_vision_buffer(vbuf, model->quant);
+    if (use_mmap)
+    {
+      munmap_gemma_model(model);
+    }
+    else
+    {
+      free_gemma_model(model);
+    }
+  }
+}
+
 // CLI
+
+#define DEFAULT_SEQLEN      16384
+#define DEFAULT_TOPK        0
+#define DEFAULT_CHUNK_SIZE  1024
+#define DEFAULT_TEMPERATURE 1.0
+#define DEFAULT_TOPP        1.0
+#define DEFAULT_RPEN        1.0
+#define DEFAULT_PROMPT      "Once upon a time"
 
 /* */
 static inline bool
 safe_atoui(const char *str, unsigned int *result)
 {
   if (str == NULL) return false;
-
   errno = 0;
 
   char     *endptr = NULL;
   long long val    = strtoll(str, &endptr, 10);
 
-  // Invalid number
-  if (endptr == str) return false;
-  // Extra characters at the end
-  if (*endptr != '\0') return false;
-  // long overflow
-  if (errno == ERANGE) return false;
-  // uint overflow
-  if (val < 0 || val > (long long)UINT_MAX) return false;
+  if (endptr == str) return false;    // Invalid number
+  if (*endptr != '\0') return false;  // Extra characters at the end
+  if (errno == ERANGE) return false;  // long overflow
+  if (val < 0 || val > (long long)UINT_MAX) return false;  // uint overflow
 
-  // All passed
   *result = (unsigned int)val;
   return true;
 }
@@ -8627,207 +8931,174 @@ static inline bool
 safe_atof(const char *str, float *result)
 {
   if (str == NULL) return false;
-
   errno = 0;
 
   char *endptr = NULL;
   float val    = strtof(str, &endptr);
 
-  // Invalid number
-  if (endptr == str) return false;
-  // Extra characters at the end
-  if (*endptr != '\0') return false;
-  // Overflow
-  if (errno == ERANGE) return false;
-  // inf / nan
-  if (isinf(val) || isnan(val)) return false;
+  if (endptr == str) return false;             // Invalid number
+  if (*endptr != '\0') return false;           // Extra characters at the end
+  if (errno == ERANGE) return false;           // Overflow
+  if (isinf(val) || isnan(val)) return false;  // inf / nan
 
-  // All passed
   *result = val;
   return true;
 }
 
+typedef struct {const char *name; unsigned int val;} uint_field;
+typedef struct {const char *name; float        val;} float_field;
+typedef struct {const char *name; bool         val;} bool_field;
+
 /* Pretty-print of the loaded model */
 void
 print_model_config(
-  GemmaModel *model, int seqlen, int chunk_size, bool enable_mm
+  GemmaModel *model, int width, int seqlen, int chunk_size, bool enable_mm
 )
 {
-  const int       width  = 20;
   bool            use_mm = model->support_mm && enable_mm;
   VisionEncoder  *enc    = model->encoder;
   TextDecoder    *dec    = model->decoder;
   GemmaTokenizer *tok    = model->tokenizer;
-  TextConfig     *cfg    = dec->config;
-
-  printf("\n========== model configuration ==========\n");
-  printf("architecture:\n");
-
-  // Integer fields
-  printf("  %-*s: %d\n", width, "n_layers", cfg->n_layers);
-  printf("  %-*s: %d\n", width, "n_heads", cfg->n_heads);
-  printf("  %-*s: %d\n", width, "n_kv_heads", cfg->n_kv_heads);
-  printf("  %-*s: %d\n", width, "head_dim", cfg->head_dim);
-  printf("  %-*s: %d\n", width, "embed_dim", cfg->embed_dim);
-  printf("  %-*s: %d\n", width, "mlp_dim", cfg->mlp_dim);
-  printf("  %-*s: %d\n", width, "q_scale", cfg->q_scale);
-  printf("  %-*s: %d\n", width, "slide_len", cfg->slide_len);
-  printf("  %-*s: %d\n", width, "image_toks", cfg->image_toks);
-  printf("  %-*s: %d\n", width, "max_seqlen", cfg->max_seqlen);
-  printf("  %-*s: %d\n", width, "vocab_size", cfg->vocab_size);
-
-  // Float fields
-  printf("  %-*s: %.6f\n", width, "local_theta", cfg->local_theta);
-  printf("  %-*s: %.6f\n", width, "global_theta", cfg->global_theta);
-  printf("  %-*s: %.6f\n", width, "eps", cfg->eps);
-  printf("  %-*s: %.6f\n", width, "att_softcap", cfg->att_softcap);
-  printf("  %-*s: %.6f\n", width, "logit_softcap", cfg->logit_softcap);
-
-  // Array fields
-  printf("  %-*s: ", width, "att_layers");
-  for (int i = 0; i < cfg->n_layers; i++)
-  {
-    printf("%d", cfg->att_layers[i] ? 1 : 0);
-    if ((i + 1) % (width - 1) == 0 && i + 1 < cfg->n_layers)
-    {
-      printf("\n");
-      for (int j = 0; j < width + 4; j++)
-      {
-        printf(" ");
-      }
-    }
-  }
-  printf("\n");
-
-  // Boolean fields
-  printf("  %-*s: %d\n", width, "qk_norm", cfg->qk_norm);
-  printf("  %-*s: %d\n", width, "pre_mlp_norm", cfg->pre_mlp_norm);
-  printf("  %-*s: %d\n", width, "pst_mlp_norm", cfg->pst_mlp_norm);
-
-  // Vision encoder architecture (if available and enabled)
-  if (use_mm)
-  {
-    VisionConfig *vcfg = enc->config;
-    printf("\nvision:\n");
-    printf("  %-*s: %d\n", width, "n_layers", vcfg->n_layers);
-    printf("  %-*s: %d\n", width, "image_size", vcfg->image_size);
-    printf("  %-*s: %d\n", width, "patch_size", vcfg->patch_size);
-    printf("  %-*s: %d\n", width, "hidden_dim", vcfg->hidden_dim);
-    printf("  %-*s: %d\n", width, "n_heads", vcfg->n_heads);
-    printf("  %-*s: %d\n", width, "mlp_dim", vcfg->mlp_dim);
-    printf("  %-*s: %.6f\n", width, "eps", vcfg->eps);
-  }
-
-  // Runtime flags
-  printf("\nruntime:\n");
-  printf("  %-*s: %d\n", width, "quant", model->quant);
-  printf("  %-*s: %d\n", width, "support_mm", model->support_mm);
-
-  // Tokenizer
-  printf("\ntokenizer:\n");
-  printf("  %-*s: %d\n", width, "vocab_size", tok->vocab_size);
-  printf("  %-*s: %d\n", width, "n_merges", tok->n_merges);
-  printf("  %-*s: %d\n", width, "bos", tok->bos);
-  printf("  %-*s: %d\n", width, "eos", tok->eos);
-  printf("  %-*s: %d\n", width, "sot", tok->sot);
-  printf("  %-*s: %d\n", width, "eot", tok->eot);
-  printf("  %-*s: %d\n", width, "soi", tok->soi);
-  printf("  %-*s: %d\n", width, "eoi", tok->eoi);
-  printf("  %-*s: %d\n", width, "ist", tok->ist);
-
-  printf("\nmemory footprint (estimated):\n");
-
-  int   C   = cfg->embed_dim;
-  int   L   = cfg->n_layers;
-  int   CH  = cfg->head_dim;
-  int   NH  = cfg->n_heads;
-  int   Cq  = NH * CH;
-  int   Ckv = cfg->n_kv_heads * CH;
-  int   CM  = cfg->mlp_dim;
-  int   vs  = cfg->vocab_size;
-  float GB  = 1024.0 * 1024.0 * 1024.0;
-
-  // Text buffer
-  size_t decB = 0;
-
-  int           ppi  = 0;
-  VisionConfig *vcfg = NULL;
+  TextConfig     *tcfg   = dec->config;
+  int             ppi    = 0;
+  VisionConfig   *vcfg   = NULL;
   if (use_mm)
   {
     vcfg = enc->config;
     ppi  = vcfg->image_size / vcfg->patch_size;
   }
-  int mult = use_mm ? max(ppi * ppi, chunk_size) : chunk_size;
 
-  // Quantized buffers
-  if (model->quant)
-  {
-    decB += C * sizeof(int8_t);   // x_i8
-    decB += Cq * sizeof(int8_t);  // xo_i8
-    decB += CM * sizeof(int8_t);  // xg_i8
-  }
-
-  // Main buffers
-  decB += L * 2 * seqlen * Ckv * sizeof(floatx);  // kv_cache
-  decB += vs * sizeof(floatx);                    // logits
-  decB += mult * C * sizeof(floatx);              // x
-  decB += mult * C * sizeof(floatx);              // resid
-  decB += mult * Cq * sizeof(floatx);             // xq
-  decB += mult * Ckv * sizeof(floatx);            // xk
-  decB += mult * CH * sizeof(floatx);             // csfreqs_slid
-  decB += mult * CH * sizeof(floatx);             // csfreqs_full
-  decB += mult * Ckv * sizeof(floatx);            // xv
-  decB += mult * Cq * sizeof(floatx);             // xo
-  decB += mult * NH * seqlen * sizeof(floatx);    // att
-  decB += mult * CM * sizeof(floatx);             // xg
-  decB += mult * CM * sizeof(floatx);             // xu
-
-  printf("  %-*s: %.2f GB\n", width, "decoder buffer", (float)decB / GB);
-
-  // Vision buffer (if applicable)
+  printf("\n========== model configuration ==========\n");
+  printf("  %-*s: %s\n", width, "quant", model->quant ? "true" : "false");
+  putchar('\n');
+  // clang-format off
+  
+  // Vision encoder architecture (if available and enabled)
   if (use_mm)
   {
-    size_t encB = 0;
+    printf("encoder:\n");
+    for (uint_field *field = (uint_field[]){
+      {"n_layers"  , vcfg->n_layers  },
+      {"image_size", vcfg->image_size},
+      {"patch_size", vcfg->patch_size},
+      {"hidden_dim", vcfg->hidden_dim},
+      {"n_heads"   , vcfg->n_heads   },
+      {"mlp_dim"   , vcfg->mlp_dim   },
+      {""},
+    }; field->name[0] != '\0'; field++)
+      printf("  %-*s: %d\n", width, field->name, (unsigned int)field->val);
+    
+    printf("  %-*s: %.8f\n", width, "eps", vcfg->eps);
+    putchar('\n');
+  }
 
-    int C  = vcfg->hidden_dim;
-    int CM = vcfg->mlp_dim;
-    int N  = ppi * ppi;
-    int NH = vcfg->n_heads;
+  printf("decoder:\n");
 
-    // Quantized buffers
-    if (model->quant)
+  // Integer fields
+  for (uint_field *field = (uint_field[]){
+    {"n_layers"  , tcfg->n_layers  },
+    {"n_heads"   , tcfg->n_heads   },
+    {"n_kv_heads", tcfg->n_kv_heads},
+    {"head_dim"  , tcfg->head_dim  },
+    {"embed_dim" , tcfg->embed_dim },
+    {"mlp_dim"   , tcfg->mlp_dim   },
+    {"q_scale"   , tcfg->q_scale   },
+    {"slide_len" , tcfg->slide_len },
+    {"image_toks", tcfg->image_toks},
+    {"max_seqlen", tcfg->max_seqlen},
+    {"vocab_size", tcfg->vocab_size},
+    {""},
+  }; field->name[0] != '\0'; field++)
+    printf("  %-*s: %d\n", width, field->name, (unsigned int)field->val);
+
+  // Float fields
+  for (float_field *field = (float_field[]){
+    {"local_theta"  , tcfg->local_theta  },
+    {"global_theta" , tcfg->global_theta },
+    {"eps"          , tcfg->eps          },
+    {"att_softcap"  , tcfg->att_softcap  },
+    {"logit_softcap", tcfg->logit_softcap},
+    {""},
+  }; field->name[0] != '\0'; field++)
+    printf("  %-*s: %.8f\n", width, field->name, (double)field->val);
+
+  // Attention layers
+  printf("  %-*s: ", width, "att_layers");
+  for (int i = 0; i < tcfg->n_layers; i++)
+  {
+    printf("%d", tcfg->att_layers[i] ? 1 : 0);
+    if ((i + 1) % (width - 1) == 0 && i + 1 < tcfg->n_layers)
     {
-      encB += N * C * sizeof(int8_t);   // x_i8
-      encB += N * sizeof(floatx);       // x_scales
-      encB += N * CM * sizeof(int8_t);  // mlp_i8
-      encB += N * sizeof(floatx);       // mlp_scales
+      putchar('\n');
+      for (int j = 0; j < width + 4; j++)
+        putchar(' ');
     }
-
-    // Main buffers
-    encB += N * C * sizeof(floatx);       // x
-    encB += N * C * sizeof(floatx);       // resid
-    encB += N * C * sizeof(floatx);       // xq
-    encB += N * C * sizeof(floatx);       // xk
-    encB += N * C * sizeof(floatx);       // xv
-    encB += N * C * sizeof(floatx);       // att_out
-    encB += N * CM * sizeof(floatx);      // mlp_hidden
-    encB += N * N * NH * sizeof(floatx);  // scores
-
-    printf("  %-*s: %.2f GB\n", width, "encoder buffer", (float)encB / GB);
   }
+  putchar('\n');
+  
+  // Bool fields
+  for (bool_field *field = (bool_field[]){
+    {"qk_norm"     , tcfg->qk_norm     },
+    {"pre_mlp_norm", tcfg->pre_mlp_norm},
+    {"pst_mlp_norm", tcfg->pst_mlp_norm},
+    {""},
+  }; field->name[0] != '\0'; field++)
+    printf("  %-*s: %s\n", width, field->name, field->val ? "true" : "false");
 
-  // Weights
+  // Tokenizer
+  printf("\ntokenizer:\n");
+  for (uint_field *field = (uint_field[]){
+    {"n_merges", tok->n_merges},
+    {"bos"     , tok->bos     },
+    {"eos"     , tok->eos     },
+    {"sot"     , tok->sot     },
+    {"eot"     , tok->eot     },
+    {"soi"     , tok->soi     },
+    {"eoi"     , tok->eoi     },
+    {"ist"     , tok->ist     },
+    {""},
+  }; field->name[0] != '\0'; field++)
+    printf("  %-*s: %d\n", width, field->name, (unsigned int)field->val);
+
+  // clang-format on
+
+  // Parameters
+  printf("\nparameters:\n");
+
+  size_t enc_params, dec_params = 0;
   if (use_mm)
   {
-    float encGB_w = get_vision_encoder_size(vcfg, cfg, model->quant) / GB;
-    printf("  %-*s: %.2f GB\n", width, "encoder weights", encGB_w);
+    enc_params = get_vision_encoder_size(vcfg, tcfg, false) / sizeof(floatx);
+    printf("  %-*s: %zu\n", width, "encoder params", enc_params);
   }
-  float decGB_w = get_text_decoder_size(cfg, model->quant) / GB;
-  printf("  %-*s: %.2f GB\n", width, "decoder weights", decGB_w);
+  dec_params = get_text_decoder_size(tcfg, false) / sizeof(floatx);
+  printf("  %-*s: %zu\n", width, "decoder params", dec_params);
 
-  // KV Cache
-  float kvcGB = (float)cfg->n_layers * 2 * Ckv * sizeof(floatx) / 1024.0;
-  printf("  %-*s: %.2f KB\n", width, "kv cache (tok)", kvcGB);
+  // Memory footprint
+  printf("\nmemory footprint (estimated):\n");
+  double GB = 1024.0 * 1024.0;
+
+  // Vision buffer & weights
+  if (use_mm)
+  {
+    double enc_GB = get_vision_buffer_size(vcfg, model->quant) / GB;
+    double enc_w_GB = get_vision_encoder_size(vcfg, tcfg, model->quant) / GB;
+    printf("  %-*s: %.2f GB\n", width, "encoder buffer", enc_GB);
+    printf("  %-*s: %.2f GB\n", width, "encoder weights", enc_w_GB);
+  }
+
+  // Text buffer & weights
+  double dec_GB =
+    get_text_buffer_size(tcfg, vcfg, seqlen, chunk_size, use_mm, model->quant) /
+    GB;
+  double dec_w_GB = get_text_decoder_size(tcfg, model->quant) / GB;
+  printf("  %-*s: %.2f GB\n", width, "decoder buffer", dec_GB);
+  printf("  %-*s: %.2f GB\n", width, "decoder weights", dec_w_GB);
+
+  // KV cache per tok
+  double kvc_t_KB = tcfg->n_layers * 2 * tcfg->n_kv_heads * tcfg->head_dim *
+                   sizeof(floatx) / 1024.0;
+  printf("  %-*s: %.2f KB\n", width, "kv cache (tok)", kvc_t_KB);
   printf("=========================================\n\n");
 }
 
@@ -8837,42 +9108,43 @@ print_usage(void)
 {
   // clang-format off
   printf(
-  "usage:\n"
-  "  ./gemma <modelfile> [options]\n"
-  "\n"
-  "arguments:\n"
-  "  modelfile          path to the model file\n"
-  "\n"
-  "options:\n"
-  "  --seqlen <N>       set sequence length"
-                            " (default: " TOSTRING(DEFAULT_SEQLEN) ")\n"
-  "  --topk <N>         set top-k sampling value"
-                            " (default: " TOSTRING(DEFAULT_TOPK) ")\n"
-  "  --seed <N>         set random seed"
-                            " (default: current time)\n"
-  "  --chunk <N>        set prefilling chunk size, must be >= 1"
-                            " (default: " TOSTRING(DEFAULT_CHUNK_SIZE) ")\n"
-  "  --temperature <F>  set temperature value, must be >= 0.0"
-                            " (default: " TOSTRING(DEFAULT_TEMPERATURE) ")\n"
-  "  --topp <F>         set top-p sampling value, must be 0.0 < p <= 1.0"
-                            " (default: " TOSTRING(DEFAULT_TOPP) ")\n"
-  "  --rpen <F>         set repetition penalty, must be >= 1.0"
-                            " (default: " TOSTRING(DEFAULT_RPEN) ")\n"
-  "  --prompt <S>       set input prompt, ignored if chat mode is enabled"
-                            " (default: \"" DEFAULT_PROMPT "\")\n"
-  "  --chat             enable chat mode\n"
-  "  --disable-mm       disable multimodal capability\n"
-  "  --disable-mmap     disable mmap (memory mapped file)\n"
-  "  --verbose          print model info\n"
-  "  --help, -?         display this help message\n"
-  "\n"
-  "controls:\n"
-  "  Ctrl+C             gracefully interrupt generation and exit\n"
-  "\n"
-  "examples:\n"
-  "  ./gemma model.bin -l 2048 -t 0.8 --chat\n"
-  "  ./gemma model.bin -i \"Hello I'm a language model,\""
-          " --seqlen 4096 --topk 50 --seed 12345\n");
+    "usage:\n"
+    "  ./gemma <modelfile> [options]\n"
+    "\n"
+    "arguments:\n"
+    "  modelfile                  path to the model file\n"
+    "\n"
+    "options:\n"
+    "  --seqlen <n_patches>       set sequence length"
+    " (default: " TOSTRING(DEFAULT_SEQLEN) ")\n"
+    "  --topk <n_patches>         set top-k sampling value"
+    " (default: " TOSTRING(DEFAULT_TOPK) ")\n"
+    "  --seed <n_patches>         set random seed"
+    " (default: current time)\n"
+    "  --chunk <n_patches>        set prefilling chunk size, must be >= 1"
+    " (default: " TOSTRING(DEFAULT_CHUNK_SIZE) ")\n"
+    "  --temperature <F>          set temperature value, must be >= 0.0"
+    " (default: " TOSTRING(DEFAULT_TEMPERATURE) ")\n"
+    "  --topp <F>                 set top-p sampling value, must be 0.0 < p <= 1.0"
+    " (default: " TOSTRING(DEFAULT_TOPP) ")\n"
+    "  --rpen <F>                 set repetition penalty, must be >= 1.0"
+    " (default: " TOSTRING(DEFAULT_RPEN) ")\n"
+    "  --prompt <S>               set input prompt, ignored if chat mode is enabled"
+    " (default: \"" DEFAULT_PROMPT "\")\n"
+    "  --chat                     enable chat mode\n"
+    "  --text-only                disable multimodal capability\n"
+    "  --no-mmap                  disable mmap (memory mapped file)\n"
+    "  --verbose                  print model info\n"
+    "  --help, -?                 display this help message\n"
+    "\n"
+    "controls:\n"
+    "  Ctrl+C                    gracefully interrupt generation and exit\n"
+    "\n"
+    "examples:\n"
+    "  ./gemma model.bin -l 2048 -t 0.8 --chat\n"
+    "  ./gemma model.bin -i \"Hello I'm a language model,\""
+    " --seqlen 4096 --topk 50 --seed 12345\n"
+  );
   // clang-format on
 }
 
@@ -8883,7 +9155,7 @@ safe_get_arg(int i, int argc, char **argv)
   if (i + 1 >= argc)
   {
     print_usage();
-    log_error("option '%s' requires an argument.", argv[i]);
+    log_error("option '%s' requires an argument", argv[i]);
     return NULL;
   }
   return argv[i + 1];
@@ -8906,13 +9178,11 @@ main(int argc, char **argv)
   const char  *prompt      = DEFAULT_PROMPT;
   bool         chatmode    = false;
   bool         enable_mm   = true;
-  bool         enable_mmap = true;
-  bool         print_cfg   = false;
+  bool         use_mmap    = true;
+  bool         verbose     = false;
 
   GemmaModel   *model = NULL;
-  TextConfig   *cfg   = NULL;
-  VisionConfig *vcfg  = NULL;
-  TextBuffer   *buf   = NULL;
+  TextBuffer   *tbuf  = NULL;
   VisionBuffer *vbuf  = NULL;
 
   // On Windows, get UTF-8 encoded command line arguments
@@ -9023,17 +9293,17 @@ main(int argc, char **argv)
     {
       chatmode = true;
     }
-    else if (strcmp(arg, "--disable-mm") == 0)
+    else if (strcmp(arg, "--text-only") == 0)
     {
       enable_mm = false;
     }
-    else if (strcmp(arg, "--disable-mmap") == 0)
+    else if (strcmp(arg, "--no-mmap") == 0)
     {
-      enable_mmap = false;
+      use_mmap = false;
     }
     else if (strcmp(arg, "--verbose") == 0)
     {
-      print_cfg = true;
+      verbose = true;
     }
     else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-?") == 0)
     {
@@ -9050,61 +9320,124 @@ main(int argc, char **argv)
 
   srand(seed);
 
-  // Read / mmap model
-  if (enable_mmap)
+  if (setup_gemma_model(
+        modelfile, use_mmap, enable_mm, seqlen, chunk_size, &model, &tbuf, &vbuf
+      ) != 0)
+    goto fail;
+
+  if (verbose)
   {
-    model = mmap_gemma_model(modelfile, enable_mm);
+    // Print config
+
+    // clang-format off
+    const int width = 20;
+    print_model_config(model, width, (int)seqlen, (int)chunk_size, enable_mm);
+
+    // Print command line args
+    printf("\n========= inference arguments ===========\n");
+
+    for (uint_field *field = (uint_field[]){
+      {"seqlen"    , seqlen    },
+      {"topk"      , topk      },
+      {"seed"      , seed      },
+      {"chunk_size", chunk_size},
+      {""},
+    }; field->name[0] != '\0'; field++)
+      printf("  %-*s: %d\n", width, field->name, field->val);
+    
+    for (float_field *field = (float_field[]){
+      {"temperature", temperature},
+      {"topp"       , topp       },
+      {"rpen"       , rpen       },
+      {""},
+    }; field->name[0] != '\0'; field++)
+      printf("  %-*s: %.8f\n", width, field->name, field->val);
+    
+    // Print the first 16 characters of the prompt
+    printf("  %-*s: ", width, "prompt");
+    for (int i = 0; i < 16; i++)
+    {
+      char c = prompt[i];
+      switch (c)
+      {
+        case '\n':
+          printf("\\n");
+          i++;
+          break;
+
+        case '\t':
+          printf("\\t");
+          i++;
+          break;
+
+        default:
+          putchar(c);
+      }
+    }
+    putchar('\n');
+
+    for (bool_field *field = (bool_field[]){
+      {"chatmode" , chatmode },
+      {"enable_mm", enable_mm},
+      {"use_mmap" , use_mmap },
+      {"verbose"  , verbose  },
+      {""},
+    }; field->name[0] != '\0'; field++)
+      printf("  %-*s: %s\n", width, field->name, field->val ? "true" : "false");
+    
+    printf("=========================================\n\n");
+    // clang-format on
   }
-  else
-  {
-    model = read_gemma_model(modelfile, enable_mm);
-  }
 
-  if (model == NULL) goto fail;
-
-  // Text config
-  cfg = model->decoder->config;
-  // Vision config
-  if (model->encoder != NULL)
-  {
-    vcfg = model->encoder->config;
-  }
-
-  bool use_mm = enable_mm && model->support_mm;
-
-  // Text buffer
-  buf = malloc_text_buffer(
-    cfg, vcfg, (int)seqlen, (int)chunk_size, use_mm, model->quant
-  );
-  if (buf == NULL) goto fail;
-
-  // Vision buffer
-  if (use_mm)
-  {
-    vbuf = malloc_vision_buffer(vcfg, model->quant);
-    if (vbuf == NULL) goto fail;
-  }
-
-  if (print_cfg)
-  {
-    print_model_config(model, (int)seqlen, (int)chunk_size, enable_mm);
-  }
+  double prefill_elapsed = 0.0;
+  int    prefill_toks    = 0;
+  double gen_elapsed     = 0.0;
+  int    gen_toks        = 0;
 
   if (chatmode)
   {
     if (chat(
-      model, buf, vbuf, (int)seqlen, (int)chunk_size, temperature, (int)topk,
-      topp, rpen, use_mm
-    ) == 1)
+          model, tbuf, vbuf, (int)seqlen, (int)chunk_size, temperature,
+          (int)topk, topp, rpen, enable_mm, &prefill_elapsed, &prefill_toks,
+          &gen_elapsed, &gen_toks
+        ) == 1)
       goto fail;
   }
   else
   {
     if (generate(
-      model, buf, vbuf, prompt, (int)seqlen, (int)chunk_size, temperature,
-      (int)topk, topp, rpen, use_mm
-    ) == 1)
+          model, tbuf, vbuf, prompt, (int)seqlen, (int)chunk_size, temperature,
+          (int)topk, topp, rpen, enable_mm, &prefill_elapsed, &prefill_toks,
+          &gen_elapsed, &gen_toks
+        ) == 1)
       goto fail;
+  }
+
+  if (verbose)
+  {
+    printf("\n\n");
+    if (prefill_elapsed > 0.0)
+    {
+      printf(
+        "prefilled %d tokens in %.2f seconds (%.2f tok/s)\n", prefill_toks,
+        prefill_elapsed, prefill_toks / prefill_elapsed
+      );
+    }
+    else
+    {
+      printf("prefilled %d tokens instantly\n", prefill_toks);
+    }
+    if (gen_elapsed > 0.0)
+    {
+      printf(
+        "generated %d tokens in %.2f seconds (%.2f tok/s)\n", gen_toks,
+        gen_elapsed, gen_toks / gen_elapsed
+      );
+    }
+    else
+    {
+      printf("generated %d tokens instantly\n", gen_toks);
+    }
   }
 
   int r;
@@ -9118,23 +9451,10 @@ fail:
 cleanup:
   if (g_errmsg[0] != '\0')
   {
-    fprintf(stderr, "\nerror: %s\n", get_error());
+    fprintf(stderr, "error: %s\n", get_error());
   }
 
   free_utf8_argv(utf8_argv, argc);
-  gemm_free_thread_scratch();
-  if (model != NULL)
-  {
-    free_text_buffer(buf, model->quant);
-    free_vision_buffer(vbuf, model->quant);
-    if (enable_mmap)
-    {
-      munmap_gemma_model(model);
-    }
-    else
-    {
-      free_gemma_model(model);
-    }
-  }
+  cleanup_gemma_model(model, tbuf, vbuf, use_mmap);
   return r;
 }

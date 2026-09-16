@@ -26,7 +26,7 @@ same idea applied to Llama.
   mask
 - Full SigLIP vision encoder with bidirectional attention between image
   soft tokens, plus a pan & scan crop utility for high-aspect-ratio images
-- mmap'd weight loading by default (`--disable-mmap` falls back to a plain
+- mmap'd weight loading by default (`--no-mmap` falls back to a plain
   read, useful on filesystems where mmap is flaky)
 - KV-cache streaming generation with chunked prefill for long prompts
 - Temperature, top-k, top-p, and repetition-penalty sampling
@@ -127,12 +127,12 @@ Multimodal models take images inline in the prompt with `@image{...}`:
 > Describe what you see in @image{photo.jpg}.
 ```
  
-For very wide or tall images, `@image_pas{...}` runs Gemma 3's pan & scan
+For very wide or tall images, `@longimage{...}` runs Gemma 3's pan & scan
 utility first, feeding the model both the full downsized image and a few
 higher-resolution crops:
  
 ```bash
-> What's happening at the bottom of @image_pas{long_screenshot.png}?
+> What's happening at the bottom of @longimage{long_screenshot.png}?
 ```
  
 CLI options:
@@ -162,8 +162,8 @@ CLI options:
 | `--rpen <F>`        | Set repetition penalty, must be >= 1.0            | 1.0                   |
 | `--prompt <S>`      | Set input prompt, ignored if chat mode is enabled | "Once upon a time"    |
 | `--chat`            | Enable chat mode                                  | —                     |
-| `--disable-mm`      | Disable multimodal capability                     | —                     |
-| `--disable-mmap`    | Disable mmap (memory mapped file)                 | —                     |
+| `--text-only`       | Disable multimodal capability                     | —                     |
+| `--no-mmap`         | Disable mmap (memory mapped file)                 | —                     |
 | `--verbose`         | Print model info                                  | —                     |
 | `--help`, `-?`      | Display this help message                         | —                     |
  
@@ -189,7 +189,7 @@ Test environment:
 - OS: `Windows 11`
 - Compiler: `gcc 15.2.0 x86_64-w64-mingw32`
 - Compiler arguments: `-Ofast -fopenmp -march=native -mtune=native`
-- Run arguments: `--temperature 0 --seqlen 100 --verbose --disable-mmap`
+- Run arguments: `--temperature 0 --seqlen 100 --verbose --no-mmap`
 - Threads (`OMP_NUM_THREADS`): `6`
 
 | Model               | Generation speed (tok/s, 100 tokens) | Prompt processing speed (tok/s, 100 tokens) | Base memory | Memory per tok |
