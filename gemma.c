@@ -2963,6 +2963,7 @@ typedef struct
   uint32_t n_merges;
 
   int vocab_size;
+  int max_toklen;
   int bos;  // beginning of sequence
   int eos;  // end of sequence
   int sot;  // start of turn
@@ -3042,7 +3043,8 @@ read_tokenizer(FILE *fp, TextConfig *tcfg, bool support_mm)
           malloc_ckd(tok->vocab_size, sizeof(*tok->vocab_sorted))))
     goto fail;
 
-  size_t offset = 0;
+  size_t offset   = 0;
+  tok->max_toklen = 0;
   for (int i = 0; i < tok->vocab_size; i++)
   {
     char *str;
@@ -3051,6 +3053,12 @@ read_tokenizer(FILE *fp, TextConfig *tcfg, bool support_mm)
     tok->vocab[i]            = str;
     tok->vocab_sorted[i].idx = i;
     tok->vocab_sorted[i].val = str;
+
+    int len = strlen(str);
+    if (len > tok->max_toklen)
+    {
+      tok->max_toklen = len;
+    }
   }
 
   qsort(
@@ -6342,8 +6350,8 @@ forward_vision(
   if (is_interrupted()) return 1;
 
   // Final projection into language model embedding space
-  // x (image_toks, embed_dim) = x (image_toks, embed_dim) @ proj (embed_dim,
-  // embed_dim)
+  // x (image_toks, embed_dim) = x (image_toks, embed_dim)
+  //                           @ proj (embed_dim, embed_dim)
   if (!quant)
   {
     if (gemm_fpx(
@@ -8593,7 +8601,7 @@ generate(
   fputs(prompt, stdout);
 
   int *tokens_buf;
-  int  tokens_cap = seqlen * 50;
+  int  tokens_cap = seqlen * model->tokenizer->max_toklen;
   if (!(tokens_buf = malloc_ckd(tokens_cap, sizeof(*tokens_buf)))) return 1;
 
   InjectContext ctx = {
@@ -8787,8 +8795,9 @@ chat(
   int  *tokens_buf = NULL;
   char *line_buf   = NULL;
 
-  int tokens_cap = seqlen * 50;
-  int line_cap   = seqlen * 50;
+  int max_toklen = model->tokenizer->max_toklen;
+  int tokens_cap = seqlen * max_toklen;
+  int line_cap   = seqlen * max_toklen;
 
   if (!(tokens_buf = malloc_ckd(tokens_cap, sizeof(*tokens_buf))) ||
       !(line_buf = malloc_ckd(line_cap, sizeof(*line_buf))))
@@ -9048,14 +9057,15 @@ print_model_config(
   // Tokenizer
   printf("\ntokenizer:\n");
   for (uint_field *field = (uint_field[]){
-    {"n_merges", tok->n_merges},
-    {"bos"     , tok->bos     },
-    {"eos"     , tok->eos     },
-    {"sot"     , tok->sot     },
-    {"eot"     , tok->eot     },
-    {"soi"     , tok->soi     },
-    {"eoi"     , tok->eoi     },
-    {"ist"     , tok->ist     },
+    {"n_merges"  , tok->n_merges  },
+    {"max_toklen", tok->max_toklen},
+    {"bos"       , tok->bos       },
+    {"eos"       , tok->eos       },
+    {"sot"       , tok->sot       },
+    {"eot"       , tok->eot       },
+    {"soi"       , tok->soi       },
+    {"eoi"       , tok->eoi       },
+    {"ist"       , tok->ist       },
     {""},
   }; field->name[0] != '\0'; field++)
     printf("  %-*s: %d\n", width, field->name, (unsigned int)field->val);
