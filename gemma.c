@@ -5385,7 +5385,7 @@ gemm_fpx_nn_kernel(
  * fpx matrix-matrix multiply (NN)
  * fpx src (m, k) @ fpx mat (k, n) = fpx dst (m, n)
  */
-static int
+static void
 gemm_fpx_nn(
   floatx *RESTRICT       dst,
   int                    dst_stride,
@@ -5436,8 +5436,6 @@ gemm_fpx_nn(
       src + m_full * src_stride, src_stride, m - m_full, n, k
     );
   }
-
-  return 0;
 }
 
 static _Thread_local int8_t *gemm_i8_pack_scratch     = NULL;
@@ -6166,13 +6164,12 @@ forward_vision(
       }
 
       // Weighted sum of values: out = scores @ V
-      if (gemm_fpx_nn(
-            vbuf->att_out + h * head_dim, /*dst_stride=*/embed_dim,
-            vbuf->xv + h * head_dim,
-            /*mat_stride=*/embed_dim, scores, /*src_stride=*/n_patches,
-            n_patches, head_dim, n_patches, false
-          ) == 1)
-        quit = true;
+      gemm_fpx_nn(
+        vbuf->att_out + h * head_dim, /*dst_stride=*/embed_dim,
+        vbuf->xv + h * head_dim,
+        /*mat_stride=*/embed_dim, scores, /*src_stride=*/n_patches, n_patches,
+        head_dim, n_patches, false
+      );
     }
     if (is_interrupted()) return 1;
 
