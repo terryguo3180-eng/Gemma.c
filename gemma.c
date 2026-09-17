@@ -2525,6 +2525,11 @@ load_image_utf8(const char *utf8_path, int *w, int *h, int *ch, int req_comp)
 // Block size of blockwise causal masking
 #define QK_BLOCK_SIZE 64
 
+// Block sizes for the m/n/k cache-blocked GEMM
+#define GEMM_MC 128  // rows of A resident per (jc, ic) tile block, mult of 8
+#define GEMM_NC 256  // cols of B packed per outer jc block, mult of 8
+#define GEMM_KC 256  // k-length streamed per inner pc chunk
+
 // OpenMP parameters
 #define OMP_NUM_THREADS 8
 #define OMP_PARA_ARGS   num_threads(OMP_NUM_THREADS)
@@ -4976,9 +4981,7 @@ gemv_fpx_nn(
     float         v       = (float)vec[i];
     const floatx *mat_row = mat + i * mat_stride;
 
-    int j;
-    #pragma omp simd
-    for (j = 0; j < m; j++)
+    for (int j = 0; j < m; j++)
     {
       acc[j] += v * (float)mat_row[j];
     }
@@ -4989,6 +4992,8 @@ gemv_fpx_nn(
     dst[j] = (floatx)acc[j];
   }
 }
+
+// A decent GEMM kernel implementation, I pretty much vibe-coded this part :D
 
 /**
  * Copy `rows` rows (stride `row_stride`, length k each) of `src` into a
@@ -5048,100 +5053,6 @@ pack_all_fpx(
       );
     }
   }
-}
-
-/**
- * Compute one 8x8 tile of dst = src @ mat.T from PACKED, contiguous
- * MR/NR-major panels (see pack_panel/pack_all). The 64 FMAs are spelled
- * out by hand rather than as a nested i/j loop. GCC vectorizes the
- * nested-loop form just fine, but Clang's optimizer can only produces
- * good code once the accumulation is fully unrolled with
- * compile-time-constant indices :'D. So I just hardcoded for 8x8.
- */
-static inline void
-gemm_fpx_kernel(
-  floatx *RESTRICT      dst,
-  int                   dst_stride,
-  const float *RESTRICT Bp,
-  const float *RESTRICT Ap,
-  int                   k
-)
-{
-  float acc[64] = {0};
-
-  /*
-   * Equivilant code:
-   * ```c
-   * for (int l = 0; l < k; l++)
-   * {
-   *   const float *a = Ap + l * 8;
-   *   const float *b = Bp + l * 8;
-   * 
-   *   for (int r = 0; r < 8; r++)
-   *     for (int j = 0; j < 8; j++)
-   *       acc[r * 8 + j] += a[r] * b[j];
-   *  }
-   * ```
-   */
-
-  for (int l = 0; l < k; l++)
-  {
-    float a0 = Ap[l * 8 + 0];
-    float a1 = Ap[l * 8 + 1];
-    float a2 = Ap[l * 8 + 2];
-    float a3 = Ap[l * 8 + 3];
-    float a4 = Ap[l * 8 + 4];
-    float a5 = Ap[l * 8 + 5];
-    float a6 = Ap[l * 8 + 6];
-    float a7 = Ap[l * 8 + 7];
-    float b0 = Bp[l * 8 + 0];
-    float b1 = Bp[l * 8 + 1];
-    float b2 = Bp[l * 8 + 2];
-    float b3 = Bp[l * 8 + 3];
-    float b4 = Bp[l * 8 + 4];
-    float b5 = Bp[l * 8 + 5];
-    float b6 = Bp[l * 8 + 6];
-    float b7 = Bp[l * 8 + 7];
-
-    // clang-format off
-    acc[ 0] += a0 * b0; acc[ 1] += a0 * b1;
-    acc[ 2] += a0 * b2; acc[ 3] += a0 * b3;
-    acc[ 4] += a0 * b4; acc[ 5] += a0 * b5;
-    acc[ 6] += a0 * b6; acc[ 7] += a0 * b7;
-    acc[ 8] += a1 * b0; acc[ 9] += a1 * b1;
-    acc[10] += a1 * b2; acc[11] += a1 * b3;
-    acc[12] += a1 * b4; acc[13] += a1 * b5;
-    acc[14] += a1 * b6; acc[15] += a1 * b7;
-    acc[16] += a2 * b0; acc[17] += a2 * b1;
-    acc[18] += a2 * b2; acc[19] += a2 * b3;
-    acc[20] += a2 * b4; acc[21] += a2 * b5;
-    acc[22] += a2 * b6; acc[23] += a2 * b7;
-    acc[24] += a3 * b0; acc[25] += a3 * b1;
-    acc[26] += a3 * b2; acc[27] += a3 * b3;
-    acc[28] += a3 * b4; acc[29] += a3 * b5;
-    acc[30] += a3 * b6; acc[31] += a3 * b7;
-    acc[32] += a4 * b0; acc[33] += a4 * b1;
-    acc[34] += a4 * b2; acc[35] += a4 * b3;
-    acc[36] += a4 * b4; acc[37] += a4 * b5;
-    acc[38] += a4 * b6; acc[39] += a4 * b7;
-    acc[40] += a5 * b0; acc[41] += a5 * b1;
-    acc[42] += a5 * b2; acc[43] += a5 * b3;
-    acc[44] += a5 * b4; acc[45] += a5 * b5;
-    acc[46] += a5 * b6; acc[47] += a5 * b7;
-    acc[48] += a6 * b0; acc[49] += a6 * b1;
-    acc[50] += a6 * b2; acc[51] += a6 * b3;
-    acc[52] += a6 * b4; acc[53] += a6 * b5;
-    acc[54] += a6 * b6; acc[55] += a6 * b7;
-    acc[56] += a7 * b0; acc[57] += a7 * b1;
-    acc[58] += a7 * b2; acc[59] += a7 * b3;
-    acc[60] += a7 * b4; acc[61] += a7 * b5;
-    acc[62] += a7 * b6; acc[63] += a7 * b7;
-    // clang-format on
-  }
-
-  for (int i = 0; i < 8; i++)
-    for (int j = 0; j < 8; j++)
-      dst[i * dst_stride + j] = (floatx)acc[i * 8 + j];
 }
 
 /* */
@@ -5226,6 +5137,207 @@ gemm_fpx_pack_scratch_get(size_t needed_floats)
   return gemm_fpx_pack_scratch;
 }
 
+/* Performs acc_ext += Ap * Bp over a k-slice of length kc. */
+static inline void
+gemm_fpx_kernel_accum(
+  float *RESTRICT       acc_ext,
+  int                   acc_stride,
+  const float *RESTRICT Bp,
+  const float *RESTRICT Ap,
+  int                   kc
+)
+{
+  float acc[64] = {0};
+
+  for (int l = 0; l < kc; l++)
+  {
+    /*
+     * Compute the outer product of Ap[l] and Bp[l], then accumulate into acc.
+     *
+     *    acc += a @ b.T (8x8):
+     *
+     *         b0   b1   b2   b3   b4   b5   b6   b7
+     *      +-----------------------------------------+
+     *  a0  | a0b0 a0b1 a0b2 a0b3 a0b4 a0b5 a0b6 a0b7 |
+     *  a1  | a1b0 a1b1 a1b2 a1b3 a1b4 a1b5 a1b6 a1b7 |
+     *  a2  | a2b0 a2b1 a2b2 a2b3 a2b4 a2b5 a2b6 a2b7 |
+     *  a3  | a3b0 a3b1 a3b2 a3b3 a3b4 a3b5 a3b6 a3b7 |
+     *  a4  | a4b0 a4b1 a4b2 a4b3 a4b4 a4b5 a4b6 a4b7 |
+     *  a5  | a5b0 a5b1 a5b2 a5b3 a5b4 a5b5 a5b6 a5b7 |
+     *  a6  | a6b0 a6b1 a6b2 a6b3 a6b4 a6b5 a6b6 a6b7 |
+     *  a7  | a7b0 a7b1 a7b2 a7b3 a7b4 a7b5 a7b6 a7b7 |
+     *      +-----------------------------------------+
+     */
+
+    // Such a shame that msvc generated absolutely no vectorization for this
+    // kernel, even though I unrolled the entire loop like this
+
+    // clang-format off
+    float a0 = Ap[l*8+0], a1 = Ap[l*8+1], a2 = Ap[l*8+2], a3 = Ap[l*8+3];
+    float a4 = Ap[l*8+4], a5 = Ap[l*8+5], a6 = Ap[l*8+6], a7 = Ap[l*8+7];
+    float b0 = Bp[l*8+0], b1 = Bp[l*8+1], b2 = Bp[l*8+2], b3 = Bp[l*8+3];
+    float b4 = Bp[l*8+4], b5 = Bp[l*8+5], b6 = Bp[l*8+6], b7 = Bp[l*8+7];
+
+    acc[ 0] += a0*b0; acc[ 1] += a0*b1; acc[ 2] += a0*b2; acc[ 3] += a0*b3;
+    acc[ 4] += a0*b4; acc[ 5] += a0*b5; acc[ 6] += a0*b6; acc[ 7] += a0*b7;
+    acc[ 8] += a1*b0; acc[ 9] += a1*b1; acc[10] += a1*b2; acc[11] += a1*b3;
+    acc[12] += a1*b4; acc[13] += a1*b5; acc[14] += a1*b6; acc[15] += a1*b7;
+    acc[16] += a2*b0; acc[17] += a2*b1; acc[18] += a2*b2; acc[19] += a2*b3;
+    acc[20] += a2*b4; acc[21] += a2*b5; acc[22] += a2*b6; acc[23] += a2*b7;
+    acc[24] += a3*b0; acc[25] += a3*b1; acc[26] += a3*b2; acc[27] += a3*b3;
+    acc[28] += a3*b4; acc[29] += a3*b5; acc[30] += a3*b6; acc[31] += a3*b7;
+    acc[32] += a4*b0; acc[33] += a4*b1; acc[34] += a4*b2; acc[35] += a4*b3;
+    acc[36] += a4*b4; acc[37] += a4*b5; acc[38] += a4*b6; acc[39] += a4*b7;
+    acc[40] += a5*b0; acc[41] += a5*b1; acc[42] += a5*b2; acc[43] += a5*b3;
+    acc[44] += a5*b4; acc[45] += a5*b5; acc[46] += a5*b6; acc[47] += a5*b7;
+    acc[48] += a6*b0; acc[49] += a6*b1; acc[50] += a6*b2; acc[51] += a6*b3;
+    acc[52] += a6*b4; acc[53] += a6*b5; acc[54] += a6*b6; acc[55] += a6*b7;
+    acc[56] += a7*b0; acc[57] += a7*b1; acc[58] += a7*b2; acc[59] += a7*b3;
+    acc[60] += a7*b4; acc[61] += a7*b5; acc[62] += a7*b6; acc[63] += a7*b7;
+    // clang-format on
+  }
+
+  for (int i = 0; i < 8; i++)
+    for (int j = 0; j < 8; j++)
+      acc_ext[i * acc_stride + j] += acc[i * 8 + j];
+}
+
+/* Converts an (mc x nc) fp32 accumulator block to floatx and writes it
+ * into dst once, after the full k range has been accumulated. */
+static inline void
+gemm_fpx_flush_block(
+  floatx *RESTRICT      dst,
+  int                   dst_stride,
+  const float *RESTRICT acc,
+  int                   acc_stride,
+  int                   mc,
+  int                   nc
+)
+{
+  for (int r = 0; r < mc; r++)
+    for (int c = 0; c < nc; c++)
+      dst[r * dst_stride + c] = (floatx)acc[r * acc_stride + c];
+}
+
+/* */
+static inline void
+gemm_fpx_compute_row(
+  floatx *RESTRICT      dst,  // dst + jc, i.e. the start of this column block
+  int                   dst_stride,
+  const float *RESTRICT Ap_full,   // packed A, (m_rows, k)
+  const float *RESTRICT Bp_block,  // packed B, (nc, k)
+  int                   m_rows,
+  int                   ic,
+  int                   nc,
+  int                   k
+)
+{
+  int mc = m_rows - ic;
+  if (mc > GEMM_MC) mc = GEMM_MC;
+
+  // Thread-local fp32 accumulator, reused across (ic,jc) iterations within
+  // this thread so we're not malloc'ing per tile.
+  static _Thread_local float *acc_buf     = NULL;
+  static _Thread_local size_t acc_buf_cap = 0;
+  size_t                      needed       = (size_t)GEMM_MC * GEMM_NC;
+
+  if (needed > acc_buf_cap)
+  {
+    free(acc_buf);
+    acc_buf     = (float *)malloc(needed * sizeof(float));
+    acc_buf_cap = (acc_buf != NULL) ? needed : 0;
+  }
+  if (acc_buf == NULL)
+  {
+    log_error("gemm_fpx accumulator scratch allocation failed");
+    return;  // best-effort: skip this tile rather than crash
+  }
+
+  // acc_buf's row stride is the fixed GEMM_NC (allocation size), NOT nc,
+  // so it must be zeroed row-by-row rather than as one flat mc*nc memset
+  for (int r = 0; r < mc; r++)
+    memset(acc_buf + (size_t)r * GEMM_NC, 0, (size_t)nc * sizeof(float));
+
+  for (int pc = 0; pc < k; pc += GEMM_KC)
+  {
+    int kc = k - pc;
+    if (kc > GEMM_KC) kc = GEMM_KC;
+
+    for (int jb = 0; jb < nc; jb += 8)
+      for (int ib = 0; ib < mc; ib += 8)
+      {
+        const float *Ap_panel = Ap_full + (size_t)(ic + ib) * k + pc * 8;
+        const float *Bp_panel = Bp_block + (size_t)jb * k + pc * 8;
+
+        gemm_fpx_kernel_accum(
+          acc_buf + ib * GEMM_NC + jb, GEMM_NC, Bp_panel, Ap_panel, kc
+        );
+      }
+  }
+
+  gemm_fpx_flush_block(
+    dst + (size_t)ic * dst_stride, dst_stride, acc_buf, GEMM_NC, mc, nc
+  );
+}
+
+/*
+ * Cache-blocked compute core shared by the "pack everything up front" path
+ * below: given an already-packed A panel covering `m_rows` rows (a
+ * multiple of 8) x k, and an already-packed B panel covering this jc
+ * column-block's `nc` columns (a multiple of 8) x k, compute the
+ * corresponding (m_rows x nc) region of `dst`.
+ *
+ * Loop nest (classic BLIS-style blocking, minus the outermost jc level
+ * which the caller already handles):
+ *
+ *   for ic in 0..m_rows step MC:  // keeps a small A slab hot
+ *     zero a (mc x nc) fp32 accumulator
+ *     for pc in 0..k step KC:     // keeps the working A/B slices
+ *                                 // small enough for L1/L2
+ *       for jb, ib: 8x8 micro-kernel accumulate
+ *     flush accumulator -> dst (floatx), once
+ *
+ * Ap_full / Bp_block use the same panel layout pack_all_fpx already
+ * produces (each 8-row group packed as packed[l*8+r], groups laid out
+ * back-to-back), so slicing a `kc`-long sub-range of `l` for a given
+ * 8-row group is just a pointer offset (+pc*8) into that group -- no
+ * re-packing needed to stream through k in chunks.
+ */
+static void
+gemm_fpx_compute_block(
+  floatx *RESTRICT      dst,  // dst + jc, i.e. the start of this column block
+  int                   dst_stride,
+  const float *RESTRICT Ap_full,   // packed A, (m_rows, k)
+  const float *RESTRICT Bp_block,  // packed B, (nc, k)
+  int                   m_rows,
+  int                   nc,
+  int                   k,
+  bool                  omp
+)
+{
+  int ic;
+
+  if (omp)
+  {
+    #pragma omp parallel for private(ic) OMP_PARA_ARGS if (omp)
+    for (ic = 0; ic < m_rows; ic += GEMM_MC)
+    {
+      gemm_fpx_compute_row(
+        dst, dst_stride, Ap_full, Bp_block, m_rows, ic, nc, k
+      );
+    }
+  }
+  else
+  {
+    for (ic = 0; ic < m_rows; ic += GEMM_MC)
+    {
+      gemm_fpx_compute_row(
+        dst, dst_stride, Ap_full, Bp_block, m_rows, ic, nc, k
+      );
+    }
+  }
+}
+
 /**
  * fpx matrix-matrix multiply (NT)
  * fpx src (m, k) @ fpx mat.T (k, n) = fpx dst (m, n)
@@ -5253,42 +5365,79 @@ gemm_fpx(
 
   if (m_full > 0 && n_full > 0)
   {
-    size_t needed  = (size_t)(m_full + n_full) * k;
+    // Scratch holds the full A panel (m_full x k) plus one NC-wide B
+    // column block (at most GEMM_NC x k) at a time, instead of the
+    // whole n_full x k B matrix up front.
+    int    nc_cap = n_full < GEMM_NC ? n_full : GEMM_NC;
+    size_t needed  = (size_t)m_full * k + (size_t)nc_cap * k;
     float *scratch = gemm_fpx_pack_scratch_get(needed);
     if (scratch == NULL)
     {
       log_error("gemm packing scratch allocation failed");
       return 1;
     }
-    float *Ap_full = scratch;
-    float *Bp_full = scratch + (size_t)m_full * k;
+    float *Ap_full  = scratch;
+    float *Bp_block = scratch + (size_t)m_full * k;
+
+    /*
+     * For both src and mat, group every 8 rows into a panel:
+     *
+     *  src (m x k)           mat (n x k)           dst (m x n)
+     * +-------------+       +-------------+       +-------------+
+     * | 8 rows (A0) |--+    | 8 rows (B0) |--+    |             |
+     * +-------------+  |    +-------------+  |    |   ib x jb   |
+     * | 8 rows (A1) |  |    | 8 rows (B1) |  |    |    tiles    |
+     * +-------------+  |    +-------------+  |    |             |
+     * | 8 rows (A2) |  |    | 8 rows (B2) |  |    |             |
+     * +-------------+  |    +-------------+  |    |             |
+     * |    ...      |  V    |    ...      |  V    |             |
+     * +-------------+       +-------------+       +-------------+
+     * (m_full rows)         (n_full rows)
+     *
+     * Then transpose all the panels to column-major:
+     *
+     * original:
+     * Ra: [aa ab ac ad ae af ag ah ai aj ak al am an ao]
+     * Rb: [ba bb bc bd be bf bg bh bi bj bk bl bm bn bo]
+     * Rc: [ca cb cc cd ce cf cg ch ci cj ck cl cm cn co]
+     * Rd: [da db dc dd de df dg dh di dj dk dl dm dn do]
+     * Re: [ea eb ec ed ee ef eg eh ei ej ek el em en eo]
+     * Rf: [fa fb fc fd fe ff fg fh fi fj fk fl fm fn fo]
+     * Rg: [ga gb gc gd ge gf gg gh gi gj gk gl gm gn go]
+     * Rh: [ha hb hc hd he hf hg hh hi hj hk hl hm hn ho]
+     *
+     * packed:
+     * Ra: [aa ba ca da ea fa ga ha]
+     * Rb: [ab bb cb db eb fb gb hb]
+     * Rc: [ac bc cc dc ec fc gc hc]
+     * Rd: [ad bd cd dd ed fd gd hd]
+     * Re: [ae be ce de ee fe ge he]
+     * Rf: [af bf cf df ef ff gf hf]
+     * Rg: [ag bg cg dg eg fg gg hg]
+     * Rh: [ah bh ch dh eh fh gh hh]
+     * Ri: [ai bi ci di ei fi gi hi]
+     * Rj: [aj bj cj dj ej fj gj hj]
+     * Rk: [ak bk ck dk ek fk gk hk]
+     * Rl: [al bl cl dl el fl gl hl]
+     * Rm: [am bm cm dm em fm gm hm]
+     * Rn: [an bn cn dn en fn gn hn]
+     * Ro: [ao bo co do eo fo go ho]
+     */
 
     pack_all_fpx(Ap_full, src, src_stride, m_full, 8, k, omp);
-    pack_all_fpx(Bp_full, mat, mat_stride, n_full, 8, k, omp);
 
-    if (omp)
+    for (int jc = 0; jc < n_full; jc += GEMM_NC)
     {
-      int jb, ib;
-      #pragma omp parallel for private(ib, jb) OMP_COLLAPSE2 OMP_PARA_ARGS
-      for (jb = 0; jb < n_full; jb += 8)
-        for (ib = 0; ib < m_full; ib += 8)
-        {
-          gemm_fpx_kernel(
-            dst + ib * dst_stride + jb, dst_stride, Bp_full + (size_t)jb * k,
-            Ap_full + (size_t)ib * k, k
-          );
-        }
-    }
-    else
-    {
-      for (int jb = 0; jb < n_full; jb += 8)
-        for (int ib = 0; ib < m_full; ib += 8)
-        {
-          gemm_fpx_kernel(
-            dst + ib * dst_stride + jb, dst_stride, Bp_full + (size_t)jb * k,
-            Ap_full + (size_t)ib * k, k
-          );
-        }
+      int nc = n_full - jc;
+      if (nc > GEMM_NC) nc = GEMM_NC;
+
+      pack_all_fpx(
+        Bp_block, mat + (size_t)jc * mat_stride, mat_stride, nc, 8, k, omp
+      );
+
+      gemm_fpx_compute_block(
+        dst + jc, dst_stride, Ap_full, Bp_block, m_full, nc, k, omp
+      );
     }
   }
 
@@ -5332,6 +5481,7 @@ gemm_fpx_nn_kernel(
 {
 #if defined(__MSVC__)
 #  define ACC(ii, j) acc[(ii) * n + (j)]
+
   float *acc = (float *)_alloca(8 * (size_t)n * sizeof(float));
   float *row = (float *)_alloca((size_t)n * sizeof(float));
   for (int ii = 0; ii < mr; ii++)
@@ -5340,12 +5490,14 @@ gemm_fpx_nn_kernel(
   }
 #else
 #  define ACC(ii, j) acc[(ii)][(j)]
+
   float acc[8][n];
   float row[n];
   for (int ii = 0; ii < mr; ii++)
   {
     memset(acc[ii], 0, n * sizeof(float));
   }
+
 #endif
 
   for (int l = 0; l < k; l++)
@@ -5521,86 +5673,6 @@ pack_all_i8(
 
 /* */
 static inline void
-gemm_int8_kernel(
-  floatx *RESTRICT       dst,
-  int                    dst_stride,
-  const int8_t *RESTRICT Bp,
-  const floatx *RESTRICT mat_scales,
-  const int8_t *RESTRICT Ap,
-  const floatx *RESTRICT src_scales,
-  int                    k
-)
-{
-  int32_t acc[64] = {0};
-
-  for (int l = 0; l < k; l++)
-  {
-    int32_t a0 = Ap[l * 8 + 0];
-    int32_t a1 = Ap[l * 8 + 1];
-    int32_t a2 = Ap[l * 8 + 2];
-    int32_t a3 = Ap[l * 8 + 3];
-    int32_t a4 = Ap[l * 8 + 4];
-    int32_t a5 = Ap[l * 8 + 5];
-    int32_t a6 = Ap[l * 8 + 6];
-    int32_t a7 = Ap[l * 8 + 7];
-    int32_t b0 = Bp[l * 8 + 0];
-    int32_t b1 = Bp[l * 8 + 1];
-    int32_t b2 = Bp[l * 8 + 2];
-    int32_t b3 = Bp[l * 8 + 3];
-    int32_t b4 = Bp[l * 8 + 4];
-    int32_t b5 = Bp[l * 8 + 5];
-    int32_t b6 = Bp[l * 8 + 6];
-    int32_t b7 = Bp[l * 8 + 7];
-
-    // clang-format off
-    acc[ 0] += a0 * b0; acc[ 1] += a0 * b1;
-    acc[ 2] += a0 * b2; acc[ 3] += a0 * b3;
-    acc[ 4] += a0 * b4; acc[ 5] += a0 * b5;
-    acc[ 6] += a0 * b6; acc[ 7] += a0 * b7;
-    acc[ 8] += a1 * b0; acc[ 9] += a1 * b1;
-    acc[10] += a1 * b2; acc[11] += a1 * b3;
-    acc[12] += a1 * b4; acc[13] += a1 * b5;
-    acc[14] += a1 * b6; acc[15] += a1 * b7;
-    acc[16] += a2 * b0; acc[17] += a2 * b1;
-    acc[18] += a2 * b2; acc[19] += a2 * b3;
-    acc[20] += a2 * b4; acc[21] += a2 * b5;
-    acc[22] += a2 * b6; acc[23] += a2 * b7;
-    acc[24] += a3 * b0; acc[25] += a3 * b1;
-    acc[26] += a3 * b2; acc[27] += a3 * b3;
-    acc[28] += a3 * b4; acc[29] += a3 * b5;
-    acc[30] += a3 * b6; acc[31] += a3 * b7;
-    acc[32] += a4 * b0; acc[33] += a4 * b1;
-    acc[34] += a4 * b2; acc[35] += a4 * b3;
-    acc[36] += a4 * b4; acc[37] += a4 * b5;
-    acc[38] += a4 * b6; acc[39] += a4 * b7;
-    acc[40] += a5 * b0; acc[41] += a5 * b1;
-    acc[42] += a5 * b2; acc[43] += a5 * b3;
-    acc[44] += a5 * b4; acc[45] += a5 * b5;
-    acc[46] += a5 * b6; acc[47] += a5 * b7;
-    acc[48] += a6 * b0; acc[49] += a6 * b1;
-    acc[50] += a6 * b2; acc[51] += a6 * b3;
-    acc[52] += a6 * b4; acc[53] += a6 * b5;
-    acc[54] += a6 * b6; acc[55] += a6 * b7;
-    acc[56] += a7 * b0; acc[57] += a7 * b1;
-    acc[58] += a7 * b2; acc[59] += a7 * b3;
-    acc[60] += a7 * b4; acc[61] += a7 * b5;
-    acc[62] += a7 * b6; acc[63] += a7 * b7;
-    // clang-format on
-  }
-
-  for (int i = 0; i < 8; i++)
-  {
-    float fscale = (float)src_scales[i];
-    for (int j = 0; j < 8; j++)
-    {
-      dst[i * dst_stride + j] =
-        (floatx)((float)acc[i * 8 + j] * fscale * (float)mat_scales[j]);
-    }
-  }
-}
-
-/* */
-static inline void
 gemm_int8_scalar_row(
   floatx *RESTRICT       dst,
   int                    dst_stride,
@@ -5672,6 +5744,179 @@ gemm_int8_scalar(
   }
 }
 
+/* Same int8 x int8 -> int32 outer-product micro-kernel. */
+static inline void
+gemm_int8_kernel_accum(
+  int32_t *RESTRICT      acc_ext,
+  int                    acc_stride,
+  const int8_t *RESTRICT Bp,
+  const int8_t *RESTRICT Ap,
+  int                    kc
+)
+{
+  int32_t acc[64] = {0};
+
+  for (int l = 0; l < kc; l++)
+  {
+    // clang-format off
+    int32_t a0 = Ap[l*8+0], a1 = Ap[l*8+1], a2 = Ap[l*8+2], a3 = Ap[l*8+3];
+    int32_t a4 = Ap[l*8+4], a5 = Ap[l*8+5], a6 = Ap[l*8+6], a7 = Ap[l*8+7];
+    int32_t b0 = Bp[l*8+0], b1 = Bp[l*8+1], b2 = Bp[l*8+2], b3 = Bp[l*8+3];
+    int32_t b4 = Bp[l*8+4], b5 = Bp[l*8+5], b6 = Bp[l*8+6], b7 = Bp[l*8+7];
+
+    acc[ 0] += a0*b0; acc[ 1] += a0*b1; acc[ 2] += a0*b2; acc[ 3] += a0*b3;
+    acc[ 4] += a0*b4; acc[ 5] += a0*b5; acc[ 6] += a0*b6; acc[ 7] += a0*b7;
+    acc[ 8] += a1*b0; acc[ 9] += a1*b1; acc[10] += a1*b2; acc[11] += a1*b3;
+    acc[12] += a1*b4; acc[13] += a1*b5; acc[14] += a1*b6; acc[15] += a1*b7;
+    acc[16] += a2*b0; acc[17] += a2*b1; acc[18] += a2*b2; acc[19] += a2*b3;
+    acc[20] += a2*b4; acc[21] += a2*b5; acc[22] += a2*b6; acc[23] += a2*b7;
+    acc[24] += a3*b0; acc[25] += a3*b1; acc[26] += a3*b2; acc[27] += a3*b3;
+    acc[28] += a3*b4; acc[29] += a3*b5; acc[30] += a3*b6; acc[31] += a3*b7;
+    acc[32] += a4*b0; acc[33] += a4*b1; acc[34] += a4*b2; acc[35] += a4*b3;
+    acc[36] += a4*b4; acc[37] += a4*b5; acc[38] += a4*b6; acc[39] += a4*b7;
+    acc[40] += a5*b0; acc[41] += a5*b1; acc[42] += a5*b2; acc[43] += a5*b3;
+    acc[44] += a5*b4; acc[45] += a5*b5; acc[46] += a5*b6; acc[47] += a5*b7;
+    acc[48] += a6*b0; acc[49] += a6*b1; acc[50] += a6*b2; acc[51] += a6*b3;
+    acc[52] += a6*b4; acc[53] += a6*b5; acc[54] += a6*b6; acc[55] += a6*b7;
+    acc[56] += a7*b0; acc[57] += a7*b1; acc[58] += a7*b2; acc[59] += a7*b3;
+    acc[60] += a7*b4; acc[61] += a7*b5; acc[62] += a7*b6; acc[63] += a7*b7;
+    // clang-format on
+  }
+
+  for (int i = 0; i < 8; i++)
+    for (int j = 0; j < 8; j++)
+      acc_ext[i * acc_stride + j] += acc[i * 8 + j];
+}
+
+/* Applies the per-row / per-column dequant scales to an (mc x nc) int32
+ * accumulator block and writes the result into dst once. `src_scales` and
+ * `mat_scales` are expected to already be offset to this block's first
+ * row / column (i.e. src_scales[r] / mat_scales[c] are absolute, not relative
+ * to some further outer offset). */
+static inline void
+gemm_int8_flush_block(
+  floatx *RESTRICT        dst,
+  int                     dst_stride,
+  const int32_t *RESTRICT acc,
+  int                     acc_stride,
+  const floatx *RESTRICT  src_scales,
+  const floatx *RESTRICT  mat_scales,
+  int                     mc,
+  int                     nc
+)
+{
+  for (int r = 0; r < mc; r++)
+  {
+    float fscale = (float)src_scales[r];
+    for (int c = 0; c < nc; c++)
+      dst[r * dst_stride + c] =
+        (floatx)((float)acc[r * acc_stride + c] * fscale * (float)mat_scales[c]);
+  }
+}
+
+/* */
+static inline void
+gemm_int8_compute_row(
+  floatx *RESTRICT       dst,  // dst + jc
+  int                    dst_stride,
+  const int8_t *RESTRICT Ap_full,           // packed A, (m_rows, k)
+  const int8_t *RESTRICT Bp_block,          // packed B, (nc, k)
+  const floatx *RESTRICT src_scales,        // absolute, one per row of Ap_full
+  const floatx *RESTRICT mat_scales_block,  // offset to this jc block already
+  int                    m_rows,
+  int                    nc,
+  int                    ic,
+  int                    k
+)
+{
+  int mc = m_rows - ic;
+  if (mc > GEMM_MC) mc = GEMM_MC;
+
+  static _Thread_local int32_t *acc_buf     = NULL;
+  static _Thread_local size_t   acc_buf_cap = 0;
+  size_t                        needed       = (size_t)GEMM_MC * GEMM_NC;
+
+  if (needed > acc_buf_cap)
+  {
+    free(acc_buf);
+    acc_buf     = (int32_t *)malloc(needed * sizeof(int32_t));
+    acc_buf_cap = (acc_buf != NULL) ? needed : 0;
+  }
+  if (acc_buf == NULL)
+  {
+    log_error("gemm_int8 accumulator scratch allocation failed");
+    return;
+  }
+
+  for (int r = 0; r < mc; r++)
+    memset(acc_buf + (size_t)r * GEMM_NC, 0, (size_t)nc * sizeof(int32_t));
+
+  for (int pc = 0; pc < k; pc += GEMM_KC)
+  {
+    int kc = k - pc;
+    if (kc > GEMM_KC) kc = GEMM_KC;
+
+    for (int jb = 0; jb < nc; jb += 8)
+      for (int ib = 0; ib < mc; ib += 8)
+      {
+        const int8_t *Ap_panel = Ap_full + (size_t)(ic + ib) * k + pc * 8;
+        const int8_t *Bp_panel = Bp_block + (size_t)jb * k + pc * 8;
+
+        gemm_int8_kernel_accum(
+          acc_buf + ib * GEMM_NC + jb, GEMM_NC, Bp_panel, Ap_panel, kc
+        );
+      }
+  }
+
+  gemm_int8_flush_block(
+    dst + (size_t)ic * dst_stride, dst_stride, acc_buf, GEMM_NC,
+    src_scales + ic, mat_scales_block, mc, nc
+  );
+}
+
+/* Cache-blocked compute core for gemm_int8, blocks the m dimension by GEMM_MC
+ * and the k dimension by GEMM_KC so the A/B slices touched by the innermost
+ * loop stay small, then applies the dequant scales once per (ic, jc) tile after
+ * the full k range has been summed in int32. */
+static void
+gemm_int8_compute_block(
+  floatx *RESTRICT       dst,  // dst + jc
+  int                    dst_stride,
+  const int8_t *RESTRICT Ap_full,           // packed A, (m_rows, k)
+  const int8_t *RESTRICT Bp_block,          // packed B, (nc, k)
+  const floatx *RESTRICT src_scales,        // absolute, one per row of Ap_full
+  const floatx *RESTRICT mat_scales_block,  // offset to this jc block already
+  int                    m_rows,
+  int                    nc,
+  int                    k,
+  bool                   omp
+)
+{
+  int ic;
+
+  if (omp)
+  {
+    #pragma omp parallel for private(ic) OMP_PARA_ARGS if (omp)
+    for (ic = 0; ic < m_rows; ic += GEMM_MC)
+    {
+      gemm_int8_compute_row(
+        dst, dst_stride, Ap_full, Bp_block, src_scales, mat_scales_block, m_rows,
+        nc, ic, k
+      );
+    }
+  }
+  else
+  {
+    for (ic = 0; ic < m_rows; ic += GEMM_MC)
+    {
+      gemm_int8_compute_row(
+        dst, dst_stride, Ap_full, Bp_block, src_scales, mat_scales_block, m_rows,
+        nc, ic, k
+      );
+    }
+  }
+}
+
 /**
  * int8 matrix-matrix multiply (NT) + dequant
  *
@@ -5703,41 +5948,35 @@ gemm_int8(
 
   if (m_full > 0 && n_full > 0)
   {
-    int8_t *scratch = gemm_i8_pack_scratch_get((size_t)(m_full + n_full) * k);
+    // Scratch holds the full A panel (m_full x k) plus one NC-wide B
+    // column block (at most GEMM_NC x k) at a time, instead of the
+    // whole n_full x k B matrix up front.
+    int     nc_cap  = n_full < GEMM_NC ? n_full : GEMM_NC;
+    size_t  needed  = (size_t)m_full * k + (size_t)nc_cap * k;
+    int8_t *scratch = gemm_i8_pack_scratch_get(needed);
     if (scratch == NULL)
     {
       log_error("gemm_int8 packing scratch allocation failed");
       return 1;
     }
-    int8_t *Ap_full = scratch;
-    int8_t *Bp_full = scratch + (size_t)m_full * k;
+    int8_t *Ap_full  = scratch;
+    int8_t *Bp_block = scratch + (size_t)m_full * k;
 
     pack_all_i8(Ap_full, src, src_stride, m_full, 8, k, omp);
-    pack_all_i8(Bp_full, mat, mat_stride, n_full, 8, k, omp);
 
-    if (omp)
+    for (int jc = 0; jc < n_full; jc += GEMM_NC)
     {
-      int jb, ib;
-      #pragma omp parallel for private(ib, jb) OMP_COLLAPSE2 OMP_PARA_ARGS
-      for (jb = 0; jb < n_full; jb += 8)
-        for (ib = 0; ib < m_full; ib += 8)
-        {
-          gemm_int8_kernel(
-            dst + ib * dst_stride + jb, dst_stride, Bp_full + (size_t)jb * k,
-            mat_scales + jb, Ap_full + (size_t)ib * k, src_scales + ib, k
-          );
-        }
-    }
-    else
-    {
-      for (int jb = 0; jb < n_full; jb += 8)
-        for (int ib = 0; ib < m_full; ib += 8)
-        {
-          gemm_int8_kernel(
-            dst + ib * dst_stride + jb, dst_stride, Bp_full + (size_t)jb * k,
-            mat_scales + jb, Ap_full + (size_t)ib * k, src_scales + ib, k
-          );
-        }
+      int nc = n_full - jc;
+      if (nc > GEMM_NC) nc = GEMM_NC;
+
+      pack_all_i8(
+        Bp_block, mat + (size_t)jc * mat_stride, mat_stride, nc, 8, k, omp
+      );
+
+      gemm_int8_compute_block(
+        dst + jc, dst_stride, Ap_full, Bp_block, src_scales,
+        mat_scales + jc, m_full, nc, k, omp
+      );
     }
   }
 
@@ -5751,7 +5990,7 @@ gemm_int8(
       k, omp
     );
   }
-  if (n_full < n)
+  if (n_full < n && m_full > 0)
   {
     gemm_int8_scalar(
       dst + n_full, dst_stride, mat + n_full * mat_stride, mat_stride,
@@ -5784,9 +6023,7 @@ softmax(floatx *dst, const floatx *src, int dim)
     expsum += val;
   }
 
-  int i;
-  #pragma omp simd
-  for (i = 0; i < dim; i++)
+  for (int i = 0; i < dim; i++)
   {
     dst[i] = (floatx)((float)dst[i] / expsum);
   }
@@ -5985,7 +6222,7 @@ forward_vision(
   int n_patches   = ppi * ppi;
   int image_toks  = tcfg->image_toks;
   int side_len    = (int)roundf(sqrtf((float)image_toks));
-  int kernal_size = (image_size / vcfg->patch_size) / side_len;
+  int kernel_size = (image_size / vcfg->patch_size) / side_len;
   int head_dim    = embed_dim / vcfg->n_heads;
   int mlp_dim     = vcfg->mlp_dim;
   int input_dim   = 3 * patch_size * patch_size;
@@ -6008,7 +6245,7 @@ forward_vision(
         float sum = 0.0f;
 
         // equivalent to Conv2d(
-        //   in_channels=3, out_channels=embed_dim, kernal_size=patch_size,
+        //   in_channels=3, out_channels=embed_dim, kernel_size=patch_size,
         //   stride=patch_size, bias=True)
 
         for (int py = 0; py < patch_size; py++)
@@ -6311,17 +6548,17 @@ forward_vision(
       for (int d = 0; d < embed_dim; d++)
       {
         float sum = 0.0f;
-        for (int ky = 0; ky < kernal_size; ky++)
+        for (int ky = 0; ky < kernel_size; ky++)
         {
-          for (int kx = 0; kx < kernal_size; kx++)
+          for (int kx = 0; kx < kernel_size; kx++)
           {
-            int py        = oy * kernal_size + ky;
-            int px        = ox * kernal_size + kx;
+            int py        = oy * kernel_size + ky;
+            int px        = ox * kernel_size + kx;
             int token_idx = (py * ppi + px) * embed_dim + d;
             sum += (float)vbuf->x[token_idx];
           }
         }
-        vbuf->x[out_idx + d] = (floatx)(sum / (kernal_size * kernal_size));
+        vbuf->x[out_idx + d] = (floatx)(sum / (kernel_size * kernel_size));
       }
     }
 
@@ -9400,21 +9637,19 @@ main(int argc, char **argv)
 
   if (chatmode)
   {
-    if (chat(
-          model, tbuf, vbuf, (int)seqlen, (int)chunk_size, temperature,
-          (int)topk, topp, rpen, enable_mm, &prefill_elapsed, &prefill_toks,
-          &gen_elapsed, &gen_toks
-        ) == 1)
-      goto fail;
+    chat(
+      model, tbuf, vbuf, (int)seqlen, (int)chunk_size, temperature, (int)topk,
+      topp, rpen, enable_mm, &prefill_elapsed, &prefill_toks, &gen_elapsed,
+      &gen_toks
+    );
   }
   else
   {
-    if (generate(
-          model, tbuf, vbuf, prompt, (int)seqlen, (int)chunk_size, temperature,
-          (int)topk, topp, rpen, enable_mm, &prefill_elapsed, &prefill_toks,
-          &gen_elapsed, &gen_toks
-        ) == 1)
-      goto fail;
+    generate(
+      model, tbuf, vbuf, prompt, (int)seqlen, (int)chunk_size, temperature,
+      (int)topk, topp, rpen, enable_mm, &prefill_elapsed, &prefill_toks,
+      &gen_elapsed, &gen_toks
+    );
   }
 
   if (verbose)
