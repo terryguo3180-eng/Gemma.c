@@ -4726,15 +4726,13 @@ rmsnorm(
 )
 {
   float sqsum = 0.0f;
-  int   i;
-
-  for (i = 0; i < dim; i++)
+  for (int i = 0; i < dim; i++)
   {
     sqsum += (float)src[i] * (float)src[i];
   }
   float rms = 1.0f / sqrtf(sqsum / (float)dim + eps);
 
-  for (i = 0; i < dim; i++)
+  for (int i = 0; i < dim; i++)
   {
     dst[i] = (floatx)((float)src[i] * rms * (float)(weight[i] + 1));
   }
@@ -4752,9 +4750,7 @@ layernorm(
 )
 {
   float mean = 0.0f;
-  int   i;
-
-  for (i = 0; i < dim; i++)
+  for (int i = 0; i < dim; i++)
   {
     mean += (float)src[i];
   }
@@ -4762,7 +4758,7 @@ layernorm(
 
   float var = 0.0f;
 
-  for (i = 0; i < dim; i++)
+  for (int i = 0; i < dim; i++)
   {
     float diff = (float)src[i] - mean;
     var += diff * diff;
@@ -4771,7 +4767,7 @@ layernorm(
 
   float inv_std = 1.0f / sqrtf(var + eps);
 
-  for (i = 0; i < dim; i++)
+  for (int i = 0; i < dim; i++)
   {
     dst[i] = (floatx)(((float)src[i] - mean) * inv_std * (float)weight[i] +
                       (float)bias[i]);
@@ -4787,9 +4783,7 @@ quantize_act(int8_t *dst, const floatx *vec, int dim)
 {
   floatx amax = 0.0f;
 
-  int d;
-
-  for (d = 0; d < dim; d++)
+  for (int d = 0; d < dim; d++)
   {
     floatx av = vec[d] >= 0 ? vec[d] : -vec[d];
     if (av > amax)
@@ -4860,9 +4854,7 @@ gemv_fpx_row(
 )
 {
   float sum = 0;
-  int   j;
-
-  for (j = 0; j < n; j++)
+  for (int j = 0; j < n; j++)
   {
     sum += (float)mat[i * n + j] * (float)vec[j];
   }
@@ -4912,9 +4904,8 @@ gemv_int8_row(
 )
 {
   int32_t sum = 0;
-  int     j;
 
-  for (j = 0; j < n; j++)
+  for (int j = 0; j < n; j++)
   {
     sum += (int32_t)mat[i * n + j] * (int32_t)vec[j];
   }
@@ -5001,9 +4992,7 @@ gemv_fpx_nn(
 
 /**
  * Copy `rows` rows (stride `row_stride`, length k each) of `src` into a
- * contiguous, already-upcast-to-float buffer laid out as `packed[l*rows + r]`,
- * so the micro-kernel can read all `rows` values for a fixed `l` with one
- * contiguous load instead of `rows` separate strided reads.
+ * contiguous, already-upcast-to-float buffer laid out as `packed[l*rows + r]`.
  */
 static inline void
 pack_panel_fpx(
@@ -5025,9 +5014,8 @@ pack_panel_fpx(
 }
 
 /**
- * Pack every R-row panel of a (total_rows x k) matrix, back to back, into one
- * contiguous buffer. Parallelized because for large prefill chunks this alone
- * touches every element of `mat` once.
+ * Pack every R-row panel of a (total_rows x k) matrix, back to back,
+ * into one contiguous buffer.
  */
 static void
 pack_all_fpx(
@@ -5064,11 +5052,11 @@ pack_all_fpx(
 
 /**
  * Compute one 8x8 tile of dst = src @ mat.T from PACKED, contiguous
- * MR/NR-major panels (see pack_panel/pack_all). The 64 FMAs are spelled out by
- * hand rather than as a nested i/j loop. GCC vectorizes the nested-loop form
- * just fine, but Clang's optimizer can only produces good code once the
- * accumulation is fully unrolled with compile-time-constant indices :'D. So I
- * just hardcoded for 8x8.
+ * MR/NR-major panels (see pack_panel/pack_all). The 64 FMAs are spelled
+ * out by hand rather than as a nested i/j loop. GCC vectorizes the
+ * nested-loop form just fine, but Clang's optimizer can only produces
+ * good code once the accumulation is fully unrolled with
+ * compile-time-constant indices :'D. So I just hardcoded for 8x8.
  */
 static inline void
 gemm_fpx_kernel(
@@ -5080,6 +5068,21 @@ gemm_fpx_kernel(
 )
 {
   float acc[64] = {0};
+
+  /*
+   * Equivilant code:
+   * ```c
+   * for (int l = 0; l < k; l++)
+   * {
+   *   const float *a = Ap + l * 8;
+   *   const float *b = Bp + l * 8;
+   * 
+   *   for (int r = 0; r < 8; r++)
+   *     for (int j = 0; j < 8; j++)
+   *       acc[r * 8 + j] += a[r] * b[j];
+   *  }
+   * ```
+   */
 
   for (int l = 0; l < k; l++)
   {
@@ -5159,9 +5162,7 @@ gemm_fpx_scalar_row(
   const floatx *src_row = src + i * src_stride;
   const floatx *w_row   = mat + j * mat_stride;
 
-  int l;
-
-  for (l = 0; l < k; l++)
+  for (int l = 0; l < k; l++)
   {
     sum += (float)src_row[l] * (float)w_row[l];
   }
@@ -5314,8 +5315,7 @@ gemm_fpx(
 /**
  * Compute an `mr`x`n` (mr <= 8) block of dst = src @ mat.
  * `mat` is converted from floatx -> float once per `l` (into `row`) and
- * then reused across all `mr` accumulator rows, instead of being
- * re-read/re-converted once per row like the naive version.
+ * then reused across all `mr` accumulator rows.
  */
 static inline void
 gemm_fpx_nn_kernel(
@@ -5465,10 +5465,7 @@ gemm_free_thread_scratch(void)
   gemm_i8_pack_scratch_cap = 0;
 }
 
-/**
- * Same idea as pack_panel/pack_all for fpx, but source/dest are int8_t, no
- * upcast needed, this is a pure gather-to-contiguous transpose.
- */
+/* */
 static inline void
 pack_panel_i8(
   int8_t *RESTRICT       packed,
@@ -5624,9 +5621,7 @@ gemm_int8_scalar_row(
   const int8_t *src_row = src + i * src_stride;
   const int8_t *mat_row = mat + j * mat_stride;
 
-  int l;
-
-  for (l = 0; l < k; l++)
+  for (int l = 0; l < k; l++)
   {
     sum += (int32_t)src_row[l] * (int32_t)mat_row[l];
   }
@@ -7789,7 +7784,7 @@ sample_from_logits(
   float sum = 0.0f;
 
   int token = vocab_size - 1;
-  for (d = 0; d < vocab_size; d++)
+  for (int d = 0; d < vocab_size; d++)
   {
     sum += (float)probs[d];
     if (r < sum)
@@ -9424,6 +9419,7 @@ main(int argc, char **argv)
 
   if (verbose)
   {
+    // Print timing stats
     printf("\n\n");
     if (prefill_elapsed > 0.0)
     {
