@@ -9,3 +9,6 @@ Papaers/
 *.o
 *.obj
 *.exe
+*.ps1
+*.txt
+.clangd

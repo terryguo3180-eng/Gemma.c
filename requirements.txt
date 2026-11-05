@@ -1,0 +1,6 @@
+torch
+transformers
+accelerate
+huggingface_hub
+safetensors
+tqdm

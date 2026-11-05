@@ -189,29 +189,23 @@ Test environment:
 - OS: `Windows 11`
 - Compiler: `gcc 15.2.0 x86_64-w64-mingw32`
 - Compiler arguments: `-Ofast -fopenmp -march=native -mtune=native`
-- Run arguments: `--temperature 0 --seqlen 100 --verbose --no-mmap`
-- Threads (`OMP_NUM_THREADS`): `6`
+- Run arguments (generation): `--temperature 0 --tokens 100 --threads 14 --verbose --no-mmap`
+- Run arguments (prefill): `--temperature 0 --seqlen 2048 --tokens 1 --threads 14 --verbose --no-mmap`
 
-| Model               | Generation speed (tok/s, 100 tokens) | Prompt processing speed (tok/s, 100 tokens) | Base memory | Memory per tok |
-| ------------------- | ------------------------------------ | ------------------------------------------- | ----------- | -------------- |
-| Gemma-1 2B (FP16)   | `<TODO>`                             | `<TODO>`                                    | `<TODO>`    | `<TODO>`       |
-| Gemma-1 2B (W8A8)   | `<TODO>`                             | `<TODO>`                                    | `<TODO>`    | `<TODO>`       |
-| Gemma-1 7B (FP16)   | `<TODO>`                             | `<TODO>`                                    | `<TODO>`    | `<TODO>`       |
-| Gemma-1 7B (W8A8)   | `<TODO>`                             | `<TODO>`                                    | `<TODO>`    | `<TODO>`       |
-| Gemma-2 2B (FP16)   | `<TODO>`                             | `<TODO>`                                    | `<TODO>`    | `<TODO>`       |
-| Gemma-2 2B (W8A8)   | `<TODO>`                             | `<TODO>`                                    | `<TODO>`    | `<TODO>`       |
-| Gemma-2 9B (FP16)   | `<TODO>`                             | `<TODO>`                                    | `<TODO>`    | `<TODO>`       |
-| Gemma-2 9B (W8A8)   | `<TODO>`                             | `<TODO>`                                    | `<TODO>`    | `<TODO>`       |
-| Gemma-3 270M (FP16) | `23.45`                              | `35.60`                                     | `0.50 GB`   | `18 KB`        |
-| Gemma-3 270M (W8A8) | `44.92`                              | `50.30`                                     | `0.25 GB`   | `18 KB`        |
-| Gemma-3 1B (FP16)   | `7.64`                               | `10.04`                                     | `1.86 GB`   | `26 KB`        |
-| Gemma-3 1B (W8A8)   | `25.15`                              | `29.97`                                     | `0.93 GB`   | `26 KB`        |
-| Gemma-3 4B (FP16)   | `2.30`                               | `2.89`                                      | `7.23 GB`   | `136 KB`       |
-| Gemma-3 4B (W8A8)   | `9.32`                               | `10.88`                                     | `3.62 GB`   | `136 KB`       |
-| Gemma-3-12B (FP16)  | `<TODO>`                             | `<TODO>`                                    | `<TODO>`    | `<TODO>`       |
-| Gemma-3 12B (W8A8)  | `3.62`                               | `3.80`                                      | `10.96 GB`  | `384 KB`       |
-| Gemma-3-27B (FP16)  | `<TODO>`                             | `<TODO>`                                    | `<TODO>`    | `<TODO>`       |
-| Gemma-3-27B (W8A8)  | `<TODO>`                             | `<TODO>`                                    | `<TODO>`    | `<TODO>`       |
+| Model | Base memory (GB) | KV cache / tok (KB) | Generation (tok/s) | Prefill (tok/s) |
+|---|---|---|---|---|
+| gemma-1-7b-it-fp16 | 17.910 | 448.00 | 1.62 (1.61-1.62) | 11.99 (11.95-12.03) |
+| gemma-2-2b-fp16 | 5.400 | 104.00 | 5.03 (5.01-5.05) | 41.97 (41.82-42.15) |
+| gemma-2-2b-fp16_q | 2.970 | 104.00 | 15.91 (15.63-16.16) | 109.79 (108.77-110.60) |
+| gemma-3-12b-it-fp16 | N/A | N/A | N/A | 8.30 (8.21-8.38) |
+| gemma-3-12b-it-fp16_q | 14.350 | 384.00 | 4.78 (4.77-4.79) | 25.95 (25.69-26.14) |
+| gemma-3-1b-it-fp16 | 2.030 | 26.00 | 11.49 (11.43-11.54) | 100.71 (99.58-101.65) |
+| gemma-3-1b-it-fp16_q | 1.100 | 26.00 | 29.16 (28.83-29.42) | 228.29 (226.83-230.81) |
+| gemma-3-270m-it-fp16 | 0.620 | 18.00 | 31.83 (31.81-31.87) | 385.16 (383.20-387.49) |
+| gemma-3-270m-it-fp16_q | 0.370 | 18.00 | 57.08 (52.46-59.55) | 627.03 (588.48-670.25) |
+| gemma-3-4b-it-fp16 | 9.630 | 136.00 | 3.42 (3.41-3.43) | 27.83 (27.59-28.03) |
+| gemma-3-4b-it-fp16_q | 5.650 | 136.00 | 11.46 (11.41-11.49) | 74.80 (74.23-75.14) |
+
 
 ## Known limitations
 
@@ -219,6 +213,10 @@ Test environment:
   yet
 - The hand-written GEMM/GEMV kernels are still fairly unoptimized compared
   to BLAS or a real SIMD kernel
+- Prefilling / SigLIP is significently faster when compiled with GCC, clang /
+  MSVC results in several times slower GEMM performance
+- W8A8 quantization is not supported for Gemma 1 models, due to its pre-norm
+  nature
 
 ## Roadmap
  
