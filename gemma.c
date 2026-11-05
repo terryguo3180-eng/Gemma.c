@@ -8722,9 +8722,9 @@ STBIR_EDGE_WRAP=2,STBIR_EDGE_ZERO=3,}Bt;typedef enum{STBIR_FILTER_DEFAULT=0,////
 STBIR_FILTER_BOX=1,STBIR_FILTER_TRIANGLE=2,STBIR_FILTER_CUBICBSPLINE=3,/////////
 STBIR_FILTER_CATMULLROM=4,STBIR_FILTER_MITCHELL=5,STBIR_FILTER_POINT_SAMPLE=6,//
 STBIR_FILTER_OTHER=7,}Bu;typedef enum{STBIR_TYPE_UINT8=0,STBIR_TYPE_UINT8_SRGB=1
-,STBIR_TYPE_UINT8_SRGB_ALPHA=2,STBIR_TYPE_UINT16=3,STBIR_TYPE_Z1=4,/////////////
-STBIR_TYPE_HALF_Z1=5}Bv;typedef void const*Bw(void*optional_output,void const*//
-input_ptr,int num_pixels,int x,int y,void*context);typedef void Bx(void const*//
+,STBIR_TYPE_UINT8_SRGB_ALPHA=2,STBIR_TYPE_UINT16=3,STBIR_TYPE_FLOAT=4,//////////
+STBIR_TYPE_HALF_FLOAT=5}Bv;typedef void const*Bw(void*optional_output,void const
+*input_ptr,int num_pixels,int x,int y,void*context);typedef void Bx(void const *
 output_ptr,int num_pixels,int y,void*context);typedef Z1 By(Z1 x,Z1 scale,void*
 user_data);typedef Z1 Bz(Z1 scale,void*user_data);typedef struct A B0;typedef///
 struct B{void*A;void const*B;int C,D;double E,F,G,H;Bw*I;void*J;int K,L;int M,N,
@@ -9188,13 +9188,13 @@ Bt G2=Gw->A.J;Bt G3=Gw->B.J;int G4=Cj(G3,Gx,Gw->B.E.A);const void*G5=((char*)Gw
 ->C)+(size_t)G4*(size_t)Gw->E;B6 const*G6=Gw->N.C;Z1*G7=Gy-Gw->N.A.A*G0;Z1*G8=0;
 do{Z1*G9;void const*G_;Z1*HA;int HB;int HC;if(G6->B<G6->A)break;HC=G6->B+1-G6->A
 ;G9=G7+G6->A*G0;HA=G7+(G6->B+1)*G0;HB=HC*Gz;G_=((char*)G5)+G6->C*G1;if(Gw->K)G_=
-Gw->K(((char*)HA)-(HC*G1)+((Gw->I!=STBIR_TYPE_Z1)?12:0),G5,HC,G6->C,G4,Gw->L);G8
-=Gw->Q((Z1*)HA-HB,HB,G_);if(Gw->R)Gw->R(G9,HB);++G6;}while(G6<=(&Gw->N.C[1]));if
-((G2==STBIR_EDGE_WRAP)&&(Gw->N.B[0]|Gw->N.B[1])){int G9,G_[2];int HA=Gw->A.E.A;
-G_[0]=-Gw->N.B[0];G_[1]=HA;for(G9=0;G9<2;G9++){int HB=Gw->N.B[G9];if(HB){int HC=
-G_[G9];Z1*HD=G7+HC*G0;Z1 const*HE=G7+Cj(G2,HC,HA)*G0;memcpy(HD,HE,HB*G0*4);if(G9
-==1)G8=HD+HB*G0;}}}G8[0]=0.0f;G8[1]=0.0f;}static void EL Zf Z1 const*G5=G0;Z1 G6
-;G6=G4[0]*G5[0];G3[0]=G6;G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EM Zf Z1//
+Gw->K(((char*)HA)-(HC*G1)+((Gw->I!=STBIR_TYPE_FLOAT)?12:0),G5,HC,G6->C,G4,Gw->L)
+;G8=Gw->Q((Z1*)HA-HB,HB,G_);if(Gw->R)Gw->R(G9,HB);++G6;}while(G6<=(&Gw->N.C[1]))
+;if((G2==STBIR_EDGE_WRAP)&&(Gw->N.B[0]|Gw->N.B[1])){int G9,G_[2];int HA=Gw->A.E.
+A;G_[0]=-Gw->N.B[0];G_[1]=HA;for(G9=0;G9<2;G9++){int HB=Gw->N.B[G9];if(HB){int//
+HC=G_[G9];Z1*HD=G7+HC*G0;Z1 const*HE=G7+Cj(G2,HC,HA)*G0;memcpy(HD,HE,HB*G0*4);if
+(G9==1)G8=HD+HB*G0;}}}G8[0]=0.0f;G8[1]=0.0f;}static void EL Zf Z1 const*G5=G0;Z1
+G6;G6=G4[0]*G5[0];G3[0]=G6;G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EM Zf Z1
 const*G5=G0;Z1 G6;G6=G4[0]*G5[0];G6+=G4[1]*G5[1];G3[0]=G6;G0+=G1;++Gz;G3+=1;}///
 while(G3<G2);}static void EN Zf Z1 const*G5=G0;Z1 G6;G6=G4[0]*G5[0];G6+=G4[1]*G5
 [1];G6+=G4[2]*G5[2];G3[0]=G6;G0+=G1;++Gz;G3+=1;}while(G3<G2);}static void EO Zf
@@ -9839,9 +9839,9 @@ STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern unsigned char*///////////////////
 stbir_resize_uint8_srgb(const unsigned char*Gw,int Gx,int Gy,int Gz,unsigned////
 char*G0,int G1,int G2,int G3,Bs G4){return(unsigned char*)Gv(Gw,Gx,Gy,Gz,G0,G1,
 G2,G3,G4,STBIR_TYPE_UINT8_SRGB,STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern Z1
-*stbir_resize_Z1_linear(const Z1*Gw,int Gx,int Gy,int Gz,Z1*G0,int G1,int G2,int
-G3,Bs G4){return(Z1*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,STBIR_TYPE_Z1,///////////////
-STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern void*stbir_resize(const void*Gw,
+*stbir_resize_FLOAT_linear(const Z1*Gw,int Gx,int Gy,int Gz,Z1*G0,int G1,int G2,
+int G3,Bs G4){return(Z1*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,STBIR_TYPE_FLOAT,////////
+STBIR_EDGE_CLAMP,STBIR_FILTER_DEFAULT);}extern void*stbir_resize(const void*Gw ,
 int Gx,int Gy,int Gz,void*G0,int G1,int G2,int G3,Bs G4,Bv G5,Bt G6,Bu G7){/////
 return(void*)Gv(Gw,Gx,Gy,Gz,G0,G1,G2,G3,G4,G5,G6,G7);}//////////////////////////
 
