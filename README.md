@@ -117,7 +117,7 @@ One-shot generation:
 Interactive chat:
  
 ```bash
-./gemma exported/gemma-3-4b-it_q.bin --chat --seqlen 4096
+./gemma exported/gemma-3-4b-it_q.bin --chat --seqlen 1024
 ```
  
 Multimodal models take images inline in the prompt with `@image{...}`:
@@ -153,7 +153,8 @@ CLI options:
  
 | Option              | Description                                       | Default               |
 | ------------------- | ------------------------------------------------- | --------------------- |
-| `--seqlen <N>`      | Set sequence length                               | 16384                 |
+| `--seqlen <N>`      | Set sequence length                               | 4096                  |
+| `--tokens <N>`      | Set max number of new tokens to generate          | -1                    |
 | `--topk <N>`        | Set top-k sampling value                          | 0                     |
 | `--seed <N>`        | Set random seed                                   | current time          |
 | `--chunk <N>`       | Set prefilling chunk size, must be >= 1           | 1024                  |
@@ -161,6 +162,7 @@ CLI options:
 | `--topp <F>`        | Set top-p sampling value, must be 0.0 < p <= 1.0  | 1.0                   |
 | `--rpen <F>`        | Set repetition penalty, must be >= 1.0            | 1.0                   |
 | `--prompt <S>`      | Set input prompt, ignored if chat mode is enabled | "Once upon a time"    |
+| `--threads <N>`     | Set OpenMP thread count, must be >= 1             | 8                     |      
 | `--chat`            | Enable chat mode                                  | —                     |
 | `--text-only`       | Disable multimodal capability                     | —                     |
 | `--no-mmap`         | Disable mmap (memory mapped file)                 | —                     |
@@ -175,10 +177,10 @@ CLI options:
  
 ### Examples
  
-| Command                                                                                   |
-| ----------------------------------------------------------------------------------------- |
-| `./gemma model.bin -l 2048 -t 0.8 --chat`                                                 |
-| `./gemma model.bin -i "Hello I'm a language model," --seqlen 4096 --topk 50 --seed 12345` |
+| Command                                                                                         |
+| ----------------------------------------------------------------------------------------------- |
+| `./gemma model.bin --seqlen 2048 --temperature 0.8 --chat`                                      |
+| `./gemma model.bin --prompt "Hello I'm a language model," --token 100 --topk 50 --seed 12345`   |
 
 ## Performance
 
@@ -197,7 +199,6 @@ Test environment:
 | gemma-1-7b-it-fp16 | 17.910 | 448.00 | 1.62 (1.61-1.62) | 11.99 (11.95-12.03) |
 | gemma-2-2b-fp16 | 5.400 | 104.00 | 5.03 (5.01-5.05) | 41.97 (41.82-42.15) |
 | gemma-2-2b-fp16_q | 2.970 | 104.00 | 15.91 (15.63-16.16) | 109.79 (108.77-110.60) |
-| gemma-3-12b-it-fp16 | N/A | N/A | N/A | 8.30 (8.21-8.38) |
 | gemma-3-12b-it-fp16_q | 14.350 | 384.00 | 4.78 (4.77-4.79) | 25.95 (25.69-26.14) |
 | gemma-3-1b-it-fp16 | 2.030 | 26.00 | 11.49 (11.43-11.54) | 100.71 (99.58-101.65) |
 | gemma-3-1b-it-fp16_q | 1.100 | 26.00 | 29.16 (28.83-29.42) | 228.29 (226.83-230.81) |
