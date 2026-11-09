@@ -2,16 +2,14 @@
 
 Gemma 1, 2 and 3 implemented in a single file of pure C.
 
-This is a from-scratch inference engine for Google's Gemma family of
-language models: Gemma 1, 2 and 3, text-only and multimodal (SigLIP vision
-tower included), in one .c file, no third-party dependencies, builds with
-a single gcc/clang/msvc invocation. It is not a wrapper around llama.cpp or
-ggml, the transformer, the attention masks, the RoPE tables, the int8
-kernels, the BPE tokenizer, and the image decoder / resizer are all
-self-included here. I did this mostly to actually understand how Gemma
-works end to end, and the by-product is a codebase that's small enough to
-read in an afternoon. It's inspired by karpathy/llama2.c, which is the
-same idea applied to Llama.
+This is a from-scratch inference engine for Google's Gemma family of language
+models: Gemma 1, 2 and 3, text-only and multimodal (SigLIP vision tower
+included), in one .c file with no dependencies beyond libc and (optionally)
+OpenMP. It is not a wrapper around llama.cpp or ggml: the transformer, the
+attention masks, the RoPE tables, the int8 kernels and the BPE tokenizer are
+all written from scratch in this file. The image decoding uses a minified
+build of stb_image and stb_image_resize2 (PNG and JPEG only), embedded in
+`gemma.c`. See [Image decoding](#image-decoding).
 
 ## Features
  
@@ -35,12 +33,13 @@ same idea applied to Llama.
   the exported `.bin` file
 - Runs on Linux, macOS, and Windows (MinGW/MSYS2), with either gcc, clang or
   msvc
+- PNG/JPEG image input via embedded stb (see Image decoding)
 
 ## Project layout
 
 ```
 .
-├── gemma.c        # The inference engine itself
+├── gemma.c        # The inference engine (minified stb image decoder embedded at the end of the file)
 ├── Makefile       # Cross-platform build script
 ├── export.py      # HuggingFace -> .bin weight exporter
 ├── model.py       # Reference PyTorch implementation
@@ -57,20 +56,23 @@ HuggingFace checkpoint, and serve as a side-by-side reference.
  
 ### 1. Export a model
  
+Gemma weights are gated: accept the license on the model's Hugging Face page
+and log in first (`huggingface-cli login`, or `hf auth login` on newer versions).
+
 ```bash
 pip install torch transformers accelerate safetensors huggingface_hub
  
-python export.py google/gemma-3-4b-it \
-    -o exported/gemma-3-4b-it.bin \
+python export.py google/gemma-3-1b-it \
+    -o exported/gemma-3-1b-it.bin \
     -d float16
 ```
  
-Export an INT8-quantized version (roughly a quarter of the FP16 size, and
-noticeably faster on CPU. See the benchmarks below):
+Export an INT8-quantized version (about half the FP16 size, and 1.8–3.4x
+faster generation depending on the model, see the benchmarks below):
  
 ```bash
-python export.py google/gemma-3-4b-it \
-    -o exported/gemma-3-4b-it_q.bin \
+python export.py google/gemma-3-1b-it \
+    -o exported/gemma-3-1b-it_q.bin \
     -d float16 \
     -q
 ```
@@ -93,11 +95,11 @@ make
  
 `make` auto-detects whether you're on gcc/clang/msvc and picks safe flags for
 each (this actually matters here). Override the compiler or dtype from the
-command line if you need to:
+command line if you need to (MSVC only supports float32):
  
 ```bash
 make CC=clang
-make DTYPE=BF16      # must match whatever -d you exported with
+make DTYPE=BF16      # must match whatever -d you exported with, FP32 / FP16 / BF16
 make debug           # -O0 -g -fsanitize=address
 ```
  
@@ -134,8 +136,6 @@ higher-resolution crops:
 ```bash
 > What's happening at the bottom of @longimage{long_screenshot.png}?
 ```
- 
-CLI options:
 
 ## Usage
  
@@ -166,7 +166,7 @@ CLI options:
 | `--chat`            | Enable chat mode                                  | —                     |
 | `--text-only`       | Disable multimodal capability                     | —                     |
 | `--no-mmap`         | Disable mmap (memory mapped file)                 | —                     |
-| `--verbose`         | Print model info                                  | —                     |
+| `--verbose`         | Print model info and the perf report              | —                     |
 | `--help`, `-?`      | Display this help message                         | —                     |
  
 ### Controls
@@ -180,7 +180,23 @@ CLI options:
 | Command                                                                                         |
 | ----------------------------------------------------------------------------------------------- |
 | `./gemma model.bin --seqlen 2048 --temperature 0.8 --chat`                                      |
-| `./gemma model.bin --prompt "Hello I'm a language model," --token 100 --topk 50 --seed 12345`   |
+| `./gemma model.bin --prompt "Hello I'm a language model," --tokens 100 --topk 50 --seed 12345`  |
+
+
+## Image decoding
+
+Image input uses [stb_image](https://github.com/nothings/stb) v2.30 and
+stb_image_resize2 v2.18 by Sean Barrett (public domain / MIT), embedded in
+`gemma.c` as a minified build limited to PNG and JPEG (`STBI_ONLY_PNG`,
+`STBI_ONLY_JPEG`). This embedded copy was produced with ad-hoc minification
+scripts plus some manual edits, so it's probably not byte-reproducible from
+upstream.
+
+Supported: PNG, baseline/progressive JPEG.
+
+Not supported: TGA, BMP, PSD, GIF, HDR, etc.
+
+stb_image is not designed as a hardened parser, so only load images you trust.
 
 ## Performance
 
@@ -191,21 +207,25 @@ Test environment:
 - OS: `Windows 11`
 - Compiler: `gcc 15.2.0 x86_64-w64-mingw32`
 - Compiler arguments: `-Ofast -fopenmp -march=native -mtune=native`
-- Run arguments (generation): `--temperature 0 --tokens 100 --threads 14 --verbose --no-mmap`
-- Run arguments (prefill): `--temperature 0 --seqlen 2048 --tokens 1 --threads 14 --verbose --no-mmap`
+- Run arguments (generation): `--temperature 0 --tokens 100 --threads 10 --verbose --no-mmap`
+- Run arguments (prefill): `--temperature 0 --seqlen 2048 --tokens 1 --threads 10 --verbose --no-mmap`
 
 | Model | Base memory (GB) | KV cache / tok (KB) | Generation (tok/s) | Prefill (tok/s) |
 |---|---|---|---|---|
-| gemma-1-7b-it-fp16 | 17.910 | 448.00 | 1.62 (1.61-1.62) | 11.99 (11.95-12.03) |
-| gemma-2-2b-fp16 | 5.400 | 104.00 | 5.03 (5.01-5.05) | 41.97 (41.82-42.15) |
-| gemma-2-2b-fp16_q | 2.970 | 104.00 | 15.91 (15.63-16.16) | 109.79 (108.77-110.60) |
-| gemma-3-12b-it-fp16_q | 14.350 | 384.00 | 4.78 (4.77-4.79) | 25.95 (25.69-26.14) |
-| gemma-3-1b-it-fp16 | 2.030 | 26.00 | 11.49 (11.43-11.54) | 100.71 (99.58-101.65) |
-| gemma-3-1b-it-fp16_q | 1.100 | 26.00 | 29.16 (28.83-29.42) | 228.29 (226.83-230.81) |
-| gemma-3-270m-it-fp16 | 0.620 | 18.00 | 31.83 (31.81-31.87) | 385.16 (383.20-387.49) |
-| gemma-3-270m-it-fp16_q | 0.370 | 18.00 | 57.08 (52.46-59.55) | 627.03 (588.48-670.25) |
-| gemma-3-4b-it-fp16 | 9.630 | 136.00 | 3.42 (3.41-3.43) | 27.83 (27.59-28.03) |
-| gemma-3-4b-it-fp16_q | 5.650 | 136.00 | 11.46 (11.41-11.49) | 74.80 (74.23-75.14) |
+| gemma-2-2b-fp32 | 10.790 | 208.00 | 7.53 (7.38-7.63) | 46.62 (45.69-47.19) |
+| gemma-2-2b-fp32_q | 3.490 | 208.00 | 24.72 (21.84-26.47) | 143.51 (142.97-144.02) |
+| gemma-3-12b-it-fp32_q | 17.340 | 768.00 | 6.52 (6.31-6.68) | 28.53 (28.50-28.58) |
+| gemma-3-1b-it-fp32 | 4.060 | 52.00 | 17.75 (15.90-18.86) | 132.74 (131.13-135.87) |
+| gemma-3-1b-it-fp32_q | 1.270 | 52.00 | 69.01 (68.46-69.97) | 399.20 (394.35-404.40) |
+| gemma-3-270m-it-fp32 | 1.240 | 36.00 | 64.01 (62.77-64.65) | 665.30 (662.13-670.06) |
+| gemma-3-270m-it-fp32_q | 0.490 | 36.00 | 208.96 (205.95-211.57) | 1421.74 (1410.15-1438.73) |
+| gemma-3-4b-it-fp32 | 19.240 | 272.00 | 4.61 (3.76-5.09) | 26.62 (22.09-29.28) |
+| gemma-3-4b-it-fp32_q | 7.270 | 272.00 | 17.60 (16.24-19.28) | 93.46 (90.41-95.20) |
+
+Notes: each figure is the median of 3 runs (range in parentheses). Prefill
+uses a 1000-token prompt. KV cache is fp16 and sized for all layers at full
+length (no sliding-window truncation yet). `--no-mmap` is used so that load
+time and page cache don't affect the numbers.
 
 
 ## Known limitations
@@ -214,7 +234,7 @@ Test environment:
   yet
 - The hand-written GEMM/GEMV kernels are still fairly unoptimized compared
   to BLAS or a real SIMD kernel
-- Prefilling / SigLIP is significently faster when compiled with GCC, clang /
+- Prefilling / SigLIP is significantly faster when compiled with GCC, clang /
   MSVC results in several times slower GEMM performance
 - W8A8 quantization is not supported for Gemma 1 models, due to its pre-norm
   nature
@@ -235,7 +255,10 @@ Test environment:
  
 - [Google Gemma](https://ai.google.dev/gemma) official models and technical reports
 - [llama2.c](https://github.com/karpathy/llama2.c) for inspiring this project
+- [stb](https://github.com/nothings/stb) by Sean Barrett, for the image decoder and resizer
 
 ## License
 
-MIT
+MIT, for the code in this repository. The embedded stb code is public domain / MIT
+under its own terms. Model weights are not covered by this license; they are
+subject to Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms).

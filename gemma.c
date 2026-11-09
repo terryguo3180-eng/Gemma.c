@@ -2,14 +2,12 @@
  *
  * This is a from-scratch inference engine for Google's Gemma family of
  * language models: Gemma 1, 2 and 3, text-only and multimodal (SigLIP vision
- * tower included), in one .c file, no third-party dependencies, builds with
- * a single gcc/clang/msvc invocation. It is not a wrapper around llama.cpp or
- * ggml, the transformer, the attention masks, the RoPE tables, the int8
- * kernels, the BPE tokenizer, and the image decoder / resizer are all
- * self-included here. I did this mostly to actually understand how Gemma
- * works end to end, and the by-product is a codebase that's small enough to
- * read in an afternoon. It's inspired by karpathy/llama2.c, which is the
- * same idea applied to Llama.
+ * tower included), in one .c file with no dependencies beyond libc and
+ * (optionally) OpenMP. It is not a wrapper around llama.cpp or ggml: the
+ * transformer, the attention masks, the RoPE tables, the int8 kernels and the
+ * BPE tokenizer are all written from scratch in this file. The image decoding
+ * uses a minified build of stb_image and stb_image_resize2 (PNG and JPEG
+ * only), embedded in this file.
  *
  * Features:
  *
@@ -29,6 +27,7 @@
  *   - A from-scratch BPE tokenizer, weights embedded straight into the
  *     `.bin` file by the export script
  *   - Runs on Linux, macOS, and Windows (MinGW), gcc, clang or msvc
+ *   - PNG/JPEG image input via embedded stb (see Image decoding)
  *
  * Model files are a custom binary format produced by the accompanying
  * `export.py`, which converts a HuggingFace Gemma checkpoint (weights,
@@ -45,8 +44,10 @@
  * If you'd rather invoke the compiler directly:
  *
  *   ```bash
- *   gcc   -Ofast          -march=native -fopenmp gemma.c -lm -o gemma  # gcc
- *   clang -O3 -ffast-math -march=native -fopenmp gemma.c -lm -o gemma  # clang
+ *   gcc   -Ofast          -march=native -mtune=native -fopenmp \
+ *         gemma.c -lm -o gemma  # gcc
+ *   clang -O3 -ffast-math -march=native -mtune=native -fopenmp \
+ *         gemma.c -lm -o gemma  # clang
  *   ```
  *
  * Or if you are using msvc:
@@ -116,7 +117,7 @@
  * in something faster (BLAS, a hand-tuned SIMD kernel, whatever) without
  * touching the model code around them.
  *
- * v1.0  (11/05/2026)
+ * v1.0  (11/09/2026)
  *
  * @TerryGuo (https://github.com/terryguo3180-eng | terry.guo2021@outlook.com)
  */
@@ -130,6 +131,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
@@ -635,14 +637,14 @@ load_image_utf8(const char *utf8_path, int *w, int *h, int *ch, int req_comp)
 #define GEMM_NC 256  // cols of B packed per outer jc block, mult of 8
 #define GEMM_KC 256  // k-length streamed per inner pc chunk
 
-// OpenMP parameters
-static int g_omp_threads = 8;
+// OpenMP parameters: there is no global thread count, every function that
+// parallelizes takes `threads` as a parameter
 
 #if defined(__MSVC__)
 // MSVC uses OpenMP 2.0, which does not support `proc_bind`
-#  define OMP_PARA_ARGS   num_threads(g_omp_threads)
+#  define OMP_PARA_ARGS
 #else
-#  define OMP_PARA_ARGS   num_threads(g_omp_threads) proc_bind(close)
+#  define OMP_PARA_ARGS proc_bind(close)
 #endif
 #if defined(__MSVC__) && !defined(MSVC_OMP_COLLAPSE)
 // Most versions of MSVC does not support the `collapse` clause
@@ -672,7 +674,6 @@ static int g_omp_threads = 8;
 #  define DTYPE FP32
 #endif
 
-// clang-format off
 #if DTYPE == FP16
 #  define floatx     _Float16
 #  define DTYPE_MAGIC  "f16"
@@ -688,7 +689,65 @@ static int g_omp_threads = 8;
 #else
 #  error "unsupported DTYPE"
 #endif
-// clang-format on
+
+#if defined(__F16C__) && defined(__AVX2__) && defined(__FMA__) && \
+    (DTYPE == FP16)
+
+#  define GEMMA_F16C 1
+#  include <immintrin.h>
+
+/* dot product of two fp16 vectors with a float accumulator, using the F16C
+ * hardware conversion (vcvtph2ps) and FMA. */
+static inline float
+dot_f16c(const _Float16 *a, const _Float16 *b, int n)
+{
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+  int    j    = 0;
+  for (; j + 32 <= n; j += 32)
+  {
+    acc0 = _mm256_fmadd_ps(
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j     ))),
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j     ))), acc0
+    );
+    acc1 = _mm256_fmadd_ps(
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j +  8))),
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j +  8))), acc1
+    );
+    acc2 = _mm256_fmadd_ps(
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j + 16))),
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j + 16))), acc2
+    );
+    acc3 = _mm256_fmadd_ps(
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j + 24))),
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j + 24))), acc3
+    );
+  }
+  for (; j + 8 <= n; j += 8)
+  {
+    acc0 = _mm256_fmadd_ps(
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j))),
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j))), acc0
+    );
+  }
+  acc0 = _mm256_add_ps(
+    _mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)
+  );
+  __m128 r = _mm_add_ps(
+    _mm256_castps256_ps128(acc0), _mm256_extractf128_ps(acc0, 1)
+  );
+  r = _mm_hadd_ps(r, r);
+  r = _mm_hadd_ps(r, r);
+
+  float sum = _mm_cvtss_f32(r);
+  for (; j < n; j++)
+  {
+    sum += (float)a[j] * (float)b[j];
+  }
+  return sum;
+}
+#endif
+
 
 // no-fast-math
 #if defined(__GCC__)
@@ -1237,7 +1296,7 @@ void
 encode(
   GemmaTokenizer *tok,
   const char     *text,
-  int             len,
+  size_t          len,
   int            *tokens,
   int             spos,
   int            *n_tokens)
@@ -1245,7 +1304,7 @@ encode(
   unsigned char *ustr = (unsigned char *)text;
 
   // Convert UTF-8 string to tokens of individual codepoints
-  int i     = 0;
+  size_t i  = 0;
   int tok_i = 0;
   tokens += spos;
 
@@ -1302,7 +1361,7 @@ encode(
     {
       // Fallback to byte level tokens
       char bstr[10];
-      for (int b = start; b < i; b++)
+      for (size_t b = start; b < i; b++)
       {
         snprintf(bstr, 10, "<0x%02X>", (unsigned char)ustr[b]);
         tokens[tok_i++] = get_token_idx(tok, bstr);
@@ -2328,8 +2387,8 @@ check_head(FILE *fp, const char *filename)
   // dtype
   if (memcmp(hdr + 4, DTYPE_MAGIC, 3) != 0)
   {
-    fprintf(
-      stderr, "unsupported dtype '%c%c%c' in model file", hdr[4], hdr[5], hdr[6]
+    log_error(
+      "unsupported dtype '%c%c%c' in model file", hdr[4], hdr[5], hdr[6]
     );
     return -1;
   }
@@ -2642,19 +2701,25 @@ malloc_vision_buffer(VisionConfig *vcfg, bool quant)
   {
     // Quantization buffers
     if (
-      !(vbuf->x_i8 = malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->x_i8))) ||
+      !(vbuf->x_i8 = malloc_ckd(
+        n_patches * embed_dim, sizeof(*vbuf->x_i8)
+      )) ||
       !(vbuf->mlp_i8 = malloc_ckd(
-        n_patches * mlp_dim, sizeof(*vbuf->mlp_i8))
-      ) ||
+        n_patches * mlp_dim, sizeof(*vbuf->mlp_i8)
+      )) ||
       !(vbuf->x_scales = malloc_ckd(n_patches, sizeof(*vbuf->x_scales))) ||
-      !(vbuf->mlp_scales = malloc_ckd(n_patches, sizeof(*vbuf->mlp_scales)))
+      !(vbuf->mlp_scales = malloc_ckd(
+        n_patches, sizeof(*vbuf->mlp_scales)
+      ))
     )
       goto fail;
   }
 
   if (
     !(vbuf->x = malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->x))) ||
-    !(vbuf->resid = malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->resid))) ||
+    !(vbuf->resid = malloc_ckd(
+      n_patches * embed_dim, sizeof(*vbuf->resid)
+    )) ||
     !(vbuf->xq = malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->xq))) ||
     !(vbuf->xk = malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->xk))) ||
     !(vbuf->xv = malloc_ckd(n_patches * embed_dim, sizeof(*vbuf->xv))) ||
@@ -2868,6 +2933,130 @@ fail:
   return NULL;
 }
 
+// Performance counters
+
+/* */
+typedef enum
+{
+  PERF_PHASE_PREFILL,  // Text prompt ingestion
+  PERF_PHASE_DECODE,   // Auto-regressive token generation
+  PERF_PHASE_VISION,   // Image ingestion (vision tower + image tokens)
+  PERF_PHASE_COUNT,
+} PerfPhase;
+
+/* The instrumented functions, in report order */
+typedef enum
+{
+  PERF_OP_RMSNORM,
+  PERF_OP_LAYERNORM,
+  PERF_OP_QUANTIZE_ACT,
+  PERF_OP_GEMV_FPX,
+  PERF_OP_GEMV_INT8,
+  PERF_OP_GEMV_FPX_NN,
+  PERF_OP_GEMM_FPX,
+  PERF_OP_GEMM_FPX_NN,
+  PERF_OP_GEMM_INT8,
+  PERF_OP_SOFTMAX,
+  PERF_OP_GELU,
+  PERF_OP_ROPE,
+  PERF_OP_SAMPLE,
+  PERF_OP_COUNT,
+} PerfOp;
+
+/* */
+static const char *const g_perf_op_names[PERF_OP_COUNT] = {
+  "rmsnorm",
+  "layernorm",
+  "quantize_act",
+  "gemv_fpx",
+  "gemv_int8",
+  "gemv_fpx_nn",
+  "gemm_fpx",
+  "gemm_fpx_nn",
+  "gemm_int8",
+  "softmax",
+  "gelu",
+  "rope",
+  "sample_from_logits",
+};
+
+/* One forward entry point worth of wall time */
+typedef struct
+{
+  double sec;    // Total time spent in this phase
+  int    toks;   // Tokens (or images) processed
+  int    calls;  // Number of times the entry point was called
+} PerfPhaseStat;
+
+/* One instrumented function worth of wall time */
+typedef struct
+{
+  double sec;  // Total time spent in the function
+  long   cnt;  // Number of calls
+} PerfOpStat;
+
+typedef struct
+{
+  // Wall time of the three forward entry points
+  PerfPhaseStat total[PERF_PHASE_COUNT];
+
+  // Where the time spent inside the instrumented functions went
+  PerfOpStat op[PERF_PHASE_COUNT][PERF_OP_COUNT];
+
+  // Phase the per-op timers below are attributed to, see PERF_PHASE
+  PerfPhase phase;
+} PerfBench;
+
+/* Timestamp for a PerfBench measurement, 0.0 when perf is NULL */
+#define PERF_TIC(perf) ((perf) != NULL ? now_sec() : 0.0)
+
+/* Most instrumented functions are called from plain serial code, but the
+ * per-head kernels of the attention block run inside an OpenMP parallel
+ * region, so their timers need the update to be atomic. */
+#if defined(_OPENMP)
+#  define PERF_ATOMIC _Pragma("omp atomic")
+#else
+#  define PERF_ATOMIC
+#endif
+
+/* Accumulate the time elapsed since t0 into the timer for `o`, and count one
+ * call (no-op if perf is NULL).
+ * This has to be a macro, not a function: taking `&perf->op[...]` before
+ * checking perf for NULL would be UB. */
+#define PERF_TOC(perf, o, t0)                                                  \
+  do                                                                           \
+  {                                                                            \
+    if ((perf) != NULL)                                                        \
+    {                                                                          \
+      double elapsed_ = now_sec() - (t0);                                      \
+      PERF_ATOMIC (perf)->op[(perf)->phase][o].sec += elapsed_;                \
+      PERF_ATOMIC (perf)->op[(perf)->phase][o].cnt++;                          \
+    }                                                                          \
+  } while (0)
+
+/* Attribute the per-op timers below this point to `ph` */
+#define PERF_PHASE(perf, ph)                                                   \
+  do                                                                           \
+  {                                                                            \
+    if ((perf) != NULL)                                                        \
+    {                                                                          \
+      (perf)->phase = (ph);                                                    \
+    }                                                                          \
+  } while (0)
+
+/* Close a phase opened with PERF_PHASE, counting `n` processed items. The
+ * matching PERF_TIC must be the first thing the entry point does. */
+#define PERF_PHASE_DONE(perf, ph, t0, n)                                       \
+  do                                                                           \
+  {                                                                            \
+    if ((perf) != NULL)                                                        \
+    {                                                                          \
+      (perf)->total[ph].sec += now_sec() - (t0);                               \
+      (perf)->total[ph].toks += (n);                                           \
+      (perf)->total[ph].calls++;                                               \
+    }                                                                          \
+  } while (0)
+
 // Math primitives
 
 NO_FAST_MATH_BEGIN;
@@ -2884,8 +3073,15 @@ NO_FAST_MATH_END;
 /* Gemma-style RMSNorm: (x * rsqrt(mean(x^2) + eps)) * (weight + 1) */
 static void
 rmsnorm(
-  floatx *dst, const floatx *src, const floatx *weight, int dim, float eps)
+  floatx       *dst,
+  const floatx *src,
+  const floatx *weight,
+  int           dim,
+  float         eps,
+  PerfBench    *perf)
 {
+  double t0 = PERF_TIC(perf);
+
   float sqsum = 0.0f;
   for (int i = 0; i < dim; i++)
   {
@@ -2895,8 +3091,9 @@ rmsnorm(
 
   for (int i = 0; i < dim; i++)
   {
-    dst[i] = (floatx)((float)src[i] * rms * (float)(weight[i] + 1));
+    dst[i] = (floatx)((float)src[i] * rms * ((float)weight[i] + 1.0f));
   }
+  PERF_TOC(perf, PERF_OP_RMSNORM, t0);
 }
 
 /* Classic LayerNorm used inside the SigLIP vision tower */
@@ -2907,8 +3104,11 @@ layernorm(
   const floatx *weight,
   const floatx *bias,
   int           dim,
-  float         eps)
+  float         eps,
+  PerfBench    *perf)
 {
+  double t0 = PERF_TIC(perf);
+
   float mean = 0.0f;
   for (int i = 0; i < dim; i++)
   {
@@ -2929,9 +3129,12 @@ layernorm(
 
   for (int i = 0; i < dim; i++)
   {
-    dst[i] = (floatx)(((float)src[i] - mean) * inv_std * (float)weight[i] +
-                      (float)bias[i]);
+    dst[i] = (floatx)(
+      ((float)src[i] - mean) * inv_std * (float)weight[i] +
+      (float)bias[i]
+    );
   }
+  PERF_TOC(perf, PERF_OP_LAYERNORM, t0);
 }
 
 /**
@@ -2939,36 +3142,26 @@ layernorm(
  * Q(fpx src (dim,)) ~= int8 dst (dim,) * fpx vec_scale (1,)
  */
 static floatx
-quantize_act(int8_t *dst, const floatx *vec, int dim)
+quantize_act(int8_t *dst, const floatx *vec, int dim, PerfBench *perf)
 {
-  floatx amax = 0.0f;
+  double t0 = PERF_TIC(perf);
+
+  float amax = 0.0f;
+  for (int d = 0; d < dim; d++)
+  {
+    amax = fmaxf(amax, fabsf((float)vec[d]));
+  }
+  float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+  float inv   = 1.0f / scale;
 
   for (int d = 0; d < dim; d++)
   {
-    floatx av = vec[d] >= 0 ? vec[d] : -vec[d];
-    if (av > amax)
-    {
-      amax = av;
-    }
+    float v = (float)vec[d] * inv;
+    int   q = (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
+    dst[d]  = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
   }
-
-  float vec_scale = (float)amax > 0.0f ? (float)amax / 127.0f : 1.0f;
-
-  for (int d = 0; d < dim; d++)
-  {
-    int q = (int)roundf((float)vec[d] / vec_scale);
-    if (q > 127)
-    {
-      q = 127;
-    }
-    else if (q < -127)
-    {
-      q = -127;
-    }
-    dst[d] = (int8_t)q;
-  }
-
-  return (floatx)vec_scale;
+  PERF_TOC(perf, PERF_OP_QUANTIZE_ACT, t0);
+  return (floatx)scale;
 }
 
 /**
@@ -2983,7 +3176,9 @@ quantize_acts(
   int                    src_stride,
   int                    m,
   int                    n,
-  bool                   omp)
+  bool                   omp,
+  int                    threads,
+  PerfBench             *perf)
 {
   if (src_stride == 0)
   {
@@ -2993,16 +3188,18 @@ quantize_acts(
   if (omp)
   {
     int i;
-    #pragma omp parallel for OMP_PARA_ARGS
+    #pragma omp parallel for num_threads(threads) OMP_PARA_ARGS
     for (i = 0; i < m; i++)
     {
-      dst_scales[i] = quantize_act(dst + i * n, src + i * src_stride, n);
+      dst_scales[i] = quantize_act(dst + i * n, src + i * src_stride, n, perf);
     }
-    return;
   }
-  for (int i = 0; i < m; i++)
+  else
   {
-    dst_scales[i] = quantize_act(dst + i * n, src + i * src_stride, n);
+    for (int i = 0; i < m; i++)
+    {
+      dst_scales[i] = quantize_act(dst + i * n, src + i * src_stride, n, perf);
+    }
   }
 }
 
@@ -3011,12 +3208,18 @@ static inline floatx
 gemv_fpx_row(
   const floatx *RESTRICT vec, const floatx *RESTRICT mat, int n, int i)
 {
+#ifdef GEMMA_F16C
+  return (floatx)dot_f16c(
+    (const _Float16 *)(mat + (size_t)i * n), (const _Float16 *)vec, n
+  );
+#else
   float sum = 0;
   for (int j = 0; j < n; j++)
   {
     sum += (float)mat[i * n + j] * (float)vec[j];
   }
   return (floatx)sum;
+#endif
 }
 
 /**
@@ -3030,23 +3233,31 @@ gemv_fpx(
   const floatx *RESTRICT vec,
   int                    m,
   int                    n,
-  bool                   omp)
+  bool                   omp,
+  int                    threads,
+  PerfBench             *perf)
 {
+  double t0 = PERF_TIC(perf);
+
   if (omp)
   {
-    int i;  // Loop vars are not automatically privatized in MSVC, have to keep
-            // it explicit
-    #pragma omp parallel for private(i) OMP_PARA_ARGS
+    int i;  // Loop vars are not automatically privatized in MSVC, have to
+            // keep it explicit
+    #pragma omp parallel for private(i) schedule(dynamic, 64) \
+            num_threads(threads) OMP_PARA_ARGS
     for (i = 0; i < m; i++)
     {
       dst[i] = gemv_fpx_row(vec, mat, n, i);
     }
-    return;
   }
-  for (int i = 0; i < m; i++)
+  else
   {
-    dst[i] = gemv_fpx_row(vec, mat, n, i);
+    for (int i = 0; i < m; i++)
+    {
+      dst[i] = gemv_fpx_row(vec, mat, n, i);
+    }
   }
+  PERF_TOC(perf, PERF_OP_GEMV_FPX, t0);
 }
 
 /* */
@@ -3082,23 +3293,30 @@ gemv_int8(
   floatx                 vec_scale,
   int                    m,
   int                    n,
-  bool                   omp)
+  bool                   omp,
+  int                    threads,
+  PerfBench             *perf)
 {
+  double t0 = PERF_TIC(perf);
+
   if (omp)
   {
     int i;
-    #pragma omp parallel for private(i) OMP_PARA_ARGS
+    #pragma omp parallel for private(i) schedule(dynamic, 64) \
+            num_threads(threads) OMP_PARA_ARGS
     for (i = 0; i < m; i++)
     {
       dst[i] = gemv_int8_row(vec, vec_scale, mat, mat_scales, n, i);
     }
-    return;
   }
-
-  for (int i = 0; i < m; i++)
+  else
   {
-    dst[i] = gemv_int8_row(vec, vec_scale, mat, mat_scales, n, i);
+    for (int i = 0; i < m; i++)
+    {
+      dst[i] = gemv_int8_row(vec, vec_scale, mat, mat_scales, n, i);
+    }
   }
+  PERF_TOC(perf, PERF_OP_GEMV_INT8, t0);
 }
 
 /* fpx matrix-vector multiply (NN)
@@ -3110,8 +3328,11 @@ gemv_fpx_nn(
   const floatx *RESTRICT mat,
   int                    mat_stride,
   int                    n,
-  int                    m)
+  int                    m,
+  PerfBench             *perf)
 {
+  double t0 = PERF_TIC(perf);
+
   if (mat_stride == 0) mat_stride = m;
 
 #if defined(__MSVC__)
@@ -3127,7 +3348,7 @@ gemv_fpx_nn(
 
   for (int i = 0; i < n; i++)
   {
-    float         v       = (float)vec[i];
+    float v = (float)vec[i];
     const floatx *mat_row = mat + i * mat_stride;
 
     int j;
@@ -3142,6 +3363,7 @@ gemv_fpx_nn(
   {
     dst[j] = (floatx)acc[j];
   }
+  PERF_TOC(perf, PERF_OP_GEMV_FPX_NN, t0);
 }
 
 /**
@@ -3178,12 +3400,13 @@ pack_all_fpx(
   int                    total_rows,
   int                    R,
   int                    k,
-  bool                   omp)
+  bool                   omp,
+  int                    threads)
 {
   if (omp)
   {
     int b;
-    #pragma omp parallel for private(b) OMP_PARA_ARGS
+    #pragma omp parallel for private(b) num_threads(threads) OMP_PARA_ARGS
     for (b = 0; b < total_rows; b += R)
     {
       pack_panel_fpx(
@@ -3238,12 +3461,14 @@ gemm_fpx_scalar(
   int                    m,
   int                    n,
   int                    k,
-  bool                   omp)
+  bool                   omp,
+  int                    threads)
 {
   if (omp)
   {
     int i, j;
-    #pragma omp parallel for private(i, j) OMP_COLLAPSE2 OMP_PARA_ARGS
+    #pragma omp parallel for private(i, j) num_threads(threads) \
+            OMP_COLLAPSE2 OMP_PARA_ARGS
     for (i = 0; i < m; i++)
     {
       for (j = 0; j < n; j++)
@@ -3333,7 +3558,6 @@ gemm_fpx_kernel_accum(
      *      +-----------------------------------------+
      */
 
-    // clang-format off
     float a0 = (float)Ap[l*8+0], a1 = (float)Ap[l*8+1],
           a2 = (float)Ap[l*8+2], a3 = (float)Ap[l*8+3];
     float a4 = (float)Ap[l*8+4], a5 = (float)Ap[l*8+5],
@@ -3359,7 +3583,6 @@ gemm_fpx_kernel_accum(
     acc[52] += a6*b4; acc[53] += a6*b5; acc[54] += a6*b6; acc[55] += a6*b7;
     acc[56] += a7*b0; acc[57] += a7*b1; acc[58] += a7*b2; acc[59] += a7*b3;
     acc[60] += a7*b4; acc[61] += a7*b5; acc[62] += a7*b6; acc[63] += a7*b7;
-    // clang-format on
   }
 
   for (int i = 0; i < 8; i++)
@@ -3415,8 +3638,10 @@ static void
 gemm_fpx_compute_tile(
   floatx *RESTRICT       dst,       // dst + ic*dst_stride + jc
   int                    dst_stride,
-  const floatx *RESTRICT Ap_block,  // packed A slice, mc x k (already offset by ic*k)
-  const floatx *RESTRICT Bp_block,  // packed B slice, nc x k (already offset by jc*k)
+  const floatx *RESTRICT Ap_block,  // packed A slice, mc x k
+                                    //   (already offset by ic*k)
+  const floatx *RESTRICT Bp_block,  // packed B slice, nc x k
+                                    //   (already offset by jc*k)
   int                    mc,
   int                    nc,
   int                    k)
@@ -3473,8 +3698,13 @@ gemm_fpx(
   int                    m,
   int                    n,
   int                    k,
-  bool                   omp)
+  bool                   omp,
+  int                    threads,
+  PerfBench             *perf)
 {
+  double t0  = PERF_TIC(perf);
+  int    ret = 0;
+
   if (dst_stride == 0) dst_stride = n;
   if (mat_stride == 0) mat_stride = k;
   if (src_stride == 0) src_stride = k;
@@ -3489,7 +3719,8 @@ gemm_fpx(
     if (scratch == NULL)
     {
       log_error("gemm packing scratch allocation failed");
-      return 1;
+      ret = 1;
+      goto done;
     }
     floatx *Ap_full = scratch;
     floatx *Bp_full = scratch + (size_t)m_full * k;
@@ -3539,8 +3770,8 @@ gemm_fpx(
      * Ro: [ao bo co do eo fo go ho]
      */
 
-    pack_all_fpx(Ap_full, src, src_stride, m_full, 8, k, omp);
-    pack_all_fpx(Bp_full, mat, mat_stride, n_full, 8, k, omp);
+    pack_all_fpx(Ap_full, src, src_stride, m_full, 8, k, omp, threads);
+    pack_all_fpx(Bp_full, mat, mat_stride, n_full, 8, k, omp, threads);
 
     int n_ic_blocks = (m_full + GEMM_MC - 1) / GEMM_MC;
     int n_jc_blocks = (n_full + GEMM_NC - 1) / GEMM_NC;
@@ -3548,8 +3779,8 @@ gemm_fpx(
     if (omp)
     {
       int bi, bj;
-      #pragma omp parallel for private(bi, bj) collapse(2) schedule(dynamic, 1)\
-              OMP_PARA_ARGS
+      #pragma omp parallel for private(bi, bj) num_threads(threads) \
+              schedule(dynamic, 1) OMP_COLLAPSE2 OMP_PARA_ARGS
       for (bi = 0; bi < n_ic_blocks; bi++)
       {
         for (bj = 0; bj < n_jc_blocks; bj++)
@@ -3592,18 +3823,20 @@ gemm_fpx(
   {
     gemm_fpx_scalar(
       dst + m_full * dst_stride, dst_stride, mat, mat_stride,
-      src + m_full * src_stride, src_stride, m - m_full, n, k, omp
+      src + m_full * src_stride, src_stride, m - m_full, n, k, omp, threads
     );
   }
   if (n_full < n && m_full > 0)
   {
     gemm_fpx_scalar(
       dst + n_full, dst_stride, mat + n_full * mat_stride, mat_stride, src,
-      src_stride, m_full, n - n_full, k, omp
+      src_stride, m_full, n - n_full, k, omp, threads
     );
   }
 
-  return 0;
+done:
+  PERF_TOC(perf, PERF_OP_GEMM_FPX, t0);
+  return ret;
 }
 
 /**
@@ -3686,8 +3919,12 @@ gemm_fpx_nn(
   int                    m,
   int                    n,
   int                    k,
-  bool                   omp)
+  bool                   omp,
+  int                    threads,
+  PerfBench             *perf)
 {
+  double t0 = PERF_TIC(perf);
+
   if (dst_stride == 0) dst_stride = n;
   if (mat_stride == 0) mat_stride = n;
   if (src_stride == 0) src_stride = k;
@@ -3697,7 +3934,7 @@ gemm_fpx_nn(
   if (omp)
   {
     int ib;
-    #pragma omp parallel for private(ib) OMP_PARA_ARGS
+    #pragma omp parallel for private(ib) num_threads(threads) OMP_PARA_ARGS
     for (ib = 0; ib < m_full; ib += 8)
     {
       gemm_fpx_nn_kernel(
@@ -3725,6 +3962,7 @@ gemm_fpx_nn(
       src + m_full * src_stride, src_stride, m - m_full, n, k
     );
   }
+  PERF_TOC(perf, PERF_OP_GEMM_FPX_NN, t0);
 }
 
 static _Thread_local int8_t *gemm_i8_pack_scratch     = NULL;
@@ -3772,12 +4010,13 @@ pack_all_i8(
   int                    total_rows,
   int                    R,
   int                    k,
-  bool                   omp)
+  bool                   omp,
+  int                    threads)
 {
   if (omp)
   {
     int b;
-    #pragma omp parallel for private(b) OMP_PARA_ARGS
+    #pragma omp parallel for private(b) num_threads(threads) OMP_PARA_ARGS
     for (b = 0; b < total_rows; b += R)
     {
       pack_panel_i8(
@@ -3839,12 +4078,14 @@ gemm_int8_scalar(
   int                    m,
   int                    n,
   int                    k,
-  bool                   omp)
+  bool                   omp,
+  int                    threads)
 {
   if (omp)
   {
     int i, j;
-    #pragma omp parallel for private(i, j) OMP_COLLAPSE2 OMP_PARA_ARGS
+    #pragma omp parallel for private(i, j) num_threads(threads) \
+            OMP_COLLAPSE2 OMP_PARA_ARGS
     for (i = 0; i < m; i++)
     {
       for (j = 0; j < n; j++)
@@ -3970,7 +4211,8 @@ gemm_int8_compute_tile(
   const int8_t *RESTRICT Ap_block,   // packed A slice, mc x k (offset by ic*k)
   const int8_t *RESTRICT Bp_block,   // packed B slice, nc x k (offset by jc*k)
   const floatx *RESTRICT src_scales, // offset to this block's first row already
-  const floatx *RESTRICT mat_scales, // offset to this block's first column already
+  const floatx *RESTRICT mat_scales, // offset to this block's first column
+                                     // already
   int                    mc,
   int                    nc,
   int                    k)
@@ -4031,8 +4273,13 @@ gemm_int8(
   int                    m,
   int                    n,
   int                    k,
-  bool                   omp)
+  bool                   omp,
+  int                    threads,
+  PerfBench             *perf)
 {
+  double t0  = PERF_TIC(perf);
+  int    ret = 0;
+
   if (dst_stride == 0) dst_stride = n;
   if (mat_stride == 0) mat_stride = k;
   if (src_stride == 0) src_stride = k;
@@ -4047,13 +4294,14 @@ gemm_int8(
     if (scratch == NULL)
     {
       log_error("gemm_int8 packing scratch allocation failed");
-      return 1;
+      ret = 1;
+      goto done;
     }
     int8_t *Ap_full = scratch;
     int8_t *Bp_full = scratch + (size_t)m_full * k;
 
-    pack_all_i8(Ap_full, src, src_stride, m_full, 8, k, omp);
-    pack_all_i8(Bp_full, mat, mat_stride, n_full, 8, k, omp);
+    pack_all_i8(Ap_full, src, src_stride, m_full, 8, k, omp, threads);
+    pack_all_i8(Bp_full, mat, mat_stride, n_full, 8, k, omp, threads);
 
     int n_ic_blocks = (m_full + GEMM_MC - 1) / GEMM_MC;
     int n_jc_blocks = (n_full + GEMM_NC - 1) / GEMM_NC;
@@ -4061,8 +4309,8 @@ gemm_int8(
     if (omp)
     {
       int bi, bj;
-      #pragma omp parallel for private(bi, bj) collapse(2) schedule(dynamic, 1)\
-              OMP_PARA_ARGS
+      #pragma omp parallel for private(bi, bj) num_threads(threads) \
+              schedule(dynamic, 1) OMP_PARA_ARGS OMP_COLLAPSE2
       for (bi = 0; bi < n_ic_blocks; bi++)
       {
         for (bj = 0; bj < n_jc_blocks; bj++)
@@ -4107,8 +4355,8 @@ gemm_int8(
   {
     gemm_int8_scalar(
       dst + m_full * dst_stride, dst_stride, mat, mat_stride, mat_scales,
-      src + m_full * src_stride, src_stride, src_scales + m_full, m - m_full, n,
-      k, omp
+      src + m_full * src_stride, src_stride, src_scales + m_full, m - m_full,
+      n, k, omp, threads
     );
   }
   if (n_full < n && m_full > 0)
@@ -4116,11 +4364,13 @@ gemm_int8(
     gemm_int8_scalar(
       dst + n_full, dst_stride, mat + n_full * mat_stride, mat_stride,
       mat_scales + n_full, src, src_stride, src_scales, m_full, n - n_full, k,
-      omp
+      omp, threads
     );
   }
 
-  return 0;
+done:
+  PERF_TOC(perf, PERF_OP_GEMM_INT8, t0);
+  return ret;
 }
 
 /* */
@@ -4142,23 +4392,46 @@ gemm_free_thread_scratch(void)
   gemm_i8_acc_buf_cap       = 0;
 }
 
+static inline float
+fast_expf(float x)
+{
+  // Cephes-style expf: ~3 ulp, vectorizable, returns exactly 0 below -87.33
+  float xl = x < -87.33654f ? -87.33654f : x;
+  xl       = xl > 88.0f ? 88.0f : xl;
+  float fx = floorf(xl * 1.44269504088896341f + 0.5f);
+  float r  = xl - fx * 0.693359375f;
+  r -= fx * -2.12194440e-4f;
+  float z = r * r;
+  float y = 1.9875691500e-4f;
+  y       = y * r + 1.3981999507e-3f;
+  y       = y * r + 8.3334519073e-3f;
+  y       = y * r + 4.1665795894e-2f;
+  y       = y * r + 1.6666665459e-1f;
+  y       = y * r + 5.0000001201e-1f;
+  y       = y * z + r + 1.0f;
+  union { int i; float f; } u;
+  u.i = ((int)fx + 127) << 23;
+  y *= u.f;
+  return x < -87.33654f ? 0.0f : y;
+}
+
 /* */
 static void
-softmax(floatx *dst, const floatx *src, int dim)
+softmax(floatx *dst, const floatx *src, int dim, PerfBench *perf)
 {
-  floatx max = -FLOATX_MAX;
+  double t0 = PERF_TIC(perf);
+
+  float max = -FLT_MAX;
   for (int i = 0; i < dim; i++)
   {
-    if (src[i] > max)
-    {
-      max = src[i];
-    }
+    max = fmaxf(max, src[i]);
   }
 
   float expsum = 0.0f;
+  #pragma omp simd reduction(+:expsum)
   for (int i = 0; i < dim; i++)
   {
-    float val = expf((float)(src[i] - max));
+    float val = fast_expf((float)(src[i] - max));
     dst[i]    = (floatx)val;
     expsum += val;
   }
@@ -4169,6 +4442,7 @@ softmax(floatx *dst, const floatx *src, int dim)
   {
     dst[i] = (floatx)((float)dst[i] / expsum);
   }
+  PERF_TOC(perf, PERF_OP_SOFTMAX, t0);
 }
 
 /* */
@@ -4291,6 +4565,7 @@ prepare_longimage(
   }
 
   for (int i = 0; i < hn_crops; i++)
+  {
     for (int j = 0; j < wn_crops; j++)
     {
       int idx = i * wn_crops + j + 1;  // +1 to skip over the first entry
@@ -4319,6 +4594,7 @@ prepare_longimage(
         dst[k] = (rsz_crop[k] / 255.0f - 0.5f) / 0.5f;
       }
     }
+  }
 
   (*n_crops)++;
   stbi_image_free(raw);
@@ -4338,6 +4614,166 @@ fail:
 NO_FAST_MATH_BEGIN;
 
 /**
+ * Tanh approximation of GELU, the activation every Gemma uses
+ *   GELU(x) ~= 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
+ */
+static inline float
+gelu_tanh(float x)
+{
+  const float c = 0.79788456080287f;  // = sqrt(2 / pi)
+
+  return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x * x * x)));
+}
+
+/**
+ * GELU gate over `rows` rows of `dim` values
+ *   dst[i] = gelu(src[i] + bias[i % dim]) * mul[i]
+ * `bias` and `mul` are optional, NULL means "no bias" / "no multiply".
+ */
+static void
+gelu(
+  floatx       *dst,
+  const floatx *src,
+  int           rows,
+  int           dim,
+  const floatx *bias,
+  const floatx *mul,
+  bool          omp,
+  int           threads,
+  PerfBench    *perf)
+{
+  double t0  = PERF_TIC(perf);
+  int    len = rows * dim;
+
+  if (omp)
+  {
+    int i;
+    #pragma omp parallel for private(i) num_threads(threads) OMP_PARA_ARGS
+    for (i = 0; i < len; i++)
+    {
+      float x = (float)src[i] + (bias != NULL ? (float)bias[i % dim] : 0.0f);
+      float g = gelu_tanh(x);
+      dst[i]  = (floatx)(mul != NULL ? g * (float)mul[i] : g);
+    }
+  }
+  else
+  {
+    for (int i = 0; i < len; i++)
+    {
+      float x = (float)src[i] + (bias != NULL ? (float)bias[i % dim] : 0.0f);
+      float g = gelu_tanh(x);
+      dst[i]  = (floatx)(mul != NULL ? g * (float)mul[i] : g);
+    }
+  }
+  PERF_TOC(perf, PERF_OP_GELU, t0);
+}
+
+/**
+ * RoPE frequency table for a single position, `head_dim` floats per table
+ * with cos & sin interleaved (that's what the rotation below reads).
+ */
+static void
+rope_freqs_pos(
+  floatx *slid,
+  floatx *full,
+  int     head_dim,
+  float   local_theta,
+  float   global_theta,
+  int     pos)
+{
+  for (int d = 0; d < head_dim / 2; d++)
+  {
+    float e = (float)(-2 * d) / (float)head_dim;  // exponent
+
+    // Rotation angles for sliding window attentions
+    float freq = powf(local_theta, e);
+    slid[d * 2]     = (floatx)cosf(freq * (float)pos);
+    slid[d * 2 + 1] = (floatx)sinf(freq * (float)pos);
+
+    // Rotation angles for full attentions
+    freq        = powf(global_theta, e);
+    full[d * 2]     = (floatx)cosf(freq * (float)pos);
+    full[d * 2 + 1] = (floatx)sinf(freq * (float)pos);
+  }
+}
+
+/**
+ * RoPE frequency table for the `n` positions starting at `pos`, one
+ * `head_dim` block per position, `stride` floats apart in both tables.
+ */
+static void
+rope_freqs(
+  floatx    *slid,
+  floatx    *full,
+  int        head_dim,
+  int        stride,
+  float      local_theta,
+  float      global_theta,
+  int        pos,
+  int        n,
+  int        threads,
+  PerfBench *perf)
+{
+  double t0 = PERF_TIC(perf);
+
+  if (n > 1)
+  {
+    int t;
+    #pragma omp parallel for private(t) num_threads(threads) OMP_PARA_ARGS
+    for (t = 0; t < n; t++)
+    {
+      rope_freqs_pos(
+        slid + (size_t)t * stride, full + (size_t)t * stride, head_dim,
+        local_theta, global_theta, pos + t
+      );
+    }
+  }
+  else
+  {
+    rope_freqs_pos(slid, full, head_dim, local_theta, global_theta, pos);
+  }
+  PERF_TOC(perf, PERF_OP_ROPE, t0);
+}
+
+/**
+ * Apply RoPE in place to `n` vectors of `head_dim` values laid out back to
+ * back, rotating with the frequency block `freq_stride` floats apart (0 when
+ * all the vectors share one block, as in a decode step). `scale` is folded
+ * into the result; prefill uses it to apply the attention scale to the
+ * queries here instead of touching the whole attention matrix later.
+ */
+static void
+rope_apply(
+  floatx       *x,
+  int           n,
+  int           head_dim,
+  const floatx *freqs,
+  int           freq_stride,
+  float         scale,
+  PerfBench    *perf)
+{
+  double t0 = PERF_TIC(perf);
+
+  for (int v = 0; v < n; v++)
+  {
+    floatx       *data = x + (size_t)v * head_dim;
+    const floatx *fr   = freqs + (size_t)v * freq_stride;
+
+    for (int d = 0; d < head_dim / 2; d++)
+    {
+      float cfr = (float)fr[2 * d];
+      float sfr = (float)fr[2 * d + 1];
+      float a   = (float)data[d];                 // first half vector
+      float b   = (float)data[d + head_dim / 2];  // ... second half vector
+
+      data[d]                = (floatx)((a * cfr - b * sfr) * scale);
+      data[d + head_dim / 2] = (floatx)((a * sfr + b * cfr) * scale);
+    }
+  }
+  PERF_TOC(perf, PERF_OP_ROPE, t0);
+}
+
+/**
  * Vision forward pass (SigLIP)
  * img: (image_size, image_size, 3)
  */
@@ -4348,7 +4784,9 @@ forward_vision(
   TextBuffer    *tbuf,
   VisionBuffer  *vbuf,
   const floatx  *img,
-  bool           quant)
+  bool           quant,
+  int            threads,
+  PerfBench     *perf)
 {
   VisionConfig *vcfg = enc->config;
 
@@ -4370,8 +4808,10 @@ forward_vision(
   // Can be further optimized by reusing GEMM, but this part is executed only
   // once per call, the cost is acceptable
   int oy, ox;
-  #pragma omp parallel for private(oy, ox) OMP_COLLAPSE2 OMP_PARA_ARGS
+  #pragma omp parallel for private(oy, ox) num_threads(threads) \
+          OMP_COLLAPSE2 OMP_PARA_ARGS
   for (oy = 0; oy < ppi; oy++)
+  {
     for (ox = 0; ox < ppi; ox++)
     {
       int patch_idx = oy * ppi + ox;
@@ -4408,6 +4848,7 @@ forward_vision(
           clamp_fpx((floatx)(sum + (float)enc->patch_emb_b[oc]));
       }
     }
+  }
 
   if (is_interrupted()) return 1;
 
@@ -4423,6 +4864,7 @@ forward_vision(
   {
     // Dequantize per row
     for (int i = 0; i < n_patches; i++)
+    {
       for (int j = 0; j < embed_dim; j++)
       {
         float scale = (float)enc->pos_embedding->i8.scales[i];
@@ -4430,6 +4872,7 @@ forward_vision(
         vbuf->x[i * embed_dim + j] =
           clamp_fpx(vbuf->x[i * embed_dim + j] + (floatx)val);
       }
+    }
   }
 
   if (is_interrupted()) return 1;
@@ -4442,11 +4885,11 @@ forward_vision(
     memcpy(vbuf->resid, vbuf->x, n_patches * embed_dim * sizeof(floatx));
 
     int i;
-    #pragma omp parallel for private(i) OMP_PARA_ARGS
+    #pragma omp parallel for private(i) num_threads(threads) OMP_PARA_ARGS
     for (i = 0; i < n_patches; i++)
     {
       floatx *row = vbuf->x + i * embed_dim;
-      layernorm(row, row, layer->n1, layer->n1_b, embed_dim, vcfg->eps);
+      layernorm(row, row, layer->n1, layer->n1_b, embed_dim, vcfg->eps, perf);
     }
     if (is_interrupted()) return 1;
 
@@ -4456,15 +4899,15 @@ forward_vision(
       if (
         gemm_fpx(
           vbuf->xq, 0, layer->wq->fpx, 0, vbuf->x, 0, n_patches, embed_dim,
-          embed_dim, true
+          embed_dim, true, threads, perf
         ) == 1 ||
         gemm_fpx(
           vbuf->xk, 0, layer->wk->fpx, 0, vbuf->x, 0, n_patches, embed_dim,
-          embed_dim, true
+          embed_dim, true, threads, perf
         ) == 1 ||
         gemm_fpx(
           vbuf->xv, 0, layer->wv->fpx, 0, vbuf->x, 0, n_patches, embed_dim,
-          embed_dim, true
+          embed_dim, true, threads, perf
         ) == 1
       )
         return 1;
@@ -4472,20 +4915,24 @@ forward_vision(
     else
     {
       quantize_acts(
-        vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, n_patches, embed_dim, true
+        vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, n_patches, embed_dim, true,
+        threads, perf
       );
       if (
         gemm_int8(
           vbuf->xq, 0, layer->wq->i8.q, 0, layer->wq->i8.scales, vbuf->x_i8,
-          0, vbuf->x_scales, n_patches, embed_dim, embed_dim, true
+          0, vbuf->x_scales, n_patches, embed_dim, embed_dim, true,
+          threads, perf
         ) == 1 ||
         gemm_int8(
           vbuf->xk, 0, layer->wk->i8.q, 0, layer->wk->i8.scales, vbuf->x_i8,
-          0, vbuf->x_scales, n_patches, embed_dim, embed_dim, true
+          0, vbuf->x_scales, n_patches, embed_dim, embed_dim, true,
+          threads, perf
         ) == 1 ||
         gemm_int8(
           vbuf->xv, 0, layer->wv->i8.q, 0, layer->wv->i8.scales, vbuf->x_i8,
-          0, vbuf->x_scales, n_patches, embed_dim, embed_dim, true
+          0, vbuf->x_scales, n_patches, embed_dim, embed_dim, true,
+          threads, perf
         ) == 1
       )
         return 1;
@@ -4494,6 +4941,7 @@ forward_vision(
 
     // Add biases
     for (int i = 0; i < n_patches; i++)
+    {
       for (int j = 0; j < embed_dim; j++)
       {
         int idx = i * embed_dim + j;
@@ -4501,6 +4949,7 @@ forward_vision(
         vbuf->xk[idx] += layer->bk[j];
         vbuf->xv[idx] += layer->bv[j];
       }
+    }
     if (is_interrupted()) return 1;
 
     // Attention
@@ -4510,7 +4959,8 @@ forward_vision(
     int  h;
     bool quit = false;
 
-    #pragma omp parallel for private(h) reduction(|| : quit) OMP_PARA_ARGS
+    #pragma omp parallel for private(h) reduction(|| : quit) \
+            num_threads(threads) OMP_PARA_ARGS
     for (h = 0; h < vcfg->n_heads; h++)
     {
       floatx *scores =
@@ -4521,7 +4971,8 @@ forward_vision(
       if (gemm_fpx(
         scores, /*dst_stride=*/n_patches, vbuf->xk + h * head_dim,
         /*mat_stride=*/embed_dim, vbuf->xq + h * head_dim,
-        /*src_stride=*/embed_dim, n_patches, n_patches, head_dim, false
+        /*src_stride=*/embed_dim, n_patches, n_patches, head_dim, false,
+        threads, perf
       ) == 1)
         quit = true;
 
@@ -4533,7 +4984,7 @@ forward_vision(
         {
           row[j] *= scale;
         }
-        softmax(row, row, n_patches);
+        softmax(row, row, n_patches, perf);
       }
 
       // Weighted sum of values: out = scores @ V
@@ -4541,7 +4992,7 @@ forward_vision(
         vbuf->att_out + h * head_dim, /*dst_stride=*/embed_dim,
         vbuf->xv + h * head_dim,
         /*mat_stride=*/embed_dim, scores, /*src_stride=*/n_patches, n_patches,
-        head_dim, n_patches, false
+        head_dim, n_patches, false, threads, perf
       );
     }
     if (quit || is_interrupted()) return 1;
@@ -4551,18 +5002,19 @@ forward_vision(
     {
       if (gemm_fpx(
         vbuf->x, 0, layer->wo->fpx, 0, vbuf->att_out, 0, n_patches,
-        embed_dim, embed_dim, true
+        embed_dim, embed_dim, true, threads, perf
       ) == 1)
         return 1;
     }
     else
     {
       quantize_acts(
-        vbuf->x_i8, vbuf->x_scales, vbuf->att_out, 0, n_patches, embed_dim, true
+        vbuf->x_i8, vbuf->x_scales, vbuf->att_out, 0, n_patches, embed_dim,
+        true, threads, perf
       );
       if (gemm_int8(
         vbuf->x, 0, layer->wo->i8.q, 0, layer->wo->i8.scales, vbuf->x_i8, 0,
-        vbuf->x_scales, n_patches, embed_dim, embed_dim, true
+        vbuf->x_scales, n_patches, embed_dim, embed_dim, true, threads, perf
       ) == 1)
         return 1;
     }
@@ -4570,10 +5022,12 @@ forward_vision(
 
     // Add output bias
     for (int i = 0; i < n_patches; i++)
+    {
       for (int j = 0; j < embed_dim; j++)
       {
         vbuf->x[i * embed_dim + j] += layer->bo[j];
       }
+    }
     if (is_interrupted()) return 1;
 
     // Residual connection
@@ -4585,11 +5039,11 @@ forward_vision(
 
     memcpy(vbuf->resid, vbuf->x, n_patches * embed_dim * sizeof(floatx));
 
-    #pragma omp parallel for private(i) OMP_PARA_ARGS
+    #pragma omp parallel for private(i) num_threads(threads) OMP_PARA_ARGS
     for (i = 0; i < n_patches; i++)
     {
       floatx *row = vbuf->x + i * embed_dim;
-      layernorm(row, row, layer->n2, layer->n2_b, embed_dim, vcfg->eps);
+      layernorm(row, row, layer->n2, layer->n2_b, embed_dim, vcfg->eps, perf);
     }
     if (is_interrupted()) return 1;
 
@@ -4598,36 +5052,30 @@ forward_vision(
     {
       if (gemm_fpx(
         vbuf->mlp_hidden, 0, layer->w1->fpx, 0, vbuf->x, 0, n_patches,
-        mlp_dim, embed_dim, true
+        mlp_dim, embed_dim, true, threads, perf
       ) == 1)
         return 1;
     }
     else
     {
       quantize_acts(
-        vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, n_patches, embed_dim, true
+        vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, n_patches, embed_dim, true,
+        threads, perf
       );
       if (gemm_int8(
         vbuf->mlp_hidden, 0, layer->w1->i8.q, 0, layer->w1->i8.scales,
-        vbuf->x_i8, 0, vbuf->x_scales, n_patches, mlp_dim, embed_dim, true
+        vbuf->x_i8, 0, vbuf->x_scales, n_patches, mlp_dim, embed_dim, true,
+        threads, perf
       ) == 1)
         return 1;
     }
     if (is_interrupted()) return 1;
 
-    for (int i = 0; i < n_patches; i++)
-      for (int j = 0; j < mlp_dim; j++)
-      {
-        // Apply fc1 biases
-        float val = (float)vbuf->mlp_hidden[
-          i * mlp_dim + j
-        ] + (float)layer->b1[j];
-        // GELU tanh approximation
-        float c = 0.79788456080287f;
-        val =
-          0.5f * val * (1.0f + tanhf(c * (val + 0.044715f * val * val * val)));
-        vbuf->mlp_hidden[i * mlp_dim + j] = (floatx)val;
-      }
+    // Apply the fc1 biases, then the GELU activation
+    gelu(
+      vbuf->mlp_hidden, vbuf->mlp_hidden, n_patches, mlp_dim, layer->b1,
+      NULL, false, threads, perf
+    );
     if (is_interrupted()) return 1;
 
     // mlp_hidden @ fc2 = x
@@ -4635,19 +5083,19 @@ forward_vision(
     {
       if (gemm_fpx(
         vbuf->x, 0, layer->w2->fpx, 0, vbuf->mlp_hidden, 0, n_patches,
-        embed_dim, mlp_dim, true
+        embed_dim, mlp_dim, true, threads, perf
       ) == 1)
         return 1;
     }
     else
     {
       quantize_acts(
-        vbuf->mlp_i8, vbuf->mlp_scales, vbuf->mlp_hidden, 0, n_patches, mlp_dim,
-        true
+        vbuf->mlp_i8, vbuf->mlp_scales, vbuf->mlp_hidden, 0, n_patches,
+        mlp_dim, true, threads, perf
       );
       if (gemm_int8(
         vbuf->x, 0, layer->w2->i8.q, 0, layer->w2->i8.scales, vbuf->mlp_i8,
-        0, vbuf->mlp_scales, n_patches, embed_dim, mlp_dim, true
+        0, vbuf->mlp_scales, n_patches, embed_dim, mlp_dim, true, threads, perf
       ) == 1)
         return 1;
     }
@@ -4655,15 +5103,17 @@ forward_vision(
 
     // x += b2
     for (int i = 0; i < n_patches; i++)
+    {
       for (int j = 0; j < embed_dim; j++)
       {
         vbuf->x[i * embed_dim + j] += layer->b2[j];
       }
+    }
 
     if (is_interrupted()) return 1;
 
     // Residual connection
-    #pragma omp parallel for private(i) OMP_PARA_ARGS
+    #pragma omp parallel for private(i) num_threads(threads) OMP_PARA_ARGS
     for (i = 0; i < n_patches * embed_dim; i++)
     {
       vbuf->x[i] = clamp_fpx(vbuf->x[i] + vbuf->resid[i]);
@@ -4673,11 +5123,13 @@ forward_vision(
 
   // Post-norm + average pooling down to image_toks tokens
   int i;
-  #pragma omp parallel for private(i) OMP_PARA_ARGS
+  #pragma omp parallel for private(i) num_threads(threads) OMP_PARA_ARGS
   for (i = 0; i < n_patches; i++)
   {
     floatx *row = vbuf->x + i * embed_dim;
-    layernorm(row, row, enc->post_norm, enc->post_norm_b, embed_dim, vcfg->eps);
+    layernorm(
+      row, row, enc->post_norm, enc->post_norm_b, embed_dim, vcfg->eps, perf
+    );
   }
   if (is_interrupted()) return 1;
 
@@ -4688,6 +5140,7 @@ forward_vision(
    * other output positions. Parallelizing this loop introduces a read/write
    * race condition. */
   for (int oy = 0; oy < side_len; oy++)
+  {
     for (int ox = 0; ox < side_len; ox++)
     {
       int out_idx = (oy * side_len + ox) * embed_dim;
@@ -4707,16 +5160,17 @@ forward_vision(
         vbuf->x[out_idx + d] = (floatx)(sum / (kernal_size * kernal_size));
       }
     }
+  }
 
   if (is_interrupted()) return 1;
   // tbuf->x now becomes (image_toks, embed_dim)
 
   // Final RMSNorm
-  #pragma omp parallel for private(i) OMP_PARA_ARGS
+  #pragma omp parallel for private(i) num_threads(threads) OMP_PARA_ARGS
   for (i = 0; i < image_toks; i++)
   {
     floatx *row = vbuf->x + i * embed_dim;
-    rmsnorm(row, row, enc->norm, embed_dim, vcfg->eps);
+    rmsnorm(row, row, enc->norm, embed_dim, vcfg->eps, perf);
   }
   if (is_interrupted()) return 1;
 
@@ -4727,18 +5181,20 @@ forward_vision(
   {
     if (gemm_fpx(
       tbuf->x, 0, enc->proj->fpx, 0, vbuf->x, 0, image_toks,
-      tcfg->embed_dim, embed_dim, true
+      tcfg->embed_dim, embed_dim, true, threads, perf
     ) == 1)
       return 1;
   }
   else
   {
     quantize_acts(
-      vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, image_toks, embed_dim, true
+      vbuf->x_i8, vbuf->x_scales, vbuf->x, 0, image_toks, embed_dim, true,
+      threads, perf
     );
     if (gemm_int8(
       tbuf->x, 0, enc->proj->i8.q, 0, enc->proj->i8.scales, vbuf->x_i8, 0,
-      vbuf->x_scales, image_toks, tcfg->embed_dim, embed_dim, true
+      vbuf->x_scales, image_toks, tcfg->embed_dim, embed_dim, true,
+      threads, perf
     ) == 1)
       return 1;
   }
@@ -4750,7 +5206,13 @@ forward_vision(
 /* Language model forward (one token) */
 int
 forward_text_decode(
-  TextDecoder *dec, TextBuffer *tbuf, int pos, bool quant, bool compute_logits)
+  TextDecoder *dec,
+  TextBuffer  *tbuf,
+  int          pos,
+  bool         quant,
+  bool         compute_logits,
+  int          threads,
+  PerfBench   *perf)
 {
   TextConfig *tcfg = dec->config;
 
@@ -4768,21 +5230,10 @@ forward_text_decode(
   }
 
   // Precompute cos & sin for all frequencies (used in RoPE)
-  for (int d = 0; d < head_dim / 2; d++)
-  {
-    float freq;
-    float e = (float)(-2 * d) / (float)head_dim;  // exponent
-
-    // Rotation angles for sliding window attentions
-    freq = powf(tcfg->local_theta, e);
-    tbuf->csfreqs_slid[d * 2]     = (floatx)cosf(freq * (float)pos);
-    tbuf->csfreqs_slid[d * 2 + 1] = (floatx)sinf(freq * (float)pos);
-
-    // Rotation angles for full attentions
-    freq = powf(tcfg->global_theta, e);
-    tbuf->csfreqs_full[d * 2]     = (floatx)cosf(freq * (float)pos);
-    tbuf->csfreqs_full[d * 2 + 1] = (floatx)sinf(freq * (float)pos);
-  }
+  rope_freqs(
+    tbuf->csfreqs_slid, tbuf->csfreqs_full, head_dim, /*freq_stride=*/0,
+    tcfg->local_theta, tcfg->global_theta, pos, 1, threads, perf
+  );
   if (is_interrupted()) return 1;
 
   // Forward all the layers
@@ -4792,33 +5243,40 @@ forward_text_decode(
 
     memcpy(tbuf->resid, tbuf->x, embed_dim * sizeof(*tbuf->x));
 
-    rmsnorm(tbuf->x, tbuf->x, layer->n1, embed_dim, tcfg->eps);
+    rmsnorm(tbuf->x, tbuf->x, layer->n1, embed_dim, tcfg->eps, perf);
     if (is_interrupted()) return 1;
 
     // The attention block
     if (!quant)
     {
       gemv_fpx(
-        tbuf->xq, layer->wq->fpx, tbuf->x, q_size, embed_dim, true
+        tbuf->xq, layer->wq->fpx, tbuf->x, q_size, embed_dim, true,
+        threads, perf
       );  // (n_heads, head_dim)
       // (n_kv_heads, head_dim)
-      gemv_fpx(tbuf->xk, layer->wk->fpx, tbuf->x, kv_size, embed_dim, true);
-      gemv_fpx(tbuf->xv, layer->wv->fpx, tbuf->x, kv_size, embed_dim, true);
+      gemv_fpx(
+        tbuf->xk, layer->wk->fpx, tbuf->x, kv_size, embed_dim, true,
+        threads, perf
+      );
+      gemv_fpx(
+        tbuf->xv, layer->wv->fpx, tbuf->x, kv_size, embed_dim, true,
+        threads, perf
+      );
     }
     else
     {
-      floatx x_scale = quantize_act(tbuf->x_i8, tbuf->x, embed_dim);
+      floatx x_scale = quantize_act(tbuf->x_i8, tbuf->x, embed_dim, perf);
       gemv_int8(
         tbuf->xq, layer->wq->i8.q, layer->wq->i8.scales, tbuf->x_i8, x_scale,
-        q_size, embed_dim, true
+        q_size, embed_dim, true, threads, perf
       );
       gemv_int8(
         tbuf->xk, layer->wk->i8.q, layer->wk->i8.scales, tbuf->x_i8, x_scale,
-        kv_size, embed_dim, true
+        kv_size, embed_dim, true, threads, perf
       );
       gemv_int8(
         tbuf->xv, layer->wv->i8.q, layer->wv->i8.scales, tbuf->x_i8, x_scale,
-        kv_size, embed_dim, true
+        kv_size, embed_dim, true, threads, perf
       );
     }
     if (is_interrupted()) return 1;
@@ -4831,13 +5289,13 @@ forward_text_decode(
         floatx *xq_head = tbuf->xq + h * head_dim;
         // Use the non-threading version here since we are running this over
         // every head
-        rmsnorm(xq_head, xq_head, layer->nq, head_dim, tcfg->eps);
+        rmsnorm(xq_head, xq_head, layer->nq, head_dim, tcfg->eps, perf);
       }
       // Key RMSNorm
       for (int h = 0; h < n_kv_heads; h++)
       {
         floatx *xk_head = tbuf->xk + h * head_dim;
-        rmsnorm(xk_head, xk_head, layer->nk, head_dim, tcfg->eps);
+        rmsnorm(xk_head, xk_head, layer->nk, head_dim, tcfg->eps, perf);
       }
     }
     if (is_interrupted()) return 1;
@@ -4846,29 +5304,12 @@ forward_text_decode(
     floatx *freqs_cs = is_local ? tbuf->csfreqs_slid : tbuf->csfreqs_full;
 
     // Apply RoPE to queries & keys
-    for (int idx = 0; idx < n_heads + n_kv_heads; idx++)
-    {
-      floatx *data;
-      if (idx < n_heads)
-      {
-        data = tbuf->xq + idx * head_dim;  // Apply to queries
-      }
-      else
-      {
-        data = tbuf->xk + (idx - n_heads) * head_dim;  // Apply to keys
-      }
-
-      for (int d = 0; d < head_dim / 2; d++)
-      {
-        float cfr = (float)freqs_cs[2 * d];
-        float sfr = (float)freqs_cs[2 * d + 1];
-        float a   = (float)data[d];  // Index in the first half vector
-        float b   = (float)data[d + head_dim / 2];  // ... second half vector
-
-        data[d] = (floatx)(a * cfr - b * sfr);
-        data[d + head_dim / 2] = (floatx)(a * sfr + b * cfr);
-      }
-    }
+    rope_apply(
+      tbuf->xq, n_heads, head_dim, freqs_cs, /*freq_stride=*/0, 1.0f, perf
+    );
+    rope_apply(
+      tbuf->xk, n_kv_heads, head_dim, freqs_cs, /*freq_stride=*/0, 1.0f, perf
+    );
     if (is_interrupted()) return 1;
 
     // (n_kv_heads, cache_len, head_dim)
@@ -4897,7 +5338,8 @@ forward_text_decode(
 
     // Iterate over all the attention heads
     int h;
-    #pragma omp parallel for private(h) OMP_PARA_ARGS
+    #pragma omp parallel for private(h) schedule(dynamic, 64) \
+            num_threads(threads) OMP_PARA_ARGS
     for (h = 0; h < n_heads; h++)
     {
       int h_kv = h * n_kv_heads / n_heads;  // GQA mapping
@@ -4910,7 +5352,9 @@ forward_text_decode(
       floatx *att_head = tbuf->att + h * attlen + spos;
 
       // Compute dot product of the current query across all the keys
-      gemv_fpx(att_head, xk_head, xq_head, attlen, head_dim, false);
+      gemv_fpx(
+        att_head, xk_head, xq_head, attlen, head_dim, false, threads, perf
+      );
       for (int t = 0; t < attlen; t++)
       {
         att_head[t] *= att_scale;
@@ -4927,7 +5371,7 @@ forward_text_decode(
       }
 
       // Softmax
-      softmax(att_head, att_head, attlen);
+      softmax(att_head, att_head, attlen, perf);
 
       // Compute output as weighted sum of values
       // v_cache[h_kv, spos:, :]
@@ -4936,7 +5380,7 @@ forward_text_decode(
       floatx *xo_head = tbuf->xo + h * head_dim;
 
       // xo_head (head_dim,) = att_head (attlen,) @ xv_head (attlen, head_dim)
-      gemv_fpx_nn(xo_head, att_head, xv_head, 0, attlen, head_dim);
+      gemv_fpx_nn(xo_head, att_head, xv_head, 0, attlen, head_dim, perf);
     }
     if (is_interrupted()) return 1;
 
@@ -4944,14 +5388,17 @@ forward_text_decode(
     // x (embed_dim,) = xo (head_dim,) @ wo.T (head_dim, embed_dim)
     if (!quant)
     {
-      gemv_fpx(tbuf->x, layer->wo->fpx, tbuf->xo, embed_dim, q_size, true);
+      gemv_fpx(
+        tbuf->x, layer->wo->fpx, tbuf->xo, embed_dim, q_size, true,
+        threads, perf
+      );
     }
     else
     {
-      floatx xo_scale = quantize_act(tbuf->xo_i8, tbuf->xo, q_size);
+      floatx xo_scale = quantize_act(tbuf->xo_i8, tbuf->xo, q_size, perf);
       gemv_int8(
         tbuf->x, layer->wo->i8.q, layer->wo->i8.scales, tbuf->xo_i8, xo_scale,
-        embed_dim, q_size, true
+        embed_dim, q_size, true, threads, perf
       );
     }
     if (is_interrupted()) return 1;
@@ -4959,7 +5406,7 @@ forward_text_decode(
     if (tcfg->pre_mlp_norm)
     {
       // Gemma 2/3: post-norm on attention output
-      rmsnorm(tbuf->x, tbuf->x, layer->n2, embed_dim, tcfg->eps);
+      rmsnorm(tbuf->x, tbuf->x, layer->n2, embed_dim, tcfg->eps, perf);
     }
     if (is_interrupted()) return 1;
 
@@ -4971,8 +5418,9 @@ forward_text_decode(
       /* Sometimes the residual stream accumulates huge values on certain
        * channels, especially in pretrained/bigger models (Sun et al., 2024,
        * https://arxiv.org/abs/2402.17762). It works fine in fp32 or bf16, but
-       * it can easily overflow fp16 and become inf, causing all the activations
-       * turning into nan after the next RMSNorm, so we need to clamp it. */
+       * it can easily overflow fp16 and become inf, causing all the
+       * activations turning into nan after the next RMSNorm, so we need to
+       * clamp it. */
 
       /* NOTE: Actually this should never trigger now since I added activation
        * scalers afterwards (see export.py), the clamp here is more of a
@@ -4987,12 +5435,12 @@ forward_text_decode(
     // Pre feedforward RMSNorm
     if (tcfg->pre_mlp_norm)
     {
-      rmsnorm(tbuf->x, tbuf->x, layer->n3, embed_dim, tcfg->eps);
+      rmsnorm(tbuf->x, tbuf->x, layer->n3, embed_dim, tcfg->eps, perf);
     }
     else
     {
       // Gemma 1: n2 is exactly pre MLP norm
-      rmsnorm(tbuf->x, tbuf->x, layer->n2, embed_dim, tcfg->eps);
+      rmsnorm(tbuf->x, tbuf->x, layer->n2, embed_dim, tcfg->eps, perf);
     }
     if (is_interrupted()) return 1;
 
@@ -5000,52 +5448,47 @@ forward_text_decode(
     if (!quant)
     {
       gemv_fpx(
-        tbuf->xu, layer->w1->fpx, tbuf->x, tcfg->mlp_dim, embed_dim, true
+        tbuf->xu, layer->w1->fpx, tbuf->x, tcfg->mlp_dim, embed_dim, true,
+        threads, perf
       );
       gemv_fpx(
-        tbuf->xg, layer->w2->fpx, tbuf->x, tcfg->mlp_dim, embed_dim, true
+        tbuf->xg, layer->w2->fpx, tbuf->x, tcfg->mlp_dim, embed_dim, true,
+        threads, perf
       );
     }
     else
     {
-      floatx x_scale = quantize_act(tbuf->x_i8, tbuf->x, embed_dim);
+      floatx x_scale = quantize_act(tbuf->x_i8, tbuf->x, embed_dim, perf);
       gemv_int8(
         tbuf->xg, layer->w2->i8.q, layer->w2->i8.scales, tbuf->x_i8, x_scale,
-        tcfg->mlp_dim, embed_dim, true
+        tcfg->mlp_dim, embed_dim, true, threads, perf
       );
       gemv_int8(
         tbuf->xu, layer->w1->i8.q, layer->w1->i8.scales, tbuf->x_i8, x_scale,
-        tcfg->mlp_dim, embed_dim, true
+        tcfg->mlp_dim, embed_dim, true, threads, perf
       );
     }
     if (is_interrupted()) return 1;
 
-    // GELU gate
-    int d;
-    #pragma omp parallel for private(d) OMP_PARA_ARGS
-    for (d = 0; d < tcfg->mlp_dim; d++)
-    {
-      // Tanh approximation of GELU
-      float x     = (float)tbuf->xg[d];
-      float c     = 0.79788456080287f;  // = sqrt(2 / pi)
-      x           = 0.5 * x * (1 + tanhf(c * (x + 0.044715 * x * x * x)));
-      tbuf->xg[d] = (floatx)x;
-      tbuf->xg[d] *= tbuf->xu[d];  // Fuse xg * xu into xg
-    }
+    // GELU gate, fused with the up projection (xg * xu)
+    gelu(
+      tbuf->xg, tbuf->xg, 1, tcfg->mlp_dim, NULL, tbuf->xu, false, threads, perf
+    );
     if (is_interrupted()) return 1;
 
     if (!quant)
     {
       gemv_fpx(
-        tbuf->x, layer->w3->fpx, tbuf->xg, embed_dim, tcfg->mlp_dim, true
+        tbuf->x, layer->w3->fpx, tbuf->xg, embed_dim, tcfg->mlp_dim, true,
+        threads, perf
       );
     }
     else
     {
-      floatx xscale = quantize_act(tbuf->xg_i8, tbuf->xg, tcfg->mlp_dim);
+      floatx xscale = quantize_act(tbuf->xg_i8, tbuf->xg, tcfg->mlp_dim, perf);
       gemv_int8(
         tbuf->x, layer->w3->i8.q, layer->w3->i8.scales, tbuf->xg_i8, xscale,
-        embed_dim, tcfg->mlp_dim, true
+        embed_dim, tcfg->mlp_dim, true, threads, perf
       );
     }
     if (is_interrupted()) return 1;
@@ -5053,7 +5496,7 @@ forward_text_decode(
     // Post feedforward RMSNorm
     if (tcfg->pst_mlp_norm)
     {
-      rmsnorm(tbuf->x, tbuf->x, layer->n4, embed_dim, tcfg->eps);
+      rmsnorm(tbuf->x, tbuf->x, layer->n4, embed_dim, tcfg->eps, perf);
     }
     if (is_interrupted()) return 1;
 
@@ -5068,7 +5511,7 @@ forward_text_decode(
   }
 
   // Final RMSNorm
-  rmsnorm(tbuf->x, tbuf->x, dec->final_norm, embed_dim, tcfg->eps);
+  rmsnorm(tbuf->x, tbuf->x, dec->final_norm, embed_dim, tcfg->eps, perf);
   if (is_interrupted()) return 1;
 
   // Compute logits (tied embedding)
@@ -5077,16 +5520,16 @@ forward_text_decode(
     if (!quant)
     {
       gemv_fpx(
-        tbuf->logits, dec->embedding->fpx, tbuf->x, tcfg->vocab_size, embed_dim,
-        true
+        tbuf->logits, dec->embedding->fpx, tbuf->x, tcfg->vocab_size,
+        embed_dim, true, threads, perf
       );
     }
     else
     {
-      floatx xscale = quantize_act(tbuf->x_i8, tbuf->x, embed_dim);
+      floatx xscale = quantize_act(tbuf->x_i8, tbuf->x, embed_dim, perf);
       gemv_int8(
         tbuf->logits, dec->embedding->i8.q, dec->embedding->i8.scales,
-        tbuf->x_i8, xscale, tcfg->vocab_size, embed_dim, true
+        tbuf->x_i8, xscale, tcfg->vocab_size, embed_dim, true, threads, perf
       );
     }
     if (is_interrupted()) return 1;
@@ -5114,7 +5557,9 @@ forward_text_chunk(
   int          n_tokens,
   bool         mask,
   bool         quant,
-  bool         compute_logits)
+  bool         compute_logits,
+  int          threads,
+  PerfBench   *perf)
 {
   TextConfig *tcfg = dec->config;
 
@@ -5141,29 +5586,10 @@ forward_text_chunk(
   }
 
   // Precompute RoPE angles
-  int t;
-  #pragma omp parallel for private(t) OMP_PARA_ARGS
-  for (t = 0; t < n_tokens; t++)
-  {
-    int pos = spos + t;
-    int off = t * head_dim;
-
-    for (int d = 0; d < head_dim / 2; d++)
-    {
-      float freq;
-      float e = (float)(-2 * d) / (float)head_dim;
-
-      // Sliding window angles
-      freq = powf(tcfg->local_theta, e);
-      tbuf->csfreqs_slid[off + d * 2]     = (floatx)cosf(freq * (float)pos);
-      tbuf->csfreqs_slid[off + d * 2 + 1] = (floatx)sinf(freq * (float)pos);
-
-      // Full attention angles
-      freq = powf(tcfg->global_theta, e);
-      tbuf->csfreqs_full[off + d * 2]     = (floatx)cosf(freq * (float)pos);
-      tbuf->csfreqs_full[off + d * 2 + 1] = (floatx)sinf(freq * (float)pos);
-    }
-  }
+  rope_freqs(
+    tbuf->csfreqs_slid, tbuf->csfreqs_full, head_dim, /*freq_stride=*/head_dim,
+    tcfg->local_theta, tcfg->global_theta, spos, n_tokens, threads, perf
+  );
   if (is_interrupted()) return 1;
 
   floatx att_scale = (floatx)(1.0f / sqrtf((float)tcfg->q_scale));
@@ -5175,11 +5601,11 @@ forward_text_chunk(
     memcpy(tbuf->resid, tbuf->x, n_tokens * embed_dim * sizeof(*tbuf->x));
 
     int t;
-    #pragma omp parallel for private(t) OMP_PARA_ARGS
+    #pragma omp parallel for private(t) num_threads(threads) OMP_PARA_ARGS
     for (t = 0; t < n_tokens; t++)
     {
       floatx *x_row = tbuf->x + t * embed_dim;
-      rmsnorm(x_row, x_row, layer->n1, embed_dim, tcfg->eps);
+      rmsnorm(x_row, x_row, layer->n1, embed_dim, tcfg->eps, perf);
     }
     if (is_interrupted()) return 1;
 
@@ -5188,7 +5614,8 @@ forward_text_chunk(
     if (quant)
     {
       quantize_acts(
-        tbuf->x_i8, tbuf->x_scales, tbuf->x, 0, n_tokens, embed_dim, true
+        tbuf->x_i8, tbuf->x_scales, tbuf->x, 0, n_tokens, embed_dim, true,
+        threads, perf
       );
     }
 
@@ -5196,7 +5623,8 @@ forward_text_chunk(
     int  h;
     bool quit = false;
 
-    #pragma omp parallel for private(h) reduction(|| : quit) OMP_PARA_ARGS
+    #pragma omp parallel for private(h) reduction(|| : quit) \
+            num_threads(threads) OMP_PARA_ARGS
     for (h = 0; h < n_heads; h++)
     {
       floatx *xq_head =
@@ -5205,7 +5633,7 @@ forward_text_chunk(
       {
         if (gemm_fpx(
           xq_head, 0, layer->wq->fpx + h * head_dim * embed_dim, 0, tbuf->x,
-          0, n_tokens, head_dim, embed_dim, false
+          0, n_tokens, head_dim, embed_dim, false, threads, perf
         ) == 1)
           quit = true;
       }
@@ -5214,7 +5642,7 @@ forward_text_chunk(
         if (gemm_int8(
           xq_head, 0, layer->wq->i8.q + h * head_dim * embed_dim, 0,
           layer->wq->i8.scales + h * head_dim, tbuf->x_i8, 0,
-          tbuf->x_scales, n_tokens, head_dim, embed_dim, false
+          tbuf->x_scales, n_tokens, head_dim, embed_dim, false, threads, perf
         ) == 1)
           quit = true;
       }
@@ -5229,11 +5657,11 @@ forward_text_chunk(
         if (
           gemm_fpx(
             xk_head, 0, layer->wk->fpx + h * head_dim * embed_dim, 0, tbuf->x,
-            0, n_tokens, head_dim, embed_dim, false
+            0, n_tokens, head_dim, embed_dim, false, threads, perf
           ) == 1 ||
           gemm_fpx(
             xv_head, 0, layer->wv->fpx + h * head_dim * embed_dim, 0, tbuf->x,
-            0, n_tokens, head_dim, embed_dim, false
+            0, n_tokens, head_dim, embed_dim, false, threads, perf
           ) == 1
         )
           quit = true;
@@ -5244,12 +5672,12 @@ forward_text_chunk(
           gemm_int8(
             xk_head, 0, layer->wk->i8.q + h * head_dim * embed_dim, 0,
             layer->wk->i8.scales + h * head_dim, tbuf->x_i8, 0,
-            tbuf->x_scales, n_tokens, head_dim, embed_dim, false
+            tbuf->x_scales, n_tokens, head_dim, embed_dim, false, threads, perf
           ) == 1 ||
           gemm_int8(
             xv_head, 0, layer->wv->i8.q + h * head_dim * embed_dim, 0,
             layer->wv->i8.scales + h * head_dim, tbuf->x_i8, 0,
-            tbuf->x_scales, n_tokens, head_dim, embed_dim, false
+            tbuf->x_scales, n_tokens, head_dim, embed_dim, false, threads, perf
           ) == 1
         )
           quit = true;
@@ -5261,65 +5689,46 @@ forward_text_chunk(
     if (tcfg->qk_norm)
     {
       int h, t;
-      #pragma omp parallel for private(h, t) OMP_COLLAPSE2 OMP_PARA_ARGS
+      #pragma omp parallel for private(h, t) num_threads(threads) \
+              OMP_COLLAPSE2 OMP_PARA_ARGS
       for (h = 0; h < n_heads; h++)
+      {
         for (t = 0; t < n_tokens; t++)
         {
           // Q norm
           floatx *xq_head = tbuf->xq + h * n_tokens * head_dim + t * head_dim;
-          rmsnorm(xq_head, xq_head, layer->nq, head_dim, tcfg->eps);
+          rmsnorm(xq_head, xq_head, layer->nq, head_dim, tcfg->eps, perf);
 
           if (h < n_kv_heads)
           {
             // K norm
-            floatx *xk_head = tbuf->xk + h * n_tokens * head_dim + t * head_dim;
-            rmsnorm(xk_head, xk_head, layer->nk, head_dim, tcfg->eps);
+            floatx *xk_head =
+              tbuf->xk + h * n_tokens * head_dim + t * head_dim;
+            rmsnorm(xk_head, xk_head, layer->nk, head_dim, tcfg->eps, perf);
           }
         }
+      }
     }
     if (is_interrupted()) return 1;
 
     bool    is_local = tcfg->att_layers[l];
     floatx *freqs_cs = is_local ? tbuf->csfreqs_slid : tbuf->csfreqs_full;
 
-    // RoPE
-    #pragma omp parallel for private(h, t) OMP_COLLAPSE2 OMP_PARA_ARGS
+    // RoPE. The attention scale is applied beforehand to the queries here,
+    // mathematically equivilant, but avoids scaling the entire
+    // n_tokens * max_k attention matrix
+    #pragma omp parallel for private(h) num_threads(threads) OMP_PARA_ARGS
     for (h = 0; h < n_heads + n_kv_heads; h++)
-      for (t = 0; t < n_tokens; t++)
-      {
-        floatx *data;
-        if (h < n_heads)
-        {
-          data = tbuf->xq + h * n_tokens * head_dim +
-                 t * head_dim;  // Apply to queries
-        }
-        else
-        {
-          data = tbuf->xk + (h - n_heads) * n_tokens * head_dim +
-                 t * head_dim;  // Apply to keys
-        }
+    {
+      bool    is_q = h < n_heads;
+      floatx *data = is_q ? tbuf->xq + h * n_tokens * head_dim
+                          : tbuf->xk + (h - n_heads) * n_tokens * head_dim;
 
-        for (int d = 0; d < head_dim / 2; d++)
-        {
-          float cfr = (float)freqs_cs[2 * d + t * head_dim];
-          float sfr = (float)freqs_cs[2 * d + 1 + t * head_dim];
-          float a   = (float)data[d];  // Index in the first half vector
-          float b   = (float)data[d + head_dim / 2];  // ... second half vector
-          float r0  = a * cfr - b * sfr;
-          float r1  = a * sfr + b * cfr;
-
-          // Apply att_scale beforehand in this step, mathematically equivilant,
-          // but avoided scaling the entire n_tokens * max_k attention matrix
-          if (h < n_heads)
-          {
-            r0 *= (float)att_scale;
-            r1 *= (float)att_scale;
-          }
-
-          data[d] = (floatx)r0;
-          data[d + head_dim / 2] = (floatx)r1;
-        }
-      }
+      rope_apply(
+        data, n_tokens, head_dim, freqs_cs, /*freq_stride=*/head_dim,
+        is_q ? (float)att_scale : 1.0f, perf
+      );
+    }
 
     if (is_interrupted()) return 1;
 
@@ -5348,7 +5757,8 @@ forward_text_chunk(
     int max_k = epos + 1;
     quit      = false;
 
-    #pragma omp parallel for private(h) reduction(|| : quit) OMP_PARA_ARGS
+    #pragma omp parallel for private(h) reduction(|| : quit) \
+            num_threads(threads) OMP_PARA_ARGS
     for (h = 0; h < n_heads; h++)
     {
       int h_kv = h * n_kv_heads / n_heads;  // GQA mapping
@@ -5369,12 +5779,12 @@ forward_text_chunk(
        * to provide better performance for causal masking.
        *
        * Naively computing causal attention means either (a) materializing the
-       * full [n_tokens, attlen] score matrix and masking out the upper triangle
-       * afterwards (wastes ~half the compute), or (b) looping token by token
-       * with a triangular schedule (correct FLOP count, but ragged inner loop
-       * length basically kills vectorization across threads). So I tile both
-       * the query and key range into blocks and classify each (qb, kb) pair
-       * into five cases:
+       * full [n_tokens, attlen] score matrix and masking out the upper
+       * triangle afterwards (wastes ~half the compute), or (b) looping token
+       * by token with a triangular schedule (correct FLOP count, but ragged
+       * inner loop length basically kills vectorization across threads). So I
+       * tile both the query and key range into blocks and classify each
+       * (qb, kb) pair into five cases:
        *
        * kb > qb -> skip, every key in this block lies in the future of queries.
        * kb < qb -> full GEMM, every key lies in the past of queries.
@@ -5414,7 +5824,7 @@ forward_text_chunk(
             // Typically people don't quantize this
             if (gemm_fpx(
               att_b, max_k, kb, 0, qb, 0, q_end - q_start, k_end - k_start,
-              head_dim, false
+              head_dim, false, threads, perf
             ) == 1)
               quit = true;
 
@@ -5453,7 +5863,9 @@ forward_text_chunk(
               }
             }
             // only softmax in the range [spos_i, pos_i]
-            softmax(att_row + spos_i, att_row + spos_i, pos_i - spos_i + 1);
+            softmax(
+              att_row + spos_i, att_row + spos_i, pos_i - spos_i + 1, perf
+            );
           }
 
           // xo_block (qb_len, head_dim) = att_block (qb_len, qb_len)
@@ -5465,8 +5877,8 @@ forward_text_chunk(
           gemm_fpx_nn(
             xo_block, /*dst_stride=*/q_size, v_block, /*mat_stride=*/0,
             att_block,
-            /*src_stride=*/max_k, q_end - q_start, head_dim, abs_q_end - spos_b,
-            false
+            /*src_stride=*/max_k, q_end - q_start, head_dim,
+            abs_q_end - spos_b, false, threads, perf
           );
         }
       }
@@ -5479,7 +5891,7 @@ forward_text_chunk(
         // att_head = xq_head @ xk_head.T
         if (gemm_fpx(
           att_head, max_k, xk_head, 0, xq_head, 0, n_tokens, max_k,
-          head_dim, false
+          head_dim, false, threads, perf
         ))
           quit = true;
 
@@ -5497,13 +5909,13 @@ forward_text_chunk(
             }
           }
           // Softmax
-          softmax(att_row, att_row, max_k);
+          softmax(att_row, att_row, max_k, perf);
         }
         // xo_head (n_tokens, head_dim) = att_head (n_tokens, max_k)
         //                              @ xv_head[:max_k] (max_k, head_dim)
         gemm_fpx_nn(
           xo_head, /*dst_stride=*/q_size, xv_head, /*mat_stride=*/0, att_head,
-          /*src_stride=*/max_k, n_tokens, head_dim, max_k, false
+          /*src_stride=*/max_k, n_tokens, head_dim, max_k, false, threads, perf
         );
       }
     }
@@ -5514,18 +5926,19 @@ forward_text_chunk(
     {
       if (gemm_fpx(
         tbuf->x, 0, layer->wo->fpx, 0, tbuf->xo, q_size, n_tokens,
-        embed_dim, q_size, true
+        embed_dim, q_size, true, threads, perf
       ) == 1)
         return 1;
     }
     else
     {
       quantize_acts(
-        tbuf->xo_i8, tbuf->xo_scales, tbuf->xo, q_size, n_tokens, q_size, true
+        tbuf->xo_i8, tbuf->xo_scales, tbuf->xo, q_size, n_tokens, q_size,
+        true, threads, perf
       );
       if (gemm_int8(
         tbuf->x, 0, layer->wo->i8.q, 0, layer->wo->i8.scales, tbuf->xo_i8,
-        0, tbuf->xo_scales, n_tokens, embed_dim, q_size, true
+        0, tbuf->xo_scales, n_tokens, embed_dim, q_size, true, threads, perf
       ) == 1)
         return 1;
     }
@@ -5534,11 +5947,11 @@ forward_text_chunk(
     if (tcfg->pre_mlp_norm)
     {
       // Gemma 2/3: post-norm on attention output
-      #pragma omp parallel for private(t) OMP_PARA_ARGS
+      #pragma omp parallel for private(t) num_threads(threads) OMP_PARA_ARGS
       for (t = 0; t < n_tokens; t++)
       {
         floatx *x_row = tbuf->x + t * embed_dim;
-        rmsnorm(x_row, x_row, layer->n2, embed_dim, tcfg->eps);
+        rmsnorm(x_row, x_row, layer->n2, embed_dim, tcfg->eps, perf);
       }  
       if (is_interrupted()) return 1;
     }
@@ -5547,7 +5960,7 @@ forward_text_chunk(
     floatx *RESTRICT resid = tbuf->resid;
 
     int d;
-    #pragma omp parallel for private(d) OMP_PARA_ARGS
+    #pragma omp parallel for private(d) num_threads(threads) OMP_PARA_ARGS
     for (d = 0; d < n_tokens * embed_dim; d++)
     {
       // Combine the residual stream
@@ -5561,22 +5974,22 @@ forward_text_chunk(
     {
       // Gemma 2/3: dedicated pre_feedforward_rmsnorm
       int t;
-      #pragma omp parallel for private(t) OMP_PARA_ARGS
+      #pragma omp parallel for private(t) num_threads(threads) OMP_PARA_ARGS
       for (t = 0; t < n_tokens; t++)
       {
         floatx *x_row = tbuf->x + t * embed_dim;
-        rmsnorm(x_row, x_row, layer->n3, embed_dim, tcfg->eps);
+        rmsnorm(x_row, x_row, layer->n3, embed_dim, tcfg->eps, perf);
       }
     }
     else
     {
       // Gemma 1: post_attention_rmsnorm is pre-MLP norm
       int t;
-      #pragma omp parallel for private(t) OMP_PARA_ARGS
+      #pragma omp parallel for private(t) num_threads(threads) OMP_PARA_ARGS
       for (t = 0; t < n_tokens; t++)
       {
         floatx *x_row = tbuf->x + t * embed_dim;
-        rmsnorm(x_row, x_row, layer->n2, embed_dim, tcfg->eps);
+        rmsnorm(x_row, x_row, layer->n2, embed_dim, tcfg->eps, perf);
       }
     }
     if (is_interrupted()) return 1;
@@ -5587,11 +6000,11 @@ forward_text_chunk(
       if (
         gemm_fpx(
           tbuf->xu, 0, layer->w1->fpx, 0, tbuf->x, 0, n_tokens, tcfg->mlp_dim,
-          embed_dim, true
+          embed_dim, true, threads, perf
         ) == 1 ||
         gemm_fpx(
           tbuf->xg, 0, layer->w2->fpx, 0, tbuf->x, 0, n_tokens, tcfg->mlp_dim,
-          embed_dim, true
+          embed_dim, true, threads, perf
         ) == 1
       )
         return 1;
@@ -5599,33 +6012,30 @@ forward_text_chunk(
     else
     {
       quantize_acts(
-        tbuf->x_i8, tbuf->x_scales, tbuf->x, 0, n_tokens, embed_dim, true
+        tbuf->x_i8, tbuf->x_scales, tbuf->x, 0, n_tokens, embed_dim, true,
+        threads, perf
       );
       if (
         gemm_int8(
           tbuf->xu, 0, layer->w1->i8.q, 0, layer->w1->i8.scales, tbuf->x_i8,
-          0, tbuf->x_scales, n_tokens, tcfg->mlp_dim, embed_dim, true
+          0, tbuf->x_scales, n_tokens, tcfg->mlp_dim, embed_dim, true,
+          threads, perf
         ) == 1 ||
         gemm_int8(
           tbuf->xg, 0, layer->w2->i8.q, 0, layer->w2->i8.scales, tbuf->x_i8,
-          0, tbuf->x_scales, n_tokens, tcfg->mlp_dim, embed_dim, true
+          0, tbuf->x_scales, n_tokens, tcfg->mlp_dim, embed_dim, true,
+          threads, perf
         )
       )
         return 1;
     }
     if (is_interrupted()) return 1;
 
-    // GELU gate
-    #pragma omp parallel for private(d) OMP_PARA_ARGS
-    for (d = 0; d < n_tokens * tcfg->mlp_dim; d++)
-    {
-      // Tanh approximation of GELU
-      float x     = (float)tbuf->xg[d];
-      float c     = 0.79788456080287f;  // = sqrt(2 / pi)
-      x           = 0.5 * x * (1 + tanhf(c * (x + 0.044715 * x * x * x)));
-      tbuf->xg[d] = (floatx)x;
-      tbuf->xg[d] *= tbuf->xu[d];  // Fuse xg * xu into xg
-    }
+    // GELU gate, fused with the up projection (xg * xu)
+    gelu(
+      tbuf->xg, tbuf->xg, n_tokens, tcfg->mlp_dim, NULL, tbuf->xu, true,
+      threads, perf
+    );
     if (is_interrupted()) return 1;
 
     // Down projection
@@ -5633,18 +6043,20 @@ forward_text_chunk(
     {
       if (gemm_fpx(
         tbuf->x, 0, layer->w3->fpx, 0, tbuf->xg, 0, n_tokens, embed_dim,
-        tcfg->mlp_dim, true
+        tcfg->mlp_dim, true, threads, perf
       ) == 1)
         return 1;
     }
     else
     {
       quantize_acts(
-        tbuf->xg_i8, tbuf->xg_scales, tbuf->xg, 0, n_tokens, tcfg->mlp_dim, true
+        tbuf->xg_i8, tbuf->xg_scales, tbuf->xg, 0, n_tokens, tcfg->mlp_dim,
+        true, threads, perf
       );
       if (gemm_int8(
         tbuf->x, 0, layer->w3->i8.q, 0, layer->w3->i8.scales, tbuf->xg_i8,
-        0, tbuf->xg_scales, n_tokens, embed_dim, tcfg->mlp_dim, true
+        0, tbuf->xg_scales, n_tokens, embed_dim, tcfg->mlp_dim, true,
+        threads, perf
       ) == 1)
         return 1;
     }
@@ -5652,18 +6064,18 @@ forward_text_chunk(
 
     if (tcfg->pst_mlp_norm)
     {
-      #pragma omp parallel for private(t) OMP_PARA_ARGS
+      #pragma omp parallel for private(t) num_threads(threads) OMP_PARA_ARGS
       for (t = 0; t < n_tokens; t++)
       {
         floatx *x_row = tbuf->x + t * embed_dim;
-        rmsnorm(x_row, x_row, layer->n4, embed_dim, tcfg->eps);
+        rmsnorm(x_row, x_row, layer->n4, embed_dim, tcfg->eps, perf);
       }
     }
     if (is_interrupted()) return 1;
 
     x     = tbuf->x;
     resid = tbuf->resid;
-    #pragma omp parallel for private(d) OMP_PARA_ARGS
+    #pragma omp parallel for private(d) num_threads(threads) OMP_PARA_ARGS
     for (d = 0; d < n_tokens * embed_dim; d++)
     {
       // Second residual
@@ -5673,11 +6085,12 @@ forward_text_chunk(
   }
 
   // Final RMSNorm
-  #pragma omp parallel for private(t) OMP_PARA_ARGS
+  int t;
+  #pragma omp parallel for private(t) num_threads(threads) OMP_PARA_ARGS
   for (t = 0; t < n_tokens; t++)
   {
     floatx *x_row = tbuf->x + t * embed_dim;
-    rmsnorm(x_row, x_row, dec->final_norm, embed_dim, tcfg->eps);
+    rmsnorm(x_row, x_row, dec->final_norm, embed_dim, tcfg->eps, perf);
   }
 
   // Compute logits (tied embedding)
@@ -5688,15 +6101,15 @@ forward_text_chunk(
     {
       gemv_fpx(
         tbuf->logits, dec->embedding->fpx, last_x, tcfg->vocab_size, embed_dim,
-        true
+        true, threads, perf
       );
     }
     else
     {
-      floatx xscale = quantize_act(tbuf->x_i8, last_x, embed_dim);
+      floatx xscale = quantize_act(tbuf->x_i8, last_x, embed_dim, perf);
       gemv_int8(
         tbuf->logits, dec->embedding->i8.q, dec->embedding->i8.scales,
-        tbuf->x_i8, xscale, tcfg->vocab_size, embed_dim, true
+        tbuf->x_i8, xscale, tcfg->vocab_size, embed_dim, true, threads, perf
       );
     }
     if (is_interrupted()) return 1;
@@ -5719,9 +6132,20 @@ NO_FAST_MATH_END;
 
 /* Language + vision model forward */
 int
-forward_gemma_decode(GemmaModel *model, TextBuffer *tbuf, int token, int pos)
+forward_gemma_decode(
+  GemmaModel *model,
+  TextBuffer *tbuf,
+  int         token,
+  int         pos,
+  int         threads,
+  PerfBench  *perf)
 {
   TextDecoder *dec = model->decoder;
+  double       t0  = PERF_TIC(perf);
+  int          rc;
+
+  // Everything below belongs to the decode phase of the report
+  PERF_PHASE(perf, PERF_PHASE_DECODE);
 
   floatx embed_scale;
   if (dec->config->pre_mlp_norm)
@@ -5744,7 +6168,7 @@ forward_gemma_decode(GemmaModel *model, TextBuffer *tbuf, int token, int pos)
 
   // x = embedding[tok] * embed_scale
   int d;
-  #pragma omp parallel for private(d) OMP_PARA_ARGS
+  #pragma omp parallel for private(d) num_threads(threads) OMP_PARA_ARGS
   for (d = 0; d < embed_dim; d++)
   {
     if (!model->quant)
@@ -5757,8 +6181,18 @@ forward_gemma_decode(GemmaModel *model, TextBuffer *tbuf, int token, int pos)
         (floatx)dec->embedding->i8.q[token * embed_dim + d] * embed_scale;
     }
   }
-  if (is_interrupted()) return 1;
-  return forward_text_decode(model->decoder, tbuf, pos, model->quant, true);
+  if (is_interrupted())
+  {
+    rc = 1;
+  }
+  else
+  {
+    rc = forward_text_decode(
+      model->decoder, tbuf, pos, model->quant, true, threads, perf
+    );
+  }
+  PERF_PHASE_DONE(perf, PERF_PHASE_DECODE, t0, 1);
+  return rc;
 }
 
 /* Language model prefill */
@@ -5771,10 +6205,16 @@ forward_gemma_prefill(
   int        *pos,
   int         chunk_size,
   bool       *rpen_visited,
-  bool        compute_logits)
+  bool        compute_logits,
+  int         threads,
+  PerfBench  *perf)
 {
   TextDecoder *dec       = model->decoder;
   int          embed_dim = dec->config->embed_dim;
+  double       t0        = PERF_TIC(perf);
+  int          rc        = 0;
+
+  PERF_PHASE(perf, PERF_PHASE_PREFILL);
 
   // Prefill by chunks
   for (int off = 0; off < n_tokens; off += chunk_size)
@@ -5824,16 +6264,20 @@ forward_gemma_prefill(
       }
     }
 
-    int rc = forward_text_chunk(
+    rc = forward_text_chunk(
       dec, tbuf, *pos + off, cur_len, true, model->quant,
-      is_last_chunk && compute_logits
+      is_last_chunk && compute_logits, threads, perf
     );
 
-    if (rc != 0) return rc;
+    if (rc != 0) break;
   }
 
-  *pos += n_tokens;
-  return 0;
+  if (rc == 0)
+  {
+    *pos += n_tokens;
+  }
+  PERF_PHASE_DONE(perf, PERF_PHASE_PREFILL, t0, n_tokens);
+  return rc;
 }
 
 /* Vision model forward + embedding prefill */
@@ -5844,41 +6288,58 @@ forward_gemma_image(
   VisionBuffer *vbuf,
   const floatx *image,
   int          *pos,
-  bool          compute_logits)
+  bool          compute_logits,
+  int           threads,
+  PerfBench    *perf)
 {
   VisionEncoder *enc = model->encoder;
+  double         t0  = PERF_TIC(perf);
+  int            rc  = 0;
+
+  PERF_PHASE(perf, PERF_PHASE_VISION);
+
   if (enc == NULL)
   {
-    return 1;
+    rc = 1;
+    goto done;
   }
 
   TextDecoder *dec = model->decoder;
-  if (forward_vision(enc, dec->config, tbuf, vbuf, image, model->quant) == 1)
+  if (forward_vision(
+    enc, dec->config, tbuf, vbuf, image, model->quant, threads, perf
+  ) == 1)
   {
-    return 1;
+    rc = 1;
+    goto done;
   }
 
   int image_toks = dec->config->image_toks;
 
-  int suc = forward_text_chunk(
+  rc = forward_text_chunk(
     // Gemma 3 models uses bi-directional attention for vision tokens
-    dec, tbuf, *pos, image_toks, false, model->quant, compute_logits
+    dec, tbuf, *pos, image_toks, false, model->quant, compute_logits, threads,
+    perf
   );
+  if (rc == 0)
+  {
+    *pos += image_toks;
+  }
 
-  *pos += image_toks;
-  return suc;
+done:
+  PERF_PHASE_DONE(perf, PERF_PHASE_VISION, t0, 1);
+  return rc;
 }
 
 // Sampling
 
 /* */
 static int
-argmax(floatx *logits, int vocab_size)
+argmax(floatx *logits, int vocab_size, int threads)
 {
   // Pick the index with the max value
   int    max_idx = -1;
   floatx max_val = -FLOATX_MAX;
-  #pragma omp parallel OMP_PARA_ARGS
+  #pragma omp parallel num_threads(threads) OMP_PARA_ARGS
   {
     int    local_idx = -1;
     floatx local_val = -FLOATX_MAX;
@@ -5979,7 +6440,9 @@ quickselect_topk(FloatIdx *arr, int lo, int hi, int k_idx)
 
 /* */
 static void
-apply_topk(floatx *logits, FloatIdx *logit_indices, int vocab_size, int k)
+apply_topk(
+  floatx *logits, FloatIdx *logit_indices, int vocab_size, int k,
+  int threads)
 {
   if (k <= 0)
   {
@@ -5992,7 +6455,7 @@ apply_topk(floatx *logits, FloatIdx *logit_indices, int vocab_size, int k)
 
   // Record index info
   int i;
-  #pragma omp parallel for private(i) OMP_PARA_ARGS
+  #pragma omp parallel for private(i) num_threads(threads) OMP_PARA_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     logit_indices[i].idx = i;
@@ -6001,7 +6464,7 @@ apply_topk(floatx *logits, FloatIdx *logit_indices, int vocab_size, int k)
   quickselect_topk(logit_indices, 0, vocab_size - 1, k - 1);
 
   // Keep the top k channels
-  #pragma omp parallel for private(i) OMP_PARA_ARGS
+  #pragma omp parallel for private(i) num_threads(threads) OMP_PARA_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     logits[i] = -FLOATX_MAX;
@@ -6056,20 +6519,22 @@ apply_topp(
   FloatIdx *logit_indices,
   int       vocab_size,
   int       k,
-  float     p)
+  float     p,
+  int       threads,
+  PerfBench *perf)
 {
   if (k > vocab_size)
   {
     k = vocab_size;
   }
   // Softmax to get the probs, store in fpbuf
-  softmax(fpbuf, logits, vocab_size);
+  softmax(fpbuf, logits, vocab_size, perf);
   int heap_size = (k == 0) ? vocab_size : k;
 
   if (k == 0)
   {
     int i;
-    #pragma omp parallel for private(i) OMP_PARA_ARGS
+    #pragma omp parallel for private(i) num_threads(threads) OMP_PARA_ARGS
     for (i = 0; i < vocab_size; i++)
     {
       logit_indices[i].idx = i;
@@ -6091,7 +6556,7 @@ apply_topp(
 
   // Set logits to -inf
   int i;
-  #pragma omp parallel for private(i) OMP_PARA_ARGS
+  #pragma omp parallel for private(i) num_threads(threads) OMP_PARA_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     logits[i] = -FLOATX_MAX;
@@ -6115,11 +6580,13 @@ apply_topp(
 
 /* Simple repetition penalty */
 void
-apply_rpen(floatx *logits, bool *visited, int vocab_size, float rpen)
+apply_rpen(
+  floatx *logits, bool *visited, int vocab_size, float rpen,
+  int threads)
 {
   // rpen short for Repetition Penalty
   int i;
-  #pragma omp parallel for private(i) OMP_PARA_ARGS
+  #pragma omp parallel for private(i) num_threads(threads) OMP_PARA_ARGS
   for (i = 0; i < vocab_size; i++)
   {
     if (!visited[i]) continue;
@@ -6171,15 +6638,23 @@ sample_from_logits(
   float     temperature,
   int       topk,
   float     topp,
-  float     rpen)
+  float     rpen,
+  int       threads,
+  PerfBench *perf)
 {
-  bool dosample = temperature != 0 && topk != 1;
+  double t0       = PERF_TIC(perf);
+  int    token;
+  bool   dosample = temperature != 0 && topk != 1;
+
+  // Sampling is the last step of a decode step
+  PERF_PHASE(perf, PERF_PHASE_DECODE);
 
   // Manipulate the logits & sample the next token
   if (!dosample)
   {
     // Argmax sampling
-    return argmax(logits, vocab_size);
+    token = argmax(logits, vocab_size, threads);
+    goto done;
   }
 
   bool use_topk = dosample && topk != 0;
@@ -6188,7 +6663,7 @@ sample_from_logits(
 
   // Apply the temperature
   int d;
-  #pragma omp parallel for private(d) OMP_PARA_ARGS
+  #pragma omp parallel for private(d) num_threads(threads) OMP_PARA_ARGS
   for (d = 0; d < vocab_size; d++)
   {
     logits[d] /= (floatx)temperature;
@@ -6196,25 +6671,32 @@ sample_from_logits(
 
   if (use_topk)
   {
-    apply_topk(logits, logit_indices, vocab_size, topk);
+    apply_topk(logits, logit_indices, vocab_size, topk, threads);
   }
   if (use_topp)
   {
-    apply_topp(logits, probs, logit_indices, vocab_size, topk, topp);
+    apply_topp(
+      logits, probs, logit_indices, vocab_size, topk, topp, threads, perf
+    );
   }
   if (use_rpen)
   {
-    apply_rpen(logits, visited, vocab_size, rpen);
+    apply_rpen(logits, visited, vocab_size, rpen, threads);
   }
 
   // Softmax to get the probs
-  softmax(probs, logits, vocab_size);
+  softmax(probs, logits, vocab_size, perf);
 
   // Multinomial sample from probs
-  float r   = (float)((float)rand() / (RAND_MAX + 1.0));
+  float total = 0.0f;
+  for (int d = 0; d < vocab_size; d++)
+  {
+    total += (float)probs[d];
+  }
+  float r   = (float)((float)rand() / (RAND_MAX + 1.0)) * total;
   float sum = 0.0f;
 
-  int token = vocab_size - 1;
+  token = vocab_size - 1;
   for (int d = 0; d < vocab_size; d++)
   {
     sum += (float)probs[d];
@@ -6224,55 +6706,68 @@ sample_from_logits(
       break;
     }
   }
+done:
+  PERF_TOC(perf, PERF_OP_SAMPLE, t0);
   return token;
 }
+
+
+// Inference settings
+
+/* Everything that can be set from the command line. main() parses it, and
+ * only the top-level drivers (generate / chat / sample) take it; everything
+ * below them takes the individual fields it needs. */
+typedef struct
+{
+  const char *modelfile;
+  const char *prompt;
+
+  int          seqlen;      // context length to allocate
+  int          tokens;      // tokens to generate, negative for "until eos"
+  int          topk;
+  int          chunk_size;  // prefill chunk size
+  int          threads;     // OpenMP threads
+  unsigned int seed;
+
+  float temperature;
+  float topp;
+  float rpen;
+
+  bool chatmode;
+  bool enable_mm;
+  bool use_mmap;
+  bool verbose;
+} CliArgs;
 
 /* The main sampling loop */
 void
 sample(
   // Input parameters
-  GemmaModel   *model,
-  TextBuffer   *tbuf,
-  VisionBuffer *vbuf,
-  int           seqlen,
-  int           tokens,
-  int           chunk_size,
-  float         temperature,
-  int           topk,
-  float         topp,
-  float         rpen,
-  bool          enable_mm,
-  void         *inject_ctx,
+  GemmaModel    *model,
+  TextBuffer    *tbuf,
+  VisionBuffer  *vbuf,
+  const CliArgs *args,
+  void          *inject_ctx,
   InjectData  (*inject_callback)(
     int token, GemmaModel *model, bool enable_mm, void *ctx
   ),
-  // Output parameters
-  double *prefill_elapsed,
-  int    *prefill_toks,
-  double *gen_elapsed,
-  int    *gen_toks)
+  // Performance counters, NULL means don't measure anything
+  PerfBench *perf)
 {
   TextConfig *tcfg       = model->decoder->config;
   int         vocab_size = tcfg->vocab_size;
+  int         threads    = args->threads;
 
-  double    prf_t0        = 0.0;
-  double    prf_t1        = 0.0;
-  double    gen_t0        = 0.0;
-  double    gen_t1        = 0.0;
   int       pos           = 0;
+  int       n_gen         = 0;
   int       token         = 0;
-  bool      dosample      = temperature != 0 && topk != 1;
-  bool      use_topk      = dosample && topk != 0;
-  bool      use_topp      = dosample && topp < 1.0f;
-  bool      use_rpen      = dosample && rpen > 1.0f;
+  bool      dosample      = args->temperature != 0 && args->topk != 1;
+  bool      use_topk      = dosample && args->topk != 0;
+  bool      use_topp      = dosample && args->topp < 1.0f;
+  bool      use_rpen      = dosample && args->rpen > 1.0f;
   bool     *visited       = NULL;
   floatx   *probs         = NULL;
   FloatIdx *logit_indices = NULL;
-
-  *prefill_elapsed = 0.0;
-  *prefill_toks    = 0;
-  *gen_elapsed     = 0.0;
-  *gen_toks        = 0;
 
   if (use_rpen)
   {
@@ -6292,27 +6787,27 @@ sample(
   }
 
   // `<bos>` is always the very first token of the sequence
-  prf_t0      = now_sec();
   int bos_tok = model->tokenizer->bos;
   if (forward_gemma_prefill(
-    model, tbuf, &bos_tok, 1, &pos, chunk_size, visited, false
+    model, tbuf, &bos_tok, 1, &pos, args->chunk_size, visited, false, threads,
+    perf
   ) == 1)
   {
     goto end;
   }
-  prf_t1 = now_sec();
-  *prefill_elapsed += prf_t1 - prf_t0;
-  *prefill_toks = 1;
 
-  InjectData injected = inject_callback(EOF, model, enable_mm, inject_ctx);
+  InjectData injected =
+    inject_callback(EOF, model, args->enable_mm, inject_ctx);
 
-  while (pos < seqlen && injected.type != INJECT_QUIT)
+  while (pos < args->seqlen && injected.type != INJECT_QUIT)
   {
     if (injected.type == INJECT_NONE)
     {
       // pure auto-regressive step
-      gen_t0 = now_sec();
-      if (forward_gemma_decode(model, tbuf, token, pos) == 1) goto end;
+      if (forward_gemma_decode(model, tbuf, token, pos, threads, perf) == 1)
+      {
+        goto end;
+      }
       pos++;
 
       if (is_interrupted()) break;
@@ -6325,17 +6820,16 @@ sample(
     else
     {
       // Data injection (text / image)
-      InjectData next    = inject_callback(EOF, model, enable_mm, inject_ctx);
-      bool       is_last = (next.type == INJECT_DONE);
-
-      int prev_pos = pos;
-      prf_t0       = now_sec();
+      InjectData next = inject_callback(
+        EOF, model, args->enable_mm, inject_ctx
+      );
+      bool is_last = (next.type == INJECT_DONE);
 
       if (injected.type == INJECT_TEXT)
       {
         if (forward_gemma_prefill(
-          model, tbuf, injected.tokens, injected.n_tokens, &pos, chunk_size,
-          visited, is_last
+          model, tbuf, injected.tokens, injected.n_tokens, &pos,
+          args->chunk_size, visited, is_last, threads, perf
         ) == 1)
         {
           goto end;
@@ -6344,16 +6838,12 @@ sample(
       else if (injected.type == INJECT_IMAG)
       {
         if (forward_gemma_image(
-          model, tbuf, vbuf, injected.image, &pos, is_last
+          model, tbuf, vbuf, injected.image, &pos, is_last, threads, perf
         ) == 1)
         {
           goto end;
         }
       }
-
-      prf_t1 = now_sec();
-      *prefill_elapsed += prf_t1 - prf_t0;
-      *prefill_toks += pos - prev_pos;
 
       if (is_interrupted()) break;
 
@@ -6363,23 +6853,19 @@ sample(
         continue;
       }
       // is_last: fall through to common sample
-      gen_t0 = now_sec();
     }
 
     // Common sample path (both Case A and last-injection)
     token = sample_from_logits(
-      tbuf->logits, probs, logit_indices, visited, vocab_size, temperature,
-      topk, topp, rpen
+      tbuf->logits, probs, logit_indices, visited, vocab_size,
+      args->temperature, args->topk, args->topp, args->rpen, threads, perf
     );
     if (use_rpen) visited[token] = true;
-    (*gen_toks)++;
+    n_gen++;
 
-    gen_t1 = now_sec();
-    *gen_elapsed += gen_t1 - gen_t0;
+    injected = inject_callback(token, model, args->enable_mm, inject_ctx);
 
-    injected = inject_callback(token, model, enable_mm, inject_ctx);
-
-    if (*gen_toks == tokens) break;
+    if (n_gen == args->tokens) break;
   }
 
 end:
@@ -6444,9 +6930,9 @@ typedef struct
 {
   CommandType type;
   char       *raw;
-  int         raw_len;
+  size_t      raw_len;
   char       *arg;
-  int         arg_len;
+  size_t      arg_len;
 } CommandRecord;
 
 /* */
@@ -6458,7 +6944,7 @@ typedef struct
     struct
     {
       const char *text;
-      int         text_len;
+      size_t      text_len;
     };
     CommandRecord cmd;
   };
@@ -6470,7 +6956,7 @@ struct InjectContext
 {
   int            state;
   const char    *text;
-  int            text_len;
+  size_t         text_len;
   ScanResult     event;
   CommandContext cmd_ctx;
   int           *tokens_buf;
@@ -6817,9 +7303,9 @@ scan_next_event(const char *text)
       closing = strchr(cmd, (int)'}');
       if (closing != NULL)
       {
-        int raw_len = closing + 1 - cmd;
-        int arg_off = strlen(cmd_type.name) + 2;
-        int arg_len = raw_len - arg_off - 1;
+        size_t raw_len = closing + 1 - cmd;
+        size_t arg_off = strlen(cmd_type.name) + 2;
+        size_t arg_len = raw_len - arg_off - 1;
 
         first_cmd = (CommandRecord){
           .type    = cmd_type,
@@ -6839,7 +7325,7 @@ scan_next_event(const char *text)
     return (ScanResult){
       .type      = SCAN_TEXT,
       .text      = text,
-      .text_len  = (int)len,
+      .text_len  = len,
       .remaining = (char *)(text + len),
     };
   }
@@ -6906,8 +7392,8 @@ inject_next(GemmaModel *model, InjectContext *ctx, bool enable_mm)
       }
 
       // Otherwise it's a command event
-      char *raw     = ctx->event.cmd.raw;
-      int   raw_len = ctx->event.cmd.raw_len;
+      char  *raw     = ctx->event.cmd.raw;
+      size_t raw_len = ctx->event.cmd.raw_len;
 
       // If this command should be ignored for the current mode, just
       // tokenize its raw text and emit it verbatim
@@ -6998,44 +7484,29 @@ generate_inject_callback(
 int
 generate(
   // Input parameters
-  GemmaModel   *model,
-  TextBuffer   *tbuf,
-  VisionBuffer *vbuf,
-  const char   *prompt,
-  int           seqlen,
-  int           tokens,
-  int           chunk_size,
-  float         temperature,
-  int           topk,
-  float         topp,
-  float         rpen,
-  bool          enable_mm,
-  // Output parameters
-  double *prefill_elapsed,
-  int    *prefill_toks,
-  double *gen_elapsed,
-  int    *gen_toks)
+  GemmaModel    *model,
+  TextBuffer    *tbuf,
+  VisionBuffer  *vbuf,
+  const CliArgs *args,
+  // Performance counters, NULL means don't measure anything
+  PerfBench *perf)
 {
-  fputs(prompt, stdout);
+  fputs(args->prompt, stdout);
 
   int *tokens_buf;
-  int  tokens_cap = seqlen * model->tokenizer->max_toklen;
+  int  tokens_cap = args->seqlen * model->tokenizer->max_toklen;
   if (!(tokens_buf = malloc_ckd(tokens_cap, sizeof(*tokens_buf)))) return 1;
 
   InjectContext ctx = {
     .state      = 0,
-    .text       = prompt,
-    .text_len   = strlen(prompt),
+    .text       = args->prompt,
+    .text_len   = strlen(args->prompt),
     .tokens_buf = tokens_buf,
     .tokens_len = 0,
     .tokens_cap = tokens_cap,
   };
 
-  sample(
-    model, tbuf, vbuf, seqlen, tokens, chunk_size, temperature, topk, topp,
-    rpen, enable_mm, &ctx, generate_inject_callback, prefill_elapsed,
-    prefill_toks, gen_elapsed, gen_toks
-  );
+  sample(model, tbuf, vbuf, args, &ctx, generate_inject_callback, perf);
   inject_context_cleanup(&ctx);
 
   free(tokens_buf);
@@ -7106,7 +7577,7 @@ new_turn(GemmaModel *model, bool enable_mm, ChatContext *ctx)
 
   case 1:
     jctx->text     = ctx->line_buf;
-    jctx->text_len = (int)strlen(ctx->line_buf);
+    jctx->text_len = strlen(ctx->line_buf);
     jctx->state    = 0;
 
     for (;;)
@@ -7193,29 +7664,19 @@ chat_inject_callback(int token, GemmaModel *model, bool enable_mm, void *ctx)
 int
 chat(
   // Input parameters
-  GemmaModel   *model,
-  TextBuffer   *tbuf,
-  VisionBuffer *vbuf,
-  int           seqlen,
-  int           tokens,
-  int           chunk_size,
-  float         temperature,
-  int           topk,
-  float         topp,
-  float         rpen,
-  bool          enable_mm,
-  // Output parameters
-  double *prefill_elapsed,
-  int    *prefill_toks,
-  double *gen_elapsed,
-  int    *gen_toks)
+  GemmaModel    *model,
+  TextBuffer    *tbuf,
+  VisionBuffer  *vbuf,
+  const CliArgs *args,
+  // Performance counters, NULL means don't measure anything
+  PerfBench *perf)
 {
   int  *tokens_buf = NULL;
   char *line_buf   = NULL;
 
   int max_toklen = model->tokenizer->max_toklen;
-  int tokens_cap = seqlen * max_toklen;
-  int line_cap   = seqlen * max_toklen;
+  int tokens_cap = args->seqlen * max_toklen;
+  int line_cap   = args->seqlen * max_toklen;
 
   if (
     !(tokens_buf = malloc_ckd(tokens_cap, sizeof(*tokens_buf))) ||
@@ -7235,17 +7696,112 @@ chat(
     .jctx     = &jctx,
   };
 
-  sample(
-    model, tbuf, vbuf, seqlen, tokens, chunk_size, temperature, topk, topp,
-    rpen, enable_mm, &ctx, chat_inject_callback, prefill_elapsed, prefill_toks,
-    gen_elapsed, gen_toks
-  );
+  sample(model, tbuf, vbuf, args, &ctx, chat_inject_callback, perf);
   inject_context_cleanup(&jctx);
 
 fail:
   free(tokens_buf);
   free(line_buf);
   return 1;
+}
+
+/* Pretty-print of the --verbose performance report */
+static void
+print_perf_bench(const PerfBench *perf)
+{
+  static const char *const phase_names[PERF_PHASE_COUNT] = {
+    "prefill", "decode", "vision"
+  };
+  const PerfPhaseStat *pre = &perf->total[PERF_PHASE_PREFILL];
+  const PerfPhaseStat *dec = &perf->total[PERF_PHASE_DECODE];
+
+  printf("\n============== performance ==============\n");
+
+  /* bench/bench.py parses these two lines, their format must not change */
+  if (pre->sec > 0.0)
+  {
+    printf(
+      "prefilled %d tokens in %.2f seconds (%.2f tok/s)\n", pre->toks,
+      pre->sec, pre->toks / pre->sec
+    );
+  }
+  else
+  {
+    printf("prefilled %d tokens instantly\n", pre->toks);
+  }
+
+  // Generation is the decode steps plus the sampling step after each one
+  const PerfOpStat *smp     = &perf->op[PERF_PHASE_DECODE][PERF_OP_SAMPLE];
+  double            gen_sec = dec->sec + smp->sec;
+  if (gen_sec > 0.0)
+  {
+    printf(
+      "generated %d tokens in %.2f seconds (%.2f tok/s)\n", (int)smp->cnt,
+      gen_sec, (double)smp->cnt / gen_sec
+    );
+  }
+  else
+  {
+    printf("generated %d tokens instantly\n", (int)smp->cnt);
+  }
+
+  for (int ph = 0; ph < PERF_PHASE_COUNT; ph++)
+  {
+    const PerfPhaseStat *tot = &perf->total[ph];
+    if (tot->calls == 0) continue;
+
+    if (ph == PERF_PHASE_VISION)
+    {
+      printf("\nvision: %d image(s), %.2f s\n", tot->calls, tot->sec);
+    }
+    else if (ph == PERF_PHASE_DECODE)
+    {
+      printf(
+        "\ndecode: %d steps, %.2f s, %.2f ms/step\n", tot->toks, tot->sec,
+        tot->sec * 1e3 / (double)tot->toks
+      );
+    }
+    else if (tot->toks > 0)
+    {
+      printf(
+        "\n%s: %d tokens, %.2f s, %.2f ms/token\n", phase_names[ph], tot->toks,
+        tot->sec, tot->sec * 1e3 / (double)tot->toks
+      );
+    }
+    else
+    {
+      printf("\n%s: %d calls, %.2f s\n", phase_names[ph], tot->calls, tot->sec);
+    }
+
+    /* Shares are relative to the time recorded in this phase, not to its wall
+     * time: a kernel that runs on 8 threads at once is timed 8 times, so the
+     * column would add up to more than 100% otherwise. */
+    double sum = 0.0;
+    for (int o = 0; o < PERF_OP_COUNT; o++)
+    {
+      sum += perf->op[ph][o].sec;
+    }
+
+    printf(
+      "  %-18s %8s %10s %9s %7s\n", "function", "calls", "total ms",
+      "avg us", "share"
+    );
+    printf("  ------------------ -------- ---------- --------- -------\n");
+
+    for (int o = 0; o < PERF_OP_COUNT; o++)
+    {
+      const PerfOpStat *st = &perf->op[ph][o];
+      if (st->cnt == 0) continue;
+
+      printf(
+        "  %-18s %8ld %10.2f %9.2f %6.1f%%\n", g_perf_op_names[o], st->cnt,
+        st->sec * 1e3, st->sec * 1e6 / (double)st->cnt,
+        sum > 0.0 ? 100.0 * st->sec / sum : 0.0
+      );
+    }
+    printf("  %-18s %8s %10.2f %9s %7s\n", "total", "", sum * 1e3, "", "");
+  }
+  printf("=========================================\n");
 }
 
 /* */
@@ -7536,6 +8092,69 @@ print_model_config(
   printf("=========================================\n\n");
 }
 
+
+/* */
+void
+print_cli_args(int width, const CliArgs *args)
+{
+  printf("\n========= inference arguments ===========\n");
+
+  for (uint_field *field = (uint_field[]){
+    {"seqlen"    , args->seqlen    },
+    {"tokens"    , args->tokens    },
+    {"topk"      , args->topk      },
+    {"seed"      , args->seed      },
+    {"chunk_size", args->chunk_size},
+    {"threads"   , args->threads   },
+    {0},
+  }; field->name != NULL; field++)
+    printf("  %-*s: %d\n", width, field->name, field->val);
+
+  for (float_field *field = (float_field[]){
+    {"temperature", args->temperature},
+    {"topp"       , args->topp       },
+    {"rpen"       , args->rpen       },
+    {0},
+  }; field->name != NULL; field++)
+    printf("  %-*s: %.8f\n", width, field->name, field->val);
+
+  // Print the first 16 characters of the prompt
+  printf("  %-*s: ", width, "prompt");
+  for (int i = 0; i < 16; i++)
+  {
+    char c = args->prompt[i];
+    switch (c)
+    {
+    case '\n':
+      printf("\\n");
+      i++;
+      break;
+
+    case '\t':
+      printf("\\t");
+      i++;
+      break;
+
+    default:
+      putchar(c);
+    }
+  }
+  putchar('\n');
+
+  for (bool_field *field = (bool_field[]){
+    {"chatmode" , args->chatmode },
+    {"enable_mm", args->enable_mm},
+    {"use_mmap" , args->use_mmap },
+    {"verbose"  , args->verbose  },
+    {0},
+  }; field->name != NULL; field++)
+    printf(
+      "  %-*s: %s\n", width, field->name, field->val ? "true" : "false"
+    );
+
+  printf("=========================================\n\n");
+}
+
 /* */
 void
 print_usage(void)
@@ -7558,28 +8177,30 @@ print_usage(void)
     " (default: current time)\n"
     "  --chunk <N>                set prefilling chunk size, must be >= 1"
     " (default: " TOSTRING(DEFAULT_CHUNK_SIZE) ")\n"
+    "  --threads <N>              set OpenMP thread count, must be >= 1"
+    " (default: " TOSTRING(DEFAULT_THREADS) ")\n"
     "  --temperature <F>          set temperature value, must be >= 0.0"
     " (default: " TOSTRING(DEFAULT_TEMPERATURE) ")\n"
-    "  --topp <F>                 set top-p sampling value, must be 0.0 < p <= 1.0"
+    "  --topp <F>                 "
+    "set top-p sampling value, must be 0.0 < p <= 1.0"
     " (default: " TOSTRING(DEFAULT_TOPP) ")\n"
     "  --rpen <F>                 set repetition penalty, must be >= 1.0"
     " (default: " TOSTRING(DEFAULT_RPEN) ")\n"
-    "  --prompt <S>               set input prompt, ignored if chat mode is enabled"
+    "  --prompt <S>               "
+    "set input prompt, ignored if chat mode is enabled"
     " (default: \"" DEFAULT_PROMPT "\")\n"
-    "  --threads <N>              set OpenMP thread count, must be >= 1"
-    " (default: " TOSTRING(DEFAULT_THREADS) ")\n"
     "  --chat                     enable chat mode\n"
     "  --text-only                disable multimodal capability\n"
     "  --no-mmap                  disable mmap (memory mapped file)\n"
-    "  --verbose                  print model info\n"
+    "  --verbose                  print model info and timing stats\n"
     "  --help, -?                 display this help message\n"
     "\n"
     "controls:\n"
     "  Ctrl+C                    gracefully interrupt generation and exit\n"
     "\n"
     "examples:\n"
-    "  ./gemma model.bin -l 2048 -t 0.8 --chat\n"
-    "  ./gemma model.bin -i \"Hello I'm a language model,\""
+    "  ./gemma model.bin --seqlen 2048 --temperature 0.8 --chat\n"
+    "  ./gemma model.bin --prompt \"Hello I'm a language model,\""
     " --tokens 100 --topk 50 --seed 12345\n"
     "\n"
   );
@@ -7605,25 +8226,31 @@ main(int argc, char **argv)
   set_utf8_console();
   setup_signal_handler();
 
-  unsigned int seqlen      = DEFAULT_SEQLEN;
-  unsigned int tokens      = -1;
-  unsigned int topk        = DEFAULT_TOPK;
-  unsigned int seed        = (unsigned int)time(NULL);
-  unsigned int chunk_size  = DEFAULT_CHUNK_SIZE;
-  float        temperature = DEFAULT_TEMPERATURE;
-  float        topp        = DEFAULT_TOPP;
-  float        rpen        = DEFAULT_RPEN;
-  const char  *prompt      = DEFAULT_PROMPT;
-  bool         chatmode    = false;
-  bool         enable_mm   = true;
-  bool         use_mmap    = true;
-  bool         verbose     = false;
+  CliArgs args = {
+    .modelfile   = NULL,
+    .prompt      = DEFAULT_PROMPT,
+    .seqlen      = DEFAULT_SEQLEN,
+    .tokens      = -1,
+    .topk        = DEFAULT_TOPK,
+    .chunk_size  = DEFAULT_CHUNK_SIZE,
+    .threads     = DEFAULT_THREADS,
+    .seed        = (unsigned int)time(NULL),
+    .temperature = DEFAULT_TEMPERATURE,
+    .topp        = DEFAULT_TOPP,
+    .rpen        = DEFAULT_RPEN,
+    .chatmode    = false,
+    .enable_mm   = true,
+    .use_mmap    = true,
+    .verbose     = false,
+  };
 
   GemmaModel   *model = NULL;
   TextBuffer   *tbuf  = NULL;
   VisionBuffer *vbuf  = NULL;
 
-  g_omp_threads = DEFAULT_THREADS;
+  PerfBench perf = {0};
+
+  int exco = 0;
 
   // On Windows, get UTF-8 encoded command line arguments
   char **utf8_argv = get_utf8_argv(&argc);
@@ -7636,14 +8263,17 @@ main(int argc, char **argv)
   {
     print_usage();
     log_error("model filename is not provided");
-    goto fail;
+    exco = 1; goto cleanup;
   }
 
-  char *modelfile = argv[1];
-  if (strcmp(modelfile, "--help") == 0 || strcmp(modelfile, "-?") == 0)
+  args.modelfile = argv[1];
+  if (
+    strcmp(args.modelfile, "--help") == 0 ||
+    strcmp(args.modelfile, "-?") == 0
+  )
   {
     print_usage();
-    goto end;
+    exco = 1; goto cleanup;
   }
 
   const char *val;
@@ -7655,260 +8285,180 @@ main(int argc, char **argv)
 
     if (strcmp(arg, "--seqlen") == 0)
     {
+      unsigned int n;
       val = safe_get_arg(i++, argc, argv);
-      if (!val) goto fail;
-      if (!safe_atoui(val, &seqlen))
+      if (!val) {exco = 1; goto cleanup;}
+      if (!safe_atoui(val, &n))
       {
         log_error("invalid number for --seqlen: %s", val);
-        goto fail;
+        exco = 1; goto cleanup;
       }
+      args.seqlen = (int)n;
     }
     else if (strcmp(arg, "--tokens") == 0)
     {
+      unsigned int n;
       val = safe_get_arg(i++, argc, argv);
-      if (!val) goto fail;
-      if (!safe_atoui(val, &tokens))
+      if (!val) {exco = 1; goto cleanup;}
+      if (!safe_atoui(val, &n))
       {
         log_error("invalid number for --tokens: %s", val);
-        goto fail;
+        exco = 1; goto cleanup;
       }
+      args.tokens = (int)n;
     }
     else if (strcmp(arg, "--topk") == 0)
     {
+      unsigned int n;
       val = safe_get_arg(i++, argc, argv);
-      if (!val) goto fail;
-      if (!safe_atoui(val, &topk))
+      if (!val) {exco = 1; goto cleanup;}
+      if (!safe_atoui(val, &n))
       {
         log_error("invalid number for --topk: %s", val);
-        goto fail;
+        exco = 1; goto cleanup;
       }
+      args.topk = (int)n;
     }
     else if (strcmp(arg, "--seed") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
-      if (!val) goto fail;
-      if (!safe_atoui(val, &seed))
+      if (!val) {exco = 1; goto cleanup;}
+      if (!safe_atoui(val, &args.seed))
       {
         log_error("invalid number for --seed: %s", val);
-        goto fail;
+        exco = 1; goto cleanup;
       }
     }
     else if (strcmp(arg, "--chunk") == 0)
     {
+      unsigned int n;
       val = safe_get_arg(i++, argc, argv);
-      if (!val) goto fail;
-      if (!safe_atoui(val, &chunk_size) || chunk_size == 0)
+      if (!val) {exco = 1; goto cleanup;}
+      if (!safe_atoui(val, &n) || n == 0)
       {
         log_error("invalid number for --chunk: %s", val);
-        goto fail;
+        exco = 1; goto cleanup;
       }
+      args.chunk_size = (int)n;
     }
     else if (strcmp(arg, "--temperature") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
-      if (!val) goto fail;
-      if (!safe_atof(val, &temperature) || temperature < 0.0f)
+      if (!val) {exco = 1; goto cleanup;}
+      if (!safe_atof(val, &args.temperature) || args.temperature < 0.0f)
       {
         log_error("invalid temperature: %s (must be >= 0)", val);
-        goto fail;
+        exco = 1; goto cleanup;
       }
     }
     else if (strcmp(arg, "--topp") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
-      if (!val) goto fail;
-      if (!safe_atof(val, &topp) || topp <= 0.0f || topp > 1.0f)
+      if (!val) {exco = 1; goto cleanup;}
+      if (
+        !safe_atof(val, &args.topp) || args.topp <= 0.0f ||
+        args.topp > 1.0f
+      )
       {
         log_error("invalid top-p: %s (must be 0 < p <= 1)", val);
-        goto fail;
+        exco = 1; goto cleanup;
       }
     }
     else if (strcmp(arg, "--rpen") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
-      if (!val) goto fail;
-      if (!safe_atof(val, &rpen) || rpen < 1.0f)
+      if (!val) {exco = 1; goto cleanup;}
+      if (!safe_atof(val, &args.rpen) || args.rpen < 1.0f)
       {
         log_error("invalid repetition penalty: %s (must be >= 1)", val);
-        goto fail;
+        exco = 1; goto cleanup;
       }
     }
     else if (strcmp(arg, "--prompt") == 0)
     {
       val = safe_get_arg(i++, argc, argv);
-      if (!val) goto fail;
-      prompt = val;
+      if (!val) {exco = 1; goto cleanup;}
+      args.prompt = val;
     }
     else if (strcmp(arg, "--threads") == 0)
     {
+      unsigned int n;
       val = safe_get_arg(i++, argc, argv);
-      if (!val) goto fail;
-      unsigned int n_threads;
-      if (!safe_atoui(val, &n_threads) || n_threads == 0)
+      if (!val) {exco = 1; goto cleanup;}
+      if (!safe_atoui(val, &n) || n == 0)
       {
         log_error("invalid number for --threads: %s (must be >= 1)", val);
-        goto fail;
+        exco = 1; goto cleanup;
       }
-      g_omp_threads = (int)n_threads;
+      args.threads = (int)n;
     }
     else if (strcmp(arg, "--chat") == 0)
     {
-      chatmode = true;
+      args.chatmode = true;
     }
     else if (strcmp(arg, "--text-only") == 0)
     {
-      enable_mm = false;
+      args.enable_mm = false;
     }
     else if (strcmp(arg, "--no-mmap") == 0)
     {
-      use_mmap = false;
+      args.use_mmap = false;
     }
     else if (strcmp(arg, "--verbose") == 0)
     {
-      verbose = true;
+      args.verbose = true;
     }
     else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-?") == 0)
     {
       print_usage();
-      goto end;
+      exco = 0; goto cleanup;
     }
     else
     {
       log_error("unknown option: %s", arg);
       print_usage();
-      goto fail;
+      exco = 1; goto cleanup;
     }
   }
 
-  srand(seed);
+  srand(args.seed);
 
   if (setup_gemma_model(
-    modelfile, use_mmap, enable_mm, seqlen, chunk_size, &model, &tbuf, &vbuf
+    args.modelfile, args.use_mmap, args.enable_mm, args.seqlen,
+    args.chunk_size, &model, &tbuf, &vbuf
   ) != 0)
-    goto fail;
-
-  if (verbose)
   {
-    // Print config
-    const int width = 20;
-    print_model_config(model, width, (int)seqlen, (int)chunk_size, enable_mm);
-
-    // Print command line args
-    printf("\n========= inference arguments ===========\n");
-
-    for (uint_field *field = (uint_field[]){
-      {"seqlen"    , seqlen    },
-      {"topk"      , topk      },
-      {"seed"      , seed      },
-      {"chunk_size", chunk_size},
-      {0},
-    }; field->name != NULL; field++)
-      printf("  %-*s: %d\n", width, field->name, field->val);
-    
-    for (float_field *field = (float_field[]){
-      {"temperature", temperature},
-      {"topp"       , topp       },
-      {"rpen"       , rpen       },
-      {0},
-    }; field->name != NULL; field++)
-      printf("  %-*s: %.8f\n", width, field->name, field->val);
-    
-    // Print the first 16 characters of the prompt
-    printf("  %-*s: ", width, "prompt");
-    for (int i = 0; i < 16; i++)
-    {
-      char c = prompt[i];
-      switch (c)
-      {
-      case '\n':
-        printf("\\n");
-        i++;
-        break;
-
-      case '\t':
-        printf("\\t");
-        i++;
-        break;
-
-      default:
-        putchar(c);
-      }
-    }
-    putchar('\n');
-    printf("  %-*s: %d\n", width, "threads", g_omp_threads);
-
-    for (bool_field *field = (bool_field[]){
-      {"chatmode" , chatmode },
-      {"enable_mm", enable_mm},
-      {"use_mmap" , use_mmap },
-      {"verbose"  , verbose  },
-      {0},
-    }; field->name != NULL; field++)
-      printf("  %-*s: %s\n", width, field->name, field->val ? "true" : "false");
-    
-    printf("=========================================\n\n");
+    exco = 1; goto cleanup;
   }
 
-  double prefill_elapsed = 0.0;
-  int    prefill_toks    = 0;
-  double gen_elapsed     = 0.0;
-  int    gen_toks        = 0;
-
-  if (chatmode)
+  if (args.verbose)
   {
-    if (chat(
-      model, tbuf, vbuf, (int)seqlen, (int)tokens, (int)chunk_size,
-      temperature, (int)topk, topp, rpen, enable_mm, &prefill_elapsed,
-      &prefill_toks, &gen_elapsed, &gen_toks
-    ) == 1)
-      goto fail;
+    // Print config & command line arguments
+    const int width = 20;
+    print_model_config(
+      model, width, args.seqlen, args.chunk_size, args.enable_mm
+    );
+    print_cli_args(width, &args);
+  }
+
+  // Only measure anything when the user asked for the report
+  PerfBench *bench = args.verbose ? &perf : NULL;
+
+  if (args.chatmode)
+  {
+    exco = chat(model, tbuf, vbuf, &args, bench);
   }
   else
   {
-    if (generate(
-      model, tbuf, vbuf, prompt, (int)seqlen, (int)tokens, (int)chunk_size,
-      temperature, (int)topk, topp, rpen, enable_mm, &prefill_elapsed,
-      &prefill_toks, &gen_elapsed, &gen_toks
-    ) == 1)
-      goto fail;
+    exco = generate(model, tbuf, vbuf, &args, bench);
   }
 
   printf("\n\n");
 
-  if (verbose)
+  if (args.verbose)
   {
-    // Print timing stats
-    if (prefill_elapsed > 0.0)
-    {
-      printf(
-        "prefilled %d tokens in %.2f seconds (%.2f tok/s)\n", prefill_toks,
-        prefill_elapsed, prefill_toks / prefill_elapsed
-      );
-    }
-    else
-    {
-      printf("prefilled %d tokens instantly\n", prefill_toks);
-    }
-    if (gen_elapsed > 0.0)
-    {
-      printf(
-        "generated %d tokens in %.2f seconds (%.2f tok/s)\n", gen_toks,
-        gen_elapsed, gen_toks / gen_elapsed
-      );
-    }
-    else
-    {
-      printf("generated %d tokens instantly\n", gen_toks);
-    }
+    print_perf_bench(&perf);
   }
-
-  int r;
-end:
-  r = 0;
-  goto cleanup;
-fail:
-  r = 1;
-  goto cleanup;
 
 cleanup:
   if (g_errmsg[0] != '\0')
@@ -7917,8 +8467,8 @@ cleanup:
   }
 
   free_utf8_argv(utf8_argv, argc);
-  cleanup_gemma_model(model, tbuf, vbuf, use_mmap);
-  return r;
+  cleanup_gemma_model(model, tbuf, vbuf, args.use_mmap);
+  return exco;
 }
 
 

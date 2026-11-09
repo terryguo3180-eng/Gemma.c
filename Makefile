@@ -10,7 +10,6 @@
 #   make CC=clang           # force a specific compiler
 #   make CC=cl              # force MSVC (from an MSVC developer shell)
 #   make DTYPE=BF16         # compile weights as bfloat16 instead of float32
-#   make DTYPE=FP32         # recommended default when building with MSVC
 #   make debug              # -O0 -g build for use with gdb/lldb (GCC/Clang)
 #
 # MSVC example (x64 Developer Command Prompt / vcvarsall x64):
@@ -80,14 +79,11 @@ else
 
   OPT := -O3 -ffast-math
 
-  # -march=native & -mtune=native isn't understood everywhere, so probe for
-  # it instead of hard-coding it and breaking the build on those targets.
+  # -march=native & -mtune=native isn't understood everywhere, so probe for it
   MARCH_NATIVE := $(shell $(CC) -march=native -E -x c /dev/null >/dev/null 2>&1 && echo -march=native)
   MTUNE_NATIVE := $(shell $(CC) -mtune=native -E -x c /dev/null >/dev/null 2>&1 && echo -mtune=native)
 
-  # Same story for OpenMP: not every Clang install ships libomp out of the
-  # box (notably Xcode's clang on macOS), so probe rather than assume, and
-  # fall back to a single-threaded build with a warning instead of failing.
+  # Same story for OpenMP
   OPENMP := $(shell $(CC) -fopenmp -E -x c /dev/null >/dev/null 2>&1 && echo -fopenmp)
   ifeq ($(OPENMP),)
     $(warning OpenMP not found for '$(CC)', building single-threaded.)
@@ -135,8 +131,7 @@ else
   $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $@ $(LDLIBS)
 
-  # Unoptimized build with debug symbols and no OpenMP (makes stepping through
-  # with gdb/lldb sane, -Ofast + threads turns every backtrace into soup ;D).
+  # Unoptimized build with debug symbols and no OpenMP
   debug: CFLAGS := -std=gnu11 $(WARNFLAGS) -O0 -g -fsanitize=address,undefined
   debug: LDFLAGS := -fsanitize=address,undefined
   debug: LDLIBS := -lm

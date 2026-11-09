@@ -1,3 +1,5 @@
 InlayHints:
   ParameterNames: No
   Designators: No
+CompileFlags:
+  Compiler: D:/Program Files/msys64/mingw64/bin/gcc.exe
