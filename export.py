@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Converter between Hugging Face Gemma checkpoints and the custom binary
 format used by this project.
 

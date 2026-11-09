@@ -164,7 +164,9 @@
 #  define RESTRICT restrict
 #endif
 
-// A bunch of hairy cross-platform code, unrelated to the inference engine
+// A bunch of hairy cross-platform code, unrelated to the inference engine.
+// Adapted from https://github.com/karpathy/llama2.c/blob/master/win.h and
+// https://github.com/karpathy/llama2.c/blob/master/win.c
 #if defined(_WIN32)
 #  include <io.h>
 #  include <time.h>
@@ -7699,6 +7701,10 @@ chat(
   sample(model, tbuf, vbuf, args, &ctx, chat_inject_callback, perf);
   inject_context_cleanup(&jctx);
 
+  free(tokens_buf);
+  free(line_buf);
+  return 0;
+
 fail:
   free(tokens_buf);
   free(line_buf);
@@ -8273,7 +8279,7 @@ main(int argc, char **argv)
   )
   {
     print_usage();
-    exco = 1; goto cleanup;
+    exco = 0; goto cleanup;
   }
 
   const char *val;
