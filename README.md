@@ -72,10 +72,10 @@ made without `-d`. So if you exported with `-d float16`, you must build with
 `make DTYPE=FP16`, otherwise the loader will refuse the file with
 `unsupported dtype 'f16' in model file`.
 
-On Windows, install MinGW-w64 or use MSYS2, then run `make` the same way.
-The Makefile will automatically detect `Windows_NT` (and also links a static
-binary so it doesn't need MinGW's DLLs sitting next to it :D). That said,
-on Windows you're better off inside WSL, see [Windows](#windows) for why.
+On Windows, WSL is the recommended option (see [Windows](#windows) for why). If
+you really can't use WSL, then install MinGW-w64 or use MSYS2 and run make the
+same way. The Makefile will automatically detect Windows_NT (and also links a
+static binary so it doesn't need MinGW's DLLs sitting next to it :D).
 
 If you'd rather invoke the compiler directly:
 
