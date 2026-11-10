@@ -158,21 +158,21 @@ Interactive chat:
 ./gemma gemma-3-1b-it_q.bin --chat
 ```
 
-> <hr style="height:4px; border:none; background:currentColor;">
+> <hr style="height:10px; border:none; background:currentColor;">
 > 
 > `> Hiya!`
 > 
-> <hr style="height:4px; border:none; background:currentColor;">
+> <hr style="height:10px; border:none; background:currentColor;">
 >
 > Hi there! How's your day going so far? 😊
 >
 > Is there anything you'd like to chat about or anything I can help you with?
 >
-> <hr style="height:4px; border:none; background:currentColor;">
+> <hr style="height:10px; border:none; background:currentColor;">
 > 
 > `> Why do the stars blink?`
 > 
-> <hr style="height:4px; border:none; background:currentColor;">
+> <hr style="height:10px; border:none; background:currentColor;">
 > 
 > That’s a fantastic question! It's a really interesting phenomenon!
 >
@@ -199,11 +199,11 @@ Interactive chat:
 > Do you want to learn more about the science behind it, or would you like to
   know anything else about the stars?
 >
-> <hr style="height:4px; border:none; background:currentColor;">
+> <hr style="height:10px; border:none; background:currentColor;">
 > 
 > `> Write a peom about stars`
 > 
-> <hr style="height:4px; border:none; background:currentColor;">
+> <hr style="height:10px; border:none; background:currentColor;">
 > 
 > Okay, here’s a poem about stars:
 > 
@@ -236,13 +236,13 @@ python export.py google/gemma-3-4b-it -o gemma-3-4b-it_q.bin -q
 ./gemma gemma-3-4b-it_q.bin --chat
 ```
 
-> <hr style="height:4px; border:none; background:currentColor;">
+> <hr style="height:10px; border:none; background:currentColor;">
 > 
 > <img src="assets/gemma.jpg" width="100" alt="gemma.jpg">
 > 
 > `> Describe what you see in @image{assets/gemma.jpg}`
 > 
-> <hr style="height:4px; border:none; background:currentColor;">
+> <hr style="height:10px; border:none; background:currentColor;">
 > 
 > Okay, here's a description of what I see in the image:
 > 
@@ -283,13 +283,13 @@ For very wide or tall images, `@longimage{...}` runs Gemma 3's pan & scan
 utility first, feeding the model both the full downsized image and a few
 higher-resolution crops:
 
-> <hr style="height:4px; border:none; background:currentColor;">
+> <hr style="height:10px; border:none; background:currentColor;">
 >
 > <img src="assets/gemma_wiki.jpg" width="100" alt="gemma_wiki.jpg">
 > 
 > `> Help me read the text at the top of this wiki page @longimage{assets/gemma_wiki.jpg}`
 >
-> <hr style="height:4px; border:none; background:currentColor;">
+> <hr style="height:10px; border:none; background:currentColor;">
 >
 > Okay, here’s the text from the top of the Wikipedia page on "Gemma (language
   model)":
