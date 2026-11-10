@@ -1,126 +1,4 @@
-/* Gemma 1, 2 and 3 implemented in a single file of pure C.
- *
- * This is a from-scratch inference engine for Google's Gemma family of
- * language models: Gemma 1, 2 and 3, text-only and multimodal (SigLIP vision
- * tower included), in one .c file with no dependencies beyond libc and
- * (optionally) OpenMP. It is not a wrapper around llama.cpp or ggml: the
- * transformer, the attention masks, the RoPE tables, the int8 kernels and the
- * BPE tokenizer are all written from scratch in this file. The image decoding
- * uses a minified build of stb_image and stb_image_resize2 (PNG and JPEG
- * only), embedded in this file.
- *
- * Features:
- *
- *   - Gemma 1 / 2 / 3, text-only and multimodal, single file, no deps
- *   - Hand-written GEMM/GEMV kernels (fpx and int8), packed/tiled, OpenMP
- *     across heads/rows
- *   - W8A8 quantization (per-channel weights, per-token activations) with a
- *     one-shot `-q` export flag
- *   - Hybrid sliding-window / full attention (Gemma 2/3) with a
- *     FlashAttention-style causal tiling scheme
- *   - Full SigLIP vision encoder with bidirectional image-token attention,
- *     plus a pan & scan crop utility for high-aspect-ratio images
- *   - mmap'd weight loading (falls back to a plain read on `--no-mmap`)
- *   - KV-cache streaming generation, chunked prefill
- *   - Temperature / top-k / top-p / repetition-penalty sampling
- *   - float32 / float16 / bfloat16 weights, selectable at compile time
- *   - A from-scratch BPE tokenizer, weights embedded straight into the
- *     `.bin` file by the export script
- *   - Runs on Linux, macOS, and Windows (MinGW), gcc, clang or msvc
- *   - PNG/JPEG image input via embedded stb (see Image decoding)
- *
- * Model files are a custom binary format produced by the accompanying
- * `export.py`, which converts a HuggingFace Gemma checkpoint (weights,
- * config, tokenizer vocab + BPE merges) into this inference-ready layout,
- * applying the activation rescaling (>:O) and optional W8A8 quantization.
- *
- * Build it:
- *
- *   ```bash
- *   make
- *   ```
- *
- * `make` auto-detects gcc / clang / msvc and picks safe flags for each.
- * If you'd rather invoke the compiler directly:
- *
- *   ```bash
- *   gcc   -Ofast          -march=native -mtune=native -fopenmp \
- *         gemma.c -lm -o gemma  # gcc
- *   clang -O3 -ffast-math -march=native -mtune=native -fopenmp \
- *         gemma.c -lm -o gemma  # clang
- *   ```
- *
- * Or if you are using msvc:
- *
- *   ```powershell
- *   cl /O2 /openmp:experimental /fp:fast gemma.c /link shell32.lib \
- *      /Fe:gemma.exe
- *   ```
- *
- * Weight dtype defaults to float32; override with -DDTYPE at compile time
- * (FP32 / FP16 / BF16), or `make DTYPE=BF16`:
- *
- *   ```bash
- *   gcc -Ofast -march=native -fopenmp -DDTYPE=BF16 gemma.c -lm -o gemma
- *   ```
- *
- * (This has to match the dtype the .bin file was exported with.)
- *
- * Basic usage:
- *
- *   ```bash
- *   ./gemma model.bin --prompt "Hello I'm a language model, "
- *   ```
- *
- * Interactive chat, maintaining history across turns with Gemma's own
- * <start_of_turn>/<end_of_turn> template:
- *
- *   ```bash
- *   ./gemma model.bin --chat
- *   ```
- *
- * Multimodal models take images inline via @image{...}:
- *
- *   ```bash
- *   ./gemma model.bin --prompt "Looking at @image{photo.jpg}, we can see"
- *   ```
- *
- *   ```
- *   > Describe what you see in @image{photo.jpg}.
- *   ```
- *
- * The image gets decoded, resized to the model's expected input size, run
- * through the vision encoder, and the resulting soft tokens get spliced into
- * the text sequence between <start_of_image>/<end_of_image>. Pass
- * `--text-only` to skip loading the vision tower entirely and save memory on
- * a text-only workload.
- *
- * For very wide/tall images, @longimage{...} runs Gemma 3's pan & scan crop
- * utility first, so the model gets both the full downsized image and a few
- * higher-resolution crops of it:
- *
- *   ```
- *   > What's happening at the bottom of @longimage{long_screenshot.png}?
- *   ```
- *
- * `--seqlen`, `--temperature`, `--topk`, `--topp`, `--rpen`, `--seed` and
- * friends cover the usual sampling knobs; run `--help` / `-?` for the full
- * list.
- *
- * Code layout, roughly top to bottom: cross-platform shims (mmap emulation,
- * UTF-8 console handling) -> config structs and the .bin (de)serialization ->
- * BPE tokenizer -> GEMM/GEMV kernels (fpx and int8) -> SigLIP vision forward
- * pass -> Gemma transformer forward pass (single-token decode, chunked
- * prefill, and the combined text+vision path) -> sampling -> chat template
- * + CLI + main loop -> embedded stb_image(_resize2) blob. The matmul kernels
- * in particular are written to be swappable in isolation if you want to drop
- * in something faster (BLAS, a hand-tuned SIMD kernel, whatever) without
- * touching the model code around them.
- *
- * v1.0  (11/09/2026)
- *
- * @TerryGuo (https://github.com/terryguo3180-eng | terry.guo2021@outlook.com)
- */
+/* Gemma 1, 2 and 3 + Vision tower implemented in a single file of pure C. */
 
 // Kill MSVC CRT "use *_s instead" deprecation spam on Windows (clang + cl)
 #if defined(_WIN32) && !defined(_CRT_SECURE_NO_WARNINGS)
@@ -639,9 +517,7 @@ load_image_utf8(const char *utf8_path, int *w, int *h, int *ch, int req_comp)
 #define GEMM_NC 256  // cols of B packed per outer jc block, mult of 8
 #define GEMM_KC 256  // k-length streamed per inner pc chunk
 
-// OpenMP parameters: there is no global thread count, every function that
-// parallelizes takes `threads` as a parameter
-
+// OpenMP parameters
 #if defined(__MSVC__)
 // MSVC uses OpenMP 2.0, which does not support `proc_bind`
 #  define OMP_PARA_ARGS
@@ -7723,7 +7599,7 @@ print_perf_bench(const PerfBench *perf)
 
   printf("\n============== performance ==============\n");
 
-  /* bench/bench.py parses these two lines, their format must not change */
+  // bench/bench.py parses these two lines, their format must not change
   if (pre->sec > 0.0)
   {
     printf(

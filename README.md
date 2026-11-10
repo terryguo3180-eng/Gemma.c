@@ -1,57 +1,22 @@
 # Gemma.c
 
-Gemma 1, 2 and 3 implemented in a single file of pure C.
+<div align="center">
+  <img src="assets/gemma.jpg" width="300" alt="gemma.c">
+</div>
+
+<br>
+
+Gemma 1, 2, 3 + multimodal implemented in a single file of pure C.
 
 This is a from-scratch inference engine for Google's Gemma family of language
 models: Gemma 1, 2 and 3, text-only and multimodal (SigLIP vision tower
-included), in one .c file with no dependencies beyond libc and (optionally)
-OpenMP. It is not a wrapper around llama.cpp or ggml: the transformer, the
-attention masks, the RoPE tables, the int8 kernels and the BPE tokenizer are
-all written from scratch in this file. The image decoding uses a minified
-build of stb_image and stb_image_resize2 (PNG and JPEG only), embedded in
-`gemma.c`. See [Image decoding](#image-decoding).
+included), W8A8 quantization, in one .c file with no dependencies beyond libc
+and (optionally) OpenMP. The image decoding uses a minified build of stb_image
+and stb_image_resize2 (PNG and JPEG only), embedded at the end of `gemma.c`.
+See [Image decoding](#image-decoding).
 
-## Features
- 
-- Gemma 1 / 2 / 3, including multimodal (SigLIP vision tower), single `.c`
-  file, no runtime dependencies beyond libc and (optional) OpenMP
-- Hand-written GEMM/GEMV kernels for both fpx and int8, packed and tiled,
-  parallelized across heads/rows with OpenMP
-- W8A8 quantization (per-channel weights, per-token activations), enabled
-  with a one-shot `-q` flag on the export side
-- Hybrid sliding-window / full attention (Gemma 2/3's local + global
-  layers), using a FlashAttention-style block-tiling scheme for the causal
-  mask
-- Full SigLIP vision encoder with bidirectional attention between image
-  soft tokens, plus a pan & scan crop utility for high-aspect-ratio images
-- mmap'd weight loading by default (`--no-mmap` falls back to a plain
-  read, useful on filesystems where mmap is flaky)
-- KV-cache streaming generation with chunked prefill for long prompts
-- Temperature, top-k, top-p, and repetition-penalty sampling
-- float32 / float16 / bfloat16 weights, picked at compile time
-- A from-scratch BPE tokenizer, with vocab + merges embedded directly into
-  the exported `.bin` file
-- Runs on Linux, macOS, and Windows (MinGW/MSYS2), with either gcc, clang or
-  msvc
-- PNG/JPEG image input via embedded stb (see Image decoding)
-
-## Project layout
-
-```
-.
-├── gemma.c        # The inference engine (minified stb image decoder embedded at the end of the file)
-├── Makefile       # Cross-platform build script
-├── export.py      # HuggingFace -> .bin weight exporter
-├── bench/bench.py # Benchmark harness: exports, measures, renders the tables below
-├── model.py       # Reference PyTorch implementation
-├── sample.py      # PyTorch-side sampling logic
-├── preprocess.py  # PyTorch-side image pre-processor
-└── tokenizer.py   # Reference tokenizer implementation
-```
-
-The Python files aren't needed to *run* the model — only `gemma.c` and a
-`.bin` file are. They exist to produce that `.bin` file from a real
-HuggingFace checkpoint, and serve as a side-by-side reference.
+The project started as a learning attempt to understand how LLMs work
+end-to-end, inspired by [llama2.c](https://github.com/karpathy/llama2.c).
 
 ## Quick start
  
@@ -63,19 +28,19 @@ and log in first (`huggingface-cli login`, or `hf auth login` on newer versions)
 ```bash
 pip install -r requirements.txt
  
-python export.py google/gemma-3-1b-it -o exported/gemma-3-1b-it.bin
+python export.py google/gemma-3-1b-it -o gemma-3-1b-it.bin
 ```
 
-Export an INT8-quantized version — about a quarter of the fp32 size (half of
-fp16) and roughly 3.5x faster generation, or 1.8x if you started from an fp16
-file (see the benchmark below):
+Export an INT8-quantized version, about a quarter of the fp32 size (half of
+fp16, one byte per weight) and roughly 3.5x faster generation, or 1.8x if you
+started from an fp16 file (see the benchmark below):
  
 ```bash
-python export.py google/gemma-3-1b-it -o exported/gemma-3-1b-it_q.bin -q
+python export.py google/gemma-3-1b-it -o gemma-3-1b-it_q.bin -q
 ```
 
 `export.py` arguments:
- 
+
 | Argument           | Description                                                               |
 | ------------------ | ------------------------------------------------------------------------- |
 | `modelfile`        | HuggingFace model id or a local directory                                 |
@@ -83,15 +48,15 @@ python export.py google/gemma-3-1b-it -o exported/gemma-3-1b-it_q.bin -q
 | `-d, --dtype`      | Weight precision: `float16` / `float32` / `bfloat16` (default: `float32`) |
 | `-q, --quantize`   | Enable INT8 (W8A8) quantization                                           |
 | `-c, --cache-path` | Custom HuggingFace cache directory                                        |
- 
+
 ### 2. Build
- 
+
 ```bash
 make
 ```
- 
+
 `make` auto-detects whether you're on gcc/clang/msvc and picks safe flags for
-each. If you get to choose the compiler, choose GCC — the GEMM loops vectorize
+each. If you get to choose the compiler, choose GCC since the GEMM loops vectorize
 a lot better there, and prefill / SigLIP end up several times slower with
 clang or MSVC at the same `-O` level. You can override the compiler or the
 dtype from the command line (MSVC only supports float32):
@@ -101,63 +66,298 @@ make CC=clang
 make DTYPE=FP16      # must match whatever -d you exported with, FP32 / FP16 / BF16
 make debug           # -O0 -g -fsanitize=address,undefined, single threaded
 ```
- 
+
 The default is `make` with no `DTYPE`, i.e. float32, which matches an export
-made without `-d`. If you exported with `-d float16`, build with
-`make DTYPE=FP16` — otherwise the loader will refuse the file with
+made without `-d`. So if you exported with `-d float16`, you must build with
+`make DTYPE=FP16`, otherwise the loader will refuse the file with
 `unsupported dtype 'f16' in model file`.
 
 On Windows, install MinGW-w64 or use MSYS2, then run `make` the same way.
-The Makefile detects `Windows_NT` and links a static binary so it doesn't
-need MinGW's DLLs sitting next to it. That said, on Windows you're better off
-inside WSL — see [Windows](#windows) for why.
+The Makefile will automatically detect `Windows_NT` (and also links a static
+binary so it doesn't need MinGW's DLLs sitting next to it :D). That said,
+on Windows you're better off inside WSL, see [Windows](#windows) for why.
+
+If you'd rather invoke the compiler directly:
+
+```bash
+gcc -Ofast -march=native -mtune=native -fopenmp gemma.c -lm -o gemma  # gcc
+clang -O3 -ffast-math -march=native -mtune=native -fopenmp gemma.c -lm -o gemma  # clang
+```
+
+Or if you are using MSVC (see [Windows](#windows)):
+
+```powershell
+cl /O2 /openmp:experimental /fp:fast gemma.c /link shell32.lib /Fe:gemma.exe
+```
+
+override with -DDTYPE at compile time (FP32 / FP16 / BF16):
+
+```bash
+gcc -Ofast -march=native -fopenmp -DDTYPE=BF16 gemma.c -lm -o gemma
+```
 
 ### 3. Run inference
  
-One-shot generation:
+One-shot generation, with temperature set to 1.2, top-k 50, top-p 0.8,
+repetition penalty 1.15:
  
 ```bash
-./gemma exported/gemma-3-1b-it_q.bin --prompt "Once upon a time" \
-    --temperature 1.2 --topk 50 --topp 0.8 --rpen 1.15
+./gemma gemma-3-1b-it_q.bin --prompt "Once upon a time" --temperature 1.2 --topk 50 --topp 0.8 --rpen 1.15
 ```
- 
+
+Sampled text:
+
+> Once upon a time, in a small village nestled beside a sparkling forest, lived
+  a young girl named Elara. She was known for her kindness and a peculiar
+  talent: she could understand the whispers of the trees.
+>
+> The trees spoke to her, sharing stories of the past, offering guidance on the
+  present, and sometimes even whispering warnings about what might be.  Elara
+  spent her days wandering through the forest, listening intently, her small
+  hands tracing the patterns of bark and leaves.
+>
+> One day, a travelling merchant arrived in the village. He carried with him a
+  beautiful, intricately carved wooden box. The merchant, a gruff but kind man
+  named Silas, noticed Elara’s unusual connection to the forest. He asked her
+  if she knew anything about the box.
+>
+> Intrigued, Elara explained her ability to listen to the trees. Silas,
+  skeptical at first, listened patiently as she described the way the forest
+  felt, how it responded to her touch.  He realized that perhaps the box wasn't
+  just a pretty object, but something far more significant.
+>
+> Silas revealed the box contained a single, smooth, grey stone. As soon as
+  Elara touched it, a wave of warmth flowed through her, and she understood its
+  purpose – to heal a withered grove of ancient trees, trapped in a perpetual
+  winter.
+>
+> Together, Elara and Silas ventured into the deepest part of the forest. They
+  faced treacherous terrain and dangerous creatures, but their combined
+  knowledge of the forest and Elara’s unique connection to the trees allowed
+  them to overcome every obstacle.
+>
+> Finally, they reached the heart of the withered grove. There, beneath a layer
+  of ice, lay the stone, pulsing with a faint, sad light. With gentle hands,
+  Elara placed the stone within the grove, and as it settled, the snow melted,
+  and the trees began to breathe again, their branches reaching towards the sun.
+>
+> Elara and Silas returned to the village, hailed as heroes. The villagers
+  celebrated their bravery and the magic of the forest, knowing that the
+  whispers of the trees held a powerful truth. And Elara, the girl who
+  understood the language of the woods, continued to wander, always
+  listening, always learning, forever connected to the forest's heart.
+>
+> The End.**
+
+An extra `**` at the end lol. This model was instruction fine-tuned and it
+probably got a little confused about the raw text-completion format.
+
 Interactive chat:
  
 ```bash
-./gemma exported/gemma-3-1b-it_q.bin --chat --seqlen 1024
+./gemma gemma-3-1b-it_q.bin --chat
 ```
- 
+
+> <hr style="height:4px; border:none; background:currentColor;">
+> 
+> `> Hiya!`
+> 
+> <hr style="height:4px; border:none; background:currentColor;">
+>
+> Hi there! How's your day going so far? 😊
+>
+> Is there anything you'd like to chat about or anything I can help you with?
+>
+> <hr style="height:4px; border:none; background:currentColor;">
+> 
+> `> Why do the stars blink?`
+> 
+> <hr style="height:4px; border:none; background:currentColor;">
+> 
+> That’s a fantastic question! It's a really interesting phenomenon!
+>
+> The “blink” you see in the stars is a result of a clever trick of how light
+  travels through the Earth's atmosphere. Here's the breakdown:
+>
+> * **The Light Source:** Stars are incredibly far away, so we see them as
+  tiny points of light.
+> * **Atmospheric Turbulence:** The Earth’s atmosphere is constantly moving,
+  swirling with air currents. These currents refract (bend) the starlight.
+> * **The Blink Effect:** As the starlight passes through these turbulent air
+  pockets, it’s constantly shifted and distorted. This causes a slight
+  “blurring” of the image.  The stars appear to “blink” – they briefly appear
+  to move – because their light trails are constantly being altered. It’s not
+  that the stars are actually moving, but that the light is being changed and
+  rearranged by the atmosphere.
+>
+> **Think of it like this:** Imagine looking at a winding road. If you move
+  your head, the image on the road changes. It's the same principle with light!
+>
+> It's a testament to the incredible complexity of our atmosphere and how it
+  interacts with light.
+>
+> Do you want to learn more about the science behind it, or would you like to
+  know anything else about the stars?
+>
+> <hr style="height:4px; border:none; background:currentColor;">
+> 
+> `> Write a peom about stars`
+> 
+> <hr style="height:4px; border:none; background:currentColor;">
+> 
+> Okay, here’s a poem about stars:
+> 
+> **Celestial Echoes**
+> 
+> Across the velvet, dark and deep,
+> A million diamonds softly sleep.
+> Stars ignite, a silver dust,
+> In cosmic realms, a sacred trust.
+> 
+> Each glimmer holds a distant fire,
+> A sun’s embrace, a burning desire.
+> Across the void, their light does leap,
+> Secrets whispered, silent, deep.
+> 
+> Of ancient worlds and nebulae’s grace,
+> Lost in time, a timeless space.
+> Constellations dance, a mythic show,
+> Where wonders bloom and starlight flow.
+> 
+> So gaze above, and let your soul,
+> Be drawn to stories, making whole.
+> For stars remain, a constant plea,
+> A beacon bright for you and me.
+
 Multimodal models take images inline in the prompt with `@image{...}`:
  
 ```bash
-./gemma exported/gemma-3-1b-it_q.bin --chat
-> Describe what you see in @image{photo.jpg}.
+python export.py google/gemma-3-4b-it -o gemma-3-4b-it_q.bin -q
+./gemma gemma-3-4b-it_q.bin --chat
 ```
- 
+
+> <hr style="height:4px; border:none; background:currentColor;">
+> 
+> <img src="assets/gemma.jpg" width="100" alt="gemma.jpg">
+> 
+> `> Describe what you see in @image{assets/gemma.jpg}`
+> 
+> <hr style="height:4px; border:none; background:currentColor;">
+> 
+> Okay, here's a description of what I see in the image:
+> 
+> **Central Focus:**
+> 
+> *   **Cute Diamond:** The main subject is a large, vibrant red diamond that
+  has been given a remarkably cheerful and endearing design. It has large,
+  round, black eyes that give it a cartoon-like expression and a small, happy
+  smile. The diamond is sitting on tiny, red, stubby legs, adding to the
+  playful, almost childlike appearance.
+> *   **Reflections:** The diamond has numerous reflective facets that catch
+  the light, creating a sparkling effect. Those reflections appear almost like
+  tiny rainbows, scattering light around.
+> 
+> **Background & Setting:**
+> 
+> *   **Letter 'C':** Behind the diamond is a large, white letter "C." It's
+  slightly blurred, and has a subtle glow, suggesting it’s been lit from behind.
+> *   **Color Palette:** The overall color scheme is dominated by red, white,
+  and a light, pinkish-purple/gray gradient that forms the background. The
+  lighting is a soft daylight, giving it a somewhat dreamy, polished look.
+> *   **Surface:** The diamond is sitting on a reflective, light-colored
+  surface (most likely metal or polished concrete) that casts a reflective
+  pattern beneath it, furthering the overall shiny aesthetic.
+> 
+> **Overall Impression:**
+> 
+> The image has a whimsical and playful feel, thanks to the cartoonistic design
+  of the diamond. The lighting and color choices create a vibrant and appealing
+  atmosphere. It feels like a promotional image or illustration, likely aimed
+  at attracting attention and conveying a sense of fun or value (perhaps
+  associated with the letter "C" – like in a brand name).
+> 
+> Do you want me to describe any specific aspect of the image in more detail,
+  or perhaps analyze the possible reasons for the artistic choices?
+
 For very wide or tall images, `@longimage{...}` runs Gemma 3's pan & scan
 utility first, feeding the model both the full downsized image and a few
 higher-resolution crops:
- 
-```bash
-> What's happening at the bottom of @longimage{long_screenshot.png}?
-```
+
+> <hr style="height:4px; border:none; background:currentColor;">
+>
+> <img src="assets/gemma_wiki.jpg" width="100" alt="gemma_wiki.jpg">
+> 
+> `> Help me read the text at the top of this wiki page @longimage{assets/gemma_wiki.jpg}`
+>
+> <hr style="height:4px; border:none; background:currentColor;">
+>
+> Okay, here’s the text from the top of the Wikipedia page on "Gemma (language
+  model)":
+> 
+> ---
+> 
+> Gemma is a series of source-available large language models developed by
+  Google DeepMind. It is based on similar technologies as Gemini. The first
+  version was released in February 2024, followed by Gemma 2 in June 2024,
+  Gemma 3 in March 2025, and the open weights Gemma 4 in April 2026. Variants
+  of Gemma have also been developed, such as the vision-language model
+  PaLI-Gemma and the model MedGemma for medical consultation topics.
+> 
+> **History** [edit]
+> 
+> In February 2024, Google debuted Gemma, a collection of open weight LLMs
+  that serve as a lightweight version of Gemma. The initial release came in two
+  sizes: neural networks with two and seven billion parameters respectively.
+  Multiple publications viewed this as a response to competitors such as Meta’s
+  releasing source code for their AI models, and a shift from Google’s
+  longstanding practice of keeping its AI models source code private.
+  [1][2][3][4]
+> 
+> Gemma 2 was released on June 27, 2024, [5] and Gemma 3 was released on March
+  12, 2025.[6] On April 3, 2026, Google released Gemma 4 under the free and
+  open-source Apache 2.0 license.[7]
+> 
+> **Overview** [edit]
+> 
+> Based on similar technologies of the Gemini series of models, Gemma is
+  described by Google as helping support its mission of "making AI technology
+  more widely accessible." The Gemma family has been reported to have an
+  average size of 7 billion parameters, allowing it to run on consumer
+  hardware. [8]
+> 
+> Since its release, Gemma has had over 150 million downloads, with 70,000
+  variants available on Hugging Face. [8]
+> 
+> The Gemma generation of models currently only supports English, although they
+  are working on multilingual long context open LLM’s. [8]
+> 
+> ---
+> 
+> Do you want me to read another section of the text or provide a summary of
+  the entire page?
 
 ## Windows
 
-Short version: **use WSL.** The native Windows builds work, but they leave a
-lot of throughput on the table, for two unrelated reasons.
+If you want a better performance in Windows, I would recommand to use WSL.
+The native Windows builds work, but they leave a lot of throughput on the
+table currently, for mainly two reasons:
 
-**libgomp.** A decode step is a few hundred very short `parallel for` regions
-per token. glibc's libgomp on Linux gets through those fork/join pairs in a
-couple of microseconds each; the MinGW build of libgomp that comes with MSYS2
-is roughly 30x more expensive per region. Since decode is nothing but a long
-chain of those regions, the overhead ends up being the whole story — the same
-source, built the same way, decodes about 1.7x faster under WSL in our tests.
+**libgomp**
+
+So a decode step contains a few hundred `parallel for` regions per token.
+glibc's libgomp on Linux gets through those fork/join pairs in a couple of
+microseconds each, but my tests showed that the MinGW build of libgomp
+(MSYS2) is roughly 30x more expensive per region! Since decode is quite a long
+chain of those regions, the overhead ends up being the whole story. WSL build
+decodes about 1.7x faster than MinGW build in my tests.
+
 Fixing that from the C side would mean hand-rolling the spin/wait instead of
-using libgomp, so it's not on the list.
+using libgomp, which is not included in my current plan.
 
-**The compiler.** The other half is the GEMM, and there the ranking flips
-depending on what you measure:
+**The compiler's auto-vectorizer**
+
+The other half is the GEMM, and there the ranking flips depending on what you
+measure:
 
 | compiler | prefill / SigLIP (GEMM-heavy) | decode (GEMV-heavy) |
 | --- | --- | --- |
@@ -168,15 +368,15 @@ depending on what you measure:
 The GEMM kernels are plain C with no intrinsics yet, so the prefill number is
 basically "how well does this compiler vectorize that loop", and GCC is
 noticeably better at it than clang or MSVC. The decode ranking is the libgomp
-problem above — MSVC's `/openmp` runtime doesn't seem to charge the same
-per-region tax.
+problem above, MSVC's `/openmp` runtime doesn't seem to charge the same
+per-region tax (but still slower than WSL).
 
 So there is currently no Windows build that wins both halves: gcc gives you the
 best prefill and the worst decode, MSVC the exact opposite, clang sits in the
 middle. WSL + gcc is the only combination that's good at both, which is also
 what every number in the [benchmark](#benchmark) was measured with. One more
-reason not to reach for MSVC: it has no `_Float16` / `__bf16`, so fp16 and bf16
-weights are a gcc/clang affair on Windows anyway.
+reason not to reach for MSVC is that it has no `_Float16` / `__bf16`, so fp16
+and bf16 weights are a gcc/clang affair on Windows anyway.
 
 ## Usage
  
@@ -203,12 +403,12 @@ weights are a gcc/clang affair on Windows anyway.
 | `--topp <F>`        | Set top-p sampling value, must be 0.0 < p <= 1.0  | 1.0                   |
 | `--rpen <F>`        | Set repetition penalty, must be >= 1.0            | 1.0                   |
 | `--prompt <S>`      | Set input prompt, ignored if chat mode is enabled | "Once upon a time"    |
-| `--threads <N>`     | Set OpenMP thread count, must be >= 1             | 8                     |      
-| `--chat`            | Enable chat mode                                  | —                     |
-| `--text-only`       | Disable multimodal capability                     | —                     |
-| `--no-mmap`         | Disable mmap (memory mapped file)                 | —                     |
-| `--verbose`         | Print model info and the perf report              | —                     |
-| `--help`, `-?`      | Display this help message                         | —                     |
+| `--threads <N>`     | Set OpenMP thread count, must be >= 1             | 8                     |
+| `--chat`            | Enable chat mode                                  | -                     |
+| `--text-only`       | Disable multimodal capability                     | -                     |
+| `--no-mmap`         | Disable mmap (memory mapped file)                 | -                     |
+| `--verbose`         | Print model info and the perf report              | -                     |
+| `--help`, `-?`      | Display this help message                         | -                     |
 
 `--threads` defaults to 8, which is a safe middle ground on most machines; set
 it to your physical core count if you're chasing numbers.
@@ -224,17 +424,17 @@ it to your physical core count if you're chasing numbers.
 `--verbose` prints the model configuration and the inference arguments up
 front, and a performance report when generation finishes:
 
-* wall time per phase — prompt ingestion (prefill), token generation
+- wall time per phase: prompt ingestion (prefill), token generation
   (decode), and image ingestion (vision, multimodal models only)
-* for each instrumented function — `rmsnorm`, `layernorm`, `quantize_act`,
+- for each instrumented function (`rmsnorm`, `layernorm`, `quantize_act`,
   `gemv_fpx`, `gemv_int8`, `gemm_fpx`, `softmax`, `gelu`, `rope`,
-  `sample_from_logits`, ... — the call count, total time, average per call,
+  `sample_from_logits`, ...): the call count, total time, average per call,
   and its share of the phase
 
 One caveat on the "share" column: it's relative to the sum of the instrumented
 functions, not to the wall clock. Kernels that run inside an OpenMP region are
 timed once per thread, so their totals add up to more than the wall time by
-roughly the thread count — which is exactly the number you want when you're
+roughly the thread count, which is exactly the number you want when you're
 looking for where the CPU time goes.
 
 ### Examples
@@ -263,23 +463,21 @@ stb_image is not designed as a hardened parser, so only load images you trust.
 ## Models and memory
 
 Sizes are what `export.py` actually writes out. The same checkpoint comes in
-three very different sizes — int8 is a quarter of fp32, fp16/bf16 is half —
+three very different sizes (int8 is a quarter of fp32, fp16/bf16 is half)
 which is the main thing to know before picking a dtype:
 
 | Model | Params | fp32 | fp16 / bf16 | int8 (`-q`) | Status |
 |---|---:|---:|---:|---:|---|
-| gemma-3-270m / -it | 268M | 1.1 GB | 0.54 GB | 0.28 GB | benchmarked |
-| gemma-3-1b / -it / -pt | 1.0B | 4.0 GB | 2.0 GB | 1.0 GB | benchmarked |
+| gemma-3-270m | 268M | 1.1 GB | 0.54 GB | 0.28 GB | benchmarked |
+| gemma-3-1b | 1.0B | 4.0 GB | 2.0 GB | 1.0 GB | benchmarked |
 | gemma-2-2b | 2.6B | 10.5 GB | 5.2 GB | 2.6 GB | benchmarked |
 | gemma-3-4b-it | 4.3B | 17.2 GB | 8.6 GB | 4.3 GB | benchmarked |
-| gemma-1-7b-it | 8.5B | ~34 GB | 17 GB | — | fp16 works, `-q` doesn't |
+| gemma-1-7b-it | 8.5B | ~34 GB | 17 GB | - | fp16 works, `-q` doesn't |
 | gemma-3-12b-it | 12.2B | ~48 GB | ~24 GB | 12 GB | int8 benchmarked |
-
-(`~` marks a size we didn't actually export; all the others are measured.)
 
 At runtime you need the weights plus the KV cache (printed by `--verbose`) plus
 the prefill attention buffer, which is roughly `chunk × n_heads × seqlen`
-floats — so a 12B model at `--seqlen 4096 --chunk 4096` wants about a gigabyte
+floats, so a 12B model at `--seqlen 4096 --chunk 4096` wants about a gigabyte
 on top of the file size. Everything else `export.py` can read (gemma-2-9b/27b,
 gemma-3-27b, ...) should work the same way, it just hasn't been benchmarked
 here.
@@ -298,12 +496,11 @@ Every cell: `--seqlen 2048 --threads 10 --temperature 0 --tokens 100
 * **decode tok/s** - 100 tokens after a 5-token prompt ("short ctx") or after
   the 1002-token prompt ("1k ctx")
 
-One warm-up run is thrown away, then 5 runs are measured; the first measured
-run is dropped as well (it's consistently a bit low — median -0.3%, worst case
--21%), and the rest is a median. `n` is the number of samples behind a row and
-`±%` is the spread we actually saw. The 270m and 1b rows pool their `-pt` and
-`-it` checkpoints — same configuration, different weights — which is why those
-two have twice the samples of everything else.
+Two warm-up runs are thrown away, then 5 runs are measured, and the rest is a
+median. `n` is the number of samples behind a row and `±%` is the spread I
+actually saw. The 270m and 1b rows pool their `-pt` and `-it` checkpoints (same
+configuration, different weights), which is why those two have twice the
+samples of everything else.
 
 
 | model | params | dtype | quant | prefill tok/s | decode tok/s (short ctx) | decode tok/s (1k ctx) | ms/token (1k ctx) | n | ±% |
@@ -342,21 +539,21 @@ two have twice the samples of everything else.
 | gemma-3-1b | 3.61× | 1.92× | 7.71× | 1.75× | 0.93× |
 | gemma-2-2b | 3.55× | 2.09× | 8.14× | 1.63× | 0.96× |
 | gemma-3-4b | 3.60× | 2.00× | 9.41× | 1.62× | 0.90× |
-| gemma-3-12b | — | — | — | — | 0.98× |
+| gemma-3-12b | - | - | - | - | 0.98× |
 
 Ratios are decode throughput from the first table (higher = the first dtype
 wins). Two things worth noting: int8 buys 3.3-3.6x over fp32 and 1.8-2.1x over
 fp16, and for an already-quantized model FP16 is actually *slower* than FP32
-(0.90-0.98x) — the dequant math is fp32 anyway, so building with `DTYPE=FP16`
+(0.90-0.98x). The dequant math is fp32 anyway, so building with `DTYPE=FP16`
 just adds conversions.
 
-What we didn't measure: 7b int8 (the activation scalers are incompatible with
-the gemma-1 pre-norm layout, the output is garbage — see below), 7b fp32
-(~32 GB), 7b bf16 (same size as fp16 but 6x slower, skipped), 12b fp32
-(45 GB doesn't fit), 12b fp16/bf16 (23 GB, ~20 min per run), 12b bf16 int8.
+What I didn't measure: 7b int8 (the activation scalers are incompatible with
+the gemma-1 pre-norm layout, the output is garbage), 7b fp32 (~32 GB), 7b bf16
+(same size as fp16 but 6x slower), 12b fp32 (45 GB doesn't fit), 12b fp16/bf16
+(23 GB, ~20 min per run), 12b bf16 int8.
 
-One more caveat: bf16 runs in software on this CPU (no AVX512-BF16), every
-`bf16 <-> float` conversion becomes a libgcc call, which is where the 6-40x
+One more caveat: bf16 runs in software on this CPU (no AVX512-BF16), so every
+`bf16 <-> float` conversion becomes a big libgcc call, which is where the 6-40x
 gap comes from. On a machine with AVX512-BF16 the bf16 column would look very
 different.
 <!-- BENCH:END -->
@@ -373,43 +570,31 @@ interrupted overnight run just continues where it stopped.
 ```bash
 # exports need torch, the numbers want WSL: point --export-python at the venv
 python3 bench/bench.py run --dry-run            # what would be measured
-python3 bench/bench.py run \
-    --export-python /mnt/d/repo/venv/Scripts/python.exe
+python3 bench/bench.py run --export-python /mnt/d/repo/venv/Scripts/python.exe
 
 python3 bench/bench.py render --update-readme   # rewrite the block above
 ```
 
-Worth knowing:
+Worth knowing that this scipt is AI-generated :D See [`bench.py`](bench/bench.py)
+for more details on how to use it.
 
-* one model file is alive at a time — each `.bin` is deleted right after it has
-  been measured (`--keep-bins` keeps them, at the cost of a lot of disk)
-* configs that would need more RAM than the machine has are recorded as skipped
-  (`--max-model-gb`, default 26)
-* `--only <regex>`, `--dtypes`, `--quant` and `--runs` narrow the sweep down;
-  `--extra-runs` controls the extra rounds that kick in when a config comes out
-  noisy
-* the long prompt lives in `prompt1000toks.txt`, which is gitignored — any
-  ~1000 token block of text works, e.g.
-  `python -c "print(open('README.md').read()[:4000])" > prompt1000toks.txt`
-* `bench.py chunk --model gemma-3-1b-it` reproduces the chunk-size sweep the
-  intro above refers to
+## Project layout
 
-### What's still slow
+```
+.
+├── gemma.c        # The inference engine (minified stb image decoder embedded at the end of the file)
+├── Makefile       # Cross-platform build script
+├── export.py      # HuggingFace -> .bin weight exporter
+├── bench/bench.py # Benchmark harness: exports, measures, renders the table
+├── model.py       # Reference PyTorch implementation
+├── sample.py      # PyTorch-side sampling logic
+├── preprocess.py  # PyTorch-side image pre-processor
+└── tokenizer.py   # Reference tokenizer implementation
+```
 
-Ideas that haven't been done yet, roughly in order of how much we'd expect
-them to help:
-
-* The GEMMs re-pack the weight matrix on every call, so prefill reads the
-  weights twice (once to pack, once to multiply). Packing once at load time
-  should be a solid win.
-* A decode step is pure memory bandwidth. A prefetch-friendly layout and
-  non-temporal loads for the weight stream would probably matter more than any
-  arithmetic change.
-* The logits projection is ~20-25% of a decode step and materialises the whole
-  vocabulary every token. For greedy decoding the argmax could be fused into
-  the last GEMV instead.
-* One token enters ~160 OpenMP regions; wrapping the layer loop in a single
-  region would remove a few hundred fork/join pairs per token.
+Please note that the Python files aren't needed to *run* the model, only
+`gemma.c` and a `.bin` file are. They exist to produce that `.bin` file from a
+real HuggingFace checkpoint, and serve as a side-by-side reference.
 
 
 ## Known limitations
