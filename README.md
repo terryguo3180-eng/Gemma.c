@@ -600,7 +600,7 @@ real HuggingFace checkpoint, and serve as a side-by-side reference.
 ## Known limitations
 
 - **One request at a time.** No batching, no continuous batching, no
-  prompt/prefix cache — every run re-prefills from scratch.
+  prompt/prefix cache, every run re-prefills from scratch.
 - **`--seqlen` is fixed at load.** The KV cache is allocated up front and the
   prefill attention buffer is roughly `chunk × n_heads × seqlen` floats, so
   memory follows the flags, not what the conversation actually uses.
@@ -624,7 +624,7 @@ real HuggingFace checkpoint, and serve as a side-by-side reference.
   level that out; see [Windows](#windows).
 - **Native Windows builds lose to WSL.** MinGW's libgomp makes decode ~1.7x
   slower than Linux, and no single Windows compiler wins both prefill and
-  decode — details in [Windows](#windows).
+  decode, details in [Windows](#windows).
 - CPU only. No GPU, no distributed anything.
 
 ## Roadmap
@@ -653,7 +653,7 @@ real HuggingFace checkpoint, and serve as a side-by-side reference.
 
 ## License
 
-MIT, for the code in this repository — see [LICENSE](LICENSE). The embedded stb
+MIT, for the code in this repository, see [LICENSE](LICENSE). The embedded stb
 code is public domain / MIT under its own terms. Model weights are not covered
 by this license; they are subject to Google's
 [Gemma Terms of Use](https://ai.google.dev/gemma/terms).
