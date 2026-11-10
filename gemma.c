@@ -568,12 +568,27 @@ load_image_utf8(const char *utf8_path, int *w, int *h, int *ch, int req_comp)
 #  error "unsupported DTYPE"
 #endif
 
+/* MSVC has the AVX2/FMA intrinsics but does not define __FMA__. */
+#if defined(__AVX2__) && (defined(__FMA__) || defined(_MSC_VER))
+#  define GEMMA_GEMM_AVX2 1
+#endif
+
+/* AVX-VNNI-INT8 (vpdpbssd): signed bytes x signed bytes -> int32. */
+#if defined(__AVXVNNIINT8__)
+#  define GEMMA_GEMM_VNNI8 1
+#endif
+
 #if defined(__F16C__) && defined(__AVX2__) && defined(__FMA__) && \
     (DTYPE == FP16)
 
 #  define GEMMA_F16C 1
-#  include <immintrin.h>
+#endif
 
+#if defined(GEMMA_F16C) || defined(GEMMA_GEMM_AVX2)
+#  include <immintrin.h>
+#endif
+
+#if defined(GEMMA_F16C)
 /* dot product of two fp16 vectors with a float accumulator, using the F16C
  * hardware conversion (vcvtph2ps) and FMA. */
 static inline float
@@ -670,7 +685,7 @@ min(int a, int b)
 
 // Error logger
 
-_Thread_local static char g_errmsg[128] = {0};
+static _Thread_local char g_errmsg[128] = {0};
 
 /* */
 static int
@@ -3266,6 +3281,57 @@ pack_panel_fpx(
   }
 }
 
+/* Same as pack_panel_fpx, but upcasting to fp32: the micro-kernel
+ * broadcasts A from memory, which needs an actual float array. */
+static inline void
+pack_panel_f32(
+  float *RESTRICT packed, const floatx *RESTRICT src, int row_stride,
+  int rows, int k)
+{
+  for (int r = 0; r < rows; r++)
+  {
+    const floatx *row = src + r * row_stride;
+    for (int l = 0; l < k; l++)
+    {
+      packed[l * rows + r] = (float)row[l];
+    }
+  }
+}
+
+/* */
+static void
+pack_all_f32(
+  float *RESTRICT        packed_full,
+  const floatx *RESTRICT mat,
+  int                    stride,
+  int                    total_rows,
+  int                    R,
+  int                    k,
+  bool                   omp,
+  int                    threads)
+{
+  if (omp)
+  {
+    int b;
+    #pragma omp parallel for private(b) num_threads(threads) OMP_PARA_ARGS
+    for (b = 0; b < total_rows; b += R)
+    {
+      pack_panel_f32(
+        packed_full + (size_t)b * k, mat + (size_t)b * stride, stride, R, k
+      );
+    }
+  }
+  else
+  {
+    for (int b = 0; b < total_rows; b += R)
+    {
+      pack_panel_f32(
+        packed_full + (size_t)b * k, mat + (size_t)b * stride, stride, R, k
+      );
+    }
+  }
+}
+
 /**
  * Pack every R-row panel of a (total_rows x k) matrix, back to back,
  * into one contiguous buffer.
@@ -3371,75 +3437,130 @@ gemm_fpx_scalar(
   }
 }
 
+/* Scratch buffers of the GEMM cores. One instance per thread, since the
+* tile loops also run inside OpenMP parallel regions (the attention block
+* calls gemm_fpx once per head). */
+typedef struct
+{
+  floatx *fpx_pack;      // packed B panels
+  size_t  fpx_pack_cap;
+  float  *fpx_pack_a;    // packed A panels, upcast to fp32
+  size_t  fpx_pack_a_cap;
+  float  *fpx_acc;       // fp32 accumulators
+  size_t  fpx_acc_cap;
+  int8_t *i8_pack;       // packed int8 panels
+  size_t  i8_pack_cap;
+  int32_t *i8_acc;       // int32 accumulators
+  size_t   i8_acc_cap;
+} GemmScratch;
+
 // _Thread_local is critical here since these will be used in openmp threads
-_Thread_local static floatx *gemm_fpx_pack_scratch     = NULL;
-_Thread_local static size_t  gemm_fpx_pack_scratch_cap = 0;  // in floatx
+static _Thread_local GemmScratch g_gemm_scratch;
+
+/* Grows *buf to hold at least `needed` elements. */
+static bool
+gemm_scratch_reserve(void **buf, size_t *cap, size_t needed, size_t elem_size)
+{
+  if (needed > *cap)
+  {
+    void *tmp = realloc(*buf, needed * elem_size);
+    if (tmp == NULL) return false;
+    *buf = tmp;
+    *cap = needed;
+  }
+  return true;
+}
 
 /* */
 static floatx *
-gemm_fpx_pack_scratch_get(size_t needed)
+gemm_fpx_pack_get(size_t needed)
 {
-  if (needed > gemm_fpx_pack_scratch_cap)
-  {
-    floatx *tmp = realloc(gemm_fpx_pack_scratch, needed * sizeof(floatx));
-    if (tmp == NULL) return NULL;
-    gemm_fpx_pack_scratch     = tmp;
-    gemm_fpx_pack_scratch_cap = needed;
-  }
-  return gemm_fpx_pack_scratch;
+  GemmScratch *ws = &g_gemm_scratch;
+  if (!gemm_scratch_reserve(
+    (void **)&ws->fpx_pack, &ws->fpx_pack_cap, needed, sizeof(floatx)
+  ))
+    return NULL;
+  return ws->fpx_pack;
 }
 
+#if defined(GEMMA_GEMM_AVX2)
+/* Loads 8 consecutive floatx values into fp32 lanes. */
+static inline __m256
+gemm_load_fpx8(const floatx *p)
+{
+#  if DTYPE == FP32
+  return _mm256_loadu_ps((const float *)p);
+#  elif DTYPE == FP16
+  return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
+#  else
+  __m256i u = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)p));
+  return _mm256_castsi256_ps(_mm256_slli_epi32(u, 16));
+#  endif
+}
 
-/* 8x8 outer-product micro-kernel */
+/* Stores 8 fp32 lanes as floatx, rounding to nearest even. */
+static inline void
+gemm_store_fpx8(floatx *p, __m256 v)
+{
+#  if DTYPE == FP32
+  _mm256_storeu_ps((float *)p, v);
+#  elif DTYPE == FP16
+  _mm_storeu_si128((__m128i *)p, _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
+#  else
+  __m256i u   = _mm256_castps_si256(v);
+  __m256i lsb =
+    _mm256_and_si256(_mm256_srli_epi32(u, 16), _mm256_set1_epi32(1));
+  u = _mm256_srli_epi32(
+    _mm256_add_epi32(u, _mm256_add_epi32(_mm256_set1_epi32(0x7FFF), lsb)), 16
+  );
+  _mm_storeu_si128(
+    (__m128i *)p,
+    _mm_packus_epi32(_mm256_castsi256_si128(u), _mm256_extracti128_si256(u, 1))
+  );
+#  endif
+}
+#endif
+
+/* 8x8 outer-product micro-kernel, fp32 accumulation */
 static inline void
 gemm_fpx_kernel_accum(
-  floatx *RESTRICT       acc_ext,
+  float *RESTRICT        acc_ext,
   int                    acc_stride,
   const floatx *RESTRICT Bp,
-  const floatx *RESTRICT Ap,
+  const float *RESTRICT  Ap,
   int                    kc)
 {
-  float acc[64] = {0};
-
-  /*
-   * Equivilant code:
-   * ```c
-   * for (int l = 0; l < k; l++)
-   * {
-   *   const float *a = Ap + l * 8;
-   *   const float *b = Bp + l * 8;
-   * 
-   *   for (int r = 0; r < 8; r++)
-   *     for (int j = 0; j < 8; j++)
-   *       acc[r * 8 + j] += a[r] * b[j];
-   *  }
-   * ```
-   */
+#if defined(GEMMA_GEMM_AVX2)
+  __m256 acc[8];
+  for (int i = 0; i < 8; i++) acc[i] = _mm256_setzero_ps();
 
   for (int l = 0; l < kc; l++)
   {
-    /*
-     * Compute the outer product of Ap[l] and Bp[l], then accumulate into acc.
-     *
-     *    acc += a @ b.T (8x8):
-     *
-     *         b0   b1   b2   b3   b4   b5   b6   b7
-     *      +-----------------------------------------+
-     *  a0  | a0b0 a0b1 a0b2 a0b3 a0b4 a0b5 a0b6 a0b7 |
-     *  a1  | a1b0 a1b1 a1b2 a1b3 a1b4 a1b5 a1b6 a1b7 |
-     *  a2  | a2b0 a2b1 a2b2 a2b3 a2b4 a2b5 a2b6 a2b7 |
-     *  a3  | a3b0 a3b1 a3b2 a3b3 a3b4 a3b5 a3b6 a3b7 |
-     *  a4  | a4b0 a4b1 a4b2 a4b3 a4b4 a4b5 a4b6 a4b7 |
-     *  a5  | a5b0 a5b1 a5b2 a5b3 a5b4 a5b5 a5b6 a5b7 |
-     *  a6  | a6b0 a6b1 a6b2 a6b3 a6b4 a6b5 a6b6 a6b7 |
-     *  a7  | a7b0 a7b1 a7b2 a7b3 a7b4 a7b5 a7b6 a7b7 |
-     *      +-----------------------------------------+
-     */
+    __m256       b = gemm_load_fpx8(Bp + l * 8);
+    const float *a = Ap + l * 8;
 
-    float a0 = (float)Ap[l*8+0], a1 = (float)Ap[l*8+1],
-          a2 = (float)Ap[l*8+2], a3 = (float)Ap[l*8+3];
-    float a4 = (float)Ap[l*8+4], a5 = (float)Ap[l*8+5],
-          a6 = (float)Ap[l*8+6], a7 = (float)Ap[l*8+7];
+    acc[0] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 0), b, acc[0]);
+    acc[1] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 1), b, acc[1]);
+    acc[2] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 2), b, acc[2]);
+    acc[3] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 3), b, acc[3]);
+    acc[4] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 4), b, acc[4]);
+    acc[5] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 5), b, acc[5]);
+    acc[6] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 6), b, acc[6]);
+    acc[7] = _mm256_fmadd_ps(_mm256_broadcast_ss(a + 7), b, acc[7]);
+  }
+
+  for (int i = 0; i < 8; i++)
+  {
+    float *row = acc_ext + i * acc_stride;
+    _mm256_storeu_ps(row, _mm256_add_ps(_mm256_loadu_ps(row), acc[i]));
+  }
+#else
+  float acc[64] = {0};
+
+  for (int l = 0; l < kc; l++)
+  {
+    float a0 = Ap[l*8+0], a1 = Ap[l*8+1], a2 = Ap[l*8+2], a3 = Ap[l*8+3];
+    float a4 = Ap[l*8+4], a5 = Ap[l*8+5], a6 = Ap[l*8+6], a7 = Ap[l*8+7];
     float b0 = (float)Bp[l*8+0], b1 = (float)Bp[l*8+1],
           b2 = (float)Bp[l*8+2], b3 = (float)Bp[l*8+3];
     float b4 = (float)Bp[l*8+4], b5 = (float)Bp[l*8+5],
@@ -3465,44 +3586,61 @@ gemm_fpx_kernel_accum(
 
   for (int i = 0; i < 8; i++)
     for (int j = 0; j < 8; j++)
-      acc_ext[i * acc_stride + j] += (floatx)acc[i * 8 + j];
+      acc_ext[i * acc_stride + j] += acc[i * 8 + j];
+#endif
 }
 
 /* Writes an (mc x nc) fp32 accumulator block into dst. */
 static inline void
 gemm_fpx_flush_block(
-  floatx *RESTRICT       dst,
-  int                    dst_stride,
-  const floatx *RESTRICT acc,
-  int                    acc_stride,
-  int                    mc,
-  int                    nc)
+  floatx *RESTRICT      dst,
+  int                   dst_stride,
+  const float *RESTRICT acc,
+  int                   acc_stride,
+  int                   mc,
+  int                   nc)
 {
   for (int r = 0; r < mc; r++)
   {
-    for (int c = 0; c < nc; c++)
+    const float *arow = acc + r * acc_stride;
+    floatx      *drow = dst + r * dst_stride;
+#if defined(GEMMA_GEMM_AVX2)
+    int c = 0;
+    for (; c + 8 <= nc; c += 8)
     {
-      dst[r * dst_stride + c] = acc[r * acc_stride + c];
+      gemm_store_fpx8(drow + c, _mm256_loadu_ps(arow + c));
     }
+    for (; c < nc; c++) drow[c] = (floatx)arow[c];
+#else
+    for (int c = 0; c < nc; c++) drow[c] = (floatx)arow[c];
+#endif
   }
 }
 
 
-static _Thread_local floatx *gemm_fpx_acc_buf     = NULL;
-static _Thread_local size_t  gemm_fpx_acc_buf_cap = 0;
 
 /* */
-static floatx *
-gemm_fpx_acc_buf_get(size_t needed)
+static float *
+gemm_fpx_pack_a_get(size_t needed)
 {
-  if (needed > gemm_fpx_acc_buf_cap)
-  {
-    floatx *tmp = realloc(gemm_fpx_acc_buf, needed * sizeof(floatx));
-    if (tmp == NULL) return NULL;
-    gemm_fpx_acc_buf     = tmp;
-    gemm_fpx_acc_buf_cap = needed;
-  }
-  return gemm_fpx_acc_buf;
+  GemmScratch *ws = &g_gemm_scratch;
+  if (!gemm_scratch_reserve(
+    (void **)&ws->fpx_pack_a, &ws->fpx_pack_a_cap, needed, sizeof(float)
+  ))
+    return NULL;
+  return ws->fpx_pack_a;
+}
+
+/* */
+static float *
+gemm_fpx_acc_get(size_t needed)
+{
+  GemmScratch *ws = &g_gemm_scratch;
+  if (!gemm_scratch_reserve(
+    (void **)&ws->fpx_acc, &ws->fpx_acc_cap, needed, sizeof(float)
+  ))
+    return NULL;
+  return ws->fpx_acc;
 }
 
 /**
@@ -3516,7 +3654,7 @@ static void
 gemm_fpx_compute_tile(
   floatx *RESTRICT       dst,       // dst + ic*dst_stride + jc
   int                    dst_stride,
-  const floatx *RESTRICT Ap_block,  // packed A slice, mc x k
+  const float *RESTRICT Ap_block,   // packed A slice (fp32), mc x k
                                     //   (already offset by ic*k)
   const floatx *RESTRICT Bp_block,  // packed B slice, nc x k
                                     //   (already offset by jc*k)
@@ -3526,7 +3664,7 @@ gemm_fpx_compute_tile(
 {
   size_t needed = (size_t)GEMM_MC * GEMM_NC;
 
-  floatx *acc_buf = gemm_fpx_acc_buf_get(needed);
+  float *acc_buf = gemm_fpx_acc_get(needed);
   if (acc_buf == NULL)
   {
     log_error("gemm_fpx accumulator scratch allocation failed");
@@ -3537,7 +3675,7 @@ gemm_fpx_compute_tile(
   // so it must be zeroed row-by-row rather than as one flat mc*nc memset.
   for (int r = 0; r < mc; r++)
   {
-    memset(acc_buf + (size_t)r * GEMM_NC, 0, (size_t)nc * sizeof(floatx));
+    memset(acc_buf + (size_t)r * GEMM_NC, 0, (size_t)nc * sizeof(float));
   }
 
   for (int pc = 0; pc < k; pc += GEMM_KC)
@@ -3548,7 +3686,7 @@ gemm_fpx_compute_tile(
     {
       for (int ib = 0; ib < mc; ib += 8)
       {
-        const floatx *Ap_panel = Ap_block + (size_t)ib * k + pc * 8;
+        const float *Ap_panel = Ap_block + (size_t)ib * k + pc * 8;
         const floatx *Bp_panel = Bp_block + (size_t)jb * k + pc * 8;
 
         gemm_fpx_kernel_accum(
@@ -3592,63 +3730,19 @@ gemm_fpx(
 
   if (m_full > 0 && n_full > 0)
   {
-    size_t needed  = (size_t)(m_full + n_full) * k;
-    floatx *scratch = gemm_fpx_pack_scratch_get(needed);
-    if (scratch == NULL)
+    size_t  needed_b = (size_t)n_full * k;
+    floatx *Bp_full  = gemm_fpx_pack_get(needed_b);
+    float  *Ap_full  = gemm_fpx_pack_a_get((size_t)m_full * k);
+    if (Ap_full == NULL || Bp_full == NULL)
     {
       log_error("gemm packing scratch allocation failed");
       ret = 1;
       goto done;
     }
-    floatx *Ap_full = scratch;
-    floatx *Bp_full = scratch + (size_t)m_full * k;
 
-    /*
-     * For both src and mat, group every 8 rows into a panel:
-     *
-     *  src (m x k)           mat (n x k)           dst (m x n)
-     * +-------------+       +-------------+       +-------------+
-     * | 8 rows (A0) |--+    | 8 rows (B0) |--+    |             |
-     * +-------------+  |    +-------------+  |    |   ib x jb   |
-     * | 8 rows (A1) |  |    | 8 rows (B1) |  |    |    tiles    |
-     * +-------------+  |    +-------------+  |    |             |
-     * | 8 rows (A2) |  |    | 8 rows (B2) |  |    |             |
-     * +-------------+  |    +-------------+  |    |             |
-     * |    ...      |  V    |    ...      |  V    |             |
-     * +-------------+       +-------------+       +-------------+
-     * (m_full rows)         (n_full rows)
-     *
-     * Then transpose all the panels to column-major:
-     *
-     * original:
-     * Ra: [aa ab ac ad ae af ag ah ai aj ak al am an ao]
-     * Rb: [ba bb bc bd be bf bg bh bi bj bk bl bm bn bo]
-     * Rc: [ca cb cc cd ce cf cg ch ci cj ck cl cm cn co]
-     * Rd: [da db dc dd de df dg dh di dj dk dl dm dn do]
-     * Re: [ea eb ec ed ee ef eg eh ei ej ek el em en eo]
-     * Rf: [fa fb fc fd fe ff fg fh fi fj fk fl fm fn fo]
-     * Rg: [ga gb gc gd ge gf gg gh gi gj gk gl gm gn go]
-     * Rh: [ha hb hc hd he hf hg hh hi hj hk hl hm hn ho]
-     *
-     * packed:
-     * Ra: [aa ba ca da ea fa ga ha]
-     * Rb: [ab bb cb db eb fb gb hb]
-     * Rc: [ac bc cc dc ec fc gc hc]
-     * Rd: [ad bd cd dd ed fd gd hd]
-     * Re: [ae be ce de ee fe ge he]
-     * Rf: [af bf cf df ef ff gf hf]
-     * Rg: [ag bg cg dg eg fg gg hg]
-     * Rh: [ah bh ch dh eh fh gh hh]
-     * Ri: [ai bi ci di ei fi gi hi]
-     * Rj: [aj bj cj dj ej fj gj hj]
-     * Rk: [ak bk ck dk ek fk gk hk]
-     * Rl: [al bl cl dl el fl gl hl]
-     * Rm: [am bm cm dm em fm gm hm]
-     * Rn: [an bn cn dn en fn gn hn]
-     * Ro: [ao bo co do eo fo go ho]
-     */
+    // For both src and mat, group every 8 rows into a panel
 
-    pack_all_fpx(Ap_full, src, src_stride, m_full, 8, k, omp, threads);
+    pack_all_f32(Ap_full, src, src_stride, m_full, 8, k, omp, threads);
     pack_all_fpx(Bp_full, mat, mat_stride, n_full, 8, k, omp, threads);
 
     int n_ic_blocks = (m_full + GEMM_MC - 1) / GEMM_MC;
@@ -3843,21 +3937,16 @@ gemm_fpx_nn(
   PERF_TOC(perf, PERF_OP_GEMM_FPX_NN, t0);
 }
 
-static _Thread_local int8_t *gemm_i8_pack_scratch     = NULL;
-static _Thread_local size_t  gemm_i8_pack_scratch_cap = 0;
-
 /* */
 static int8_t *
-gemm_i8_pack_scratch_get(size_t needed)
+gemm_i8_pack_get(size_t needed)
 {
-  if (needed > gemm_i8_pack_scratch_cap)
-  {
-    int8_t *tmp = realloc(gemm_i8_pack_scratch, needed);
-    if (tmp == NULL) return NULL;
-    gemm_i8_pack_scratch     = tmp;
-    gemm_i8_pack_scratch_cap = needed;
-  }
-  return gemm_i8_pack_scratch;
+  GemmScratch *ws = &g_gemm_scratch;
+  if (!gemm_scratch_reserve(
+    (void **)&ws->i8_pack, &ws->i8_pack_cap, needed, sizeof(int8_t)
+  ))
+    return NULL;
+  return ws->i8_pack;
 }
 
 /* */
@@ -3891,6 +3980,26 @@ pack_all_i8(
   bool                   omp,
   int                    threads)
 {
+  (void)R;  // only used by the transposed packing
+#if defined(GEMMA_GEMM_VNNI8) || defined(GEMMA_GEMM_AVX2)
+  // k-contiguous rows: exactly what vpdpbssd consumes
+  if (omp)
+  {
+    int b;
+    #pragma omp parallel for private(b) num_threads(threads) OMP_PARA_ARGS
+    for (b = 0; b < total_rows; b++)
+    {
+      memcpy(packed_full + (size_t)b * k, mat + (size_t)b * stride, (size_t)k);
+    }
+  }
+  else
+  {
+    for (int b = 0; b < total_rows; b++)
+    {
+      memcpy(packed_full + (size_t)b * k, mat + (size_t)b * stride, (size_t)k);
+    }
+  }
+#else
   if (omp)
   {
     int b;
@@ -3911,6 +4020,7 @@ pack_all_i8(
       );
     }
   }
+#endif
 }
 
 /* */
@@ -3990,6 +4100,154 @@ gemm_int8_scalar(
   }
 }
 
+#if defined(GEMMA_GEMM_VNNI8) || defined(GEMMA_GEMM_AVX2)
+/* Horizontal sum of 8 int32 lanes. */
+static inline int32_t
+hsum_epi32(__m256i v)
+{
+  __m128i s = _mm_add_epi32(
+    _mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1)
+  );
+  s = _mm_hadd_epi32(s, s);
+  s = _mm_hadd_epi32(s, s);
+  return _mm_cvtsi128_si32(s);
+}
+
+/* Same micro-tile for plain AVX2: widen to int16 and let vpmaddwd do the
+ * pair sums. Half the throughput of vpdpbssd, but it needs nothing newer
+ * than AVX2 (so MSVC and older CPUs get a vectorized kernel too). */
+static inline void
+gemm_int8_kernel_dot_widen(
+  int32_t *RESTRICT      acc,
+  int                    acc_stride,
+  const int8_t *RESTRICT Bp,
+  const int8_t *RESTRICT Ap,
+  int                    k)
+{
+  __m256i a00 = _mm256_setzero_si256(), a01 = _mm256_setzero_si256();
+  __m256i a10 = _mm256_setzero_si256(), a11 = _mm256_setzero_si256();
+  __m256i a20 = _mm256_setzero_si256(), a21 = _mm256_setzero_si256();
+  __m256i a30 = _mm256_setzero_si256(), a31 = _mm256_setzero_si256();
+
+  const int8_t *b0 = Bp;
+  const int8_t *b1 = Bp + k;
+  const int8_t *a0 = Ap;
+  const int8_t *a1 = Ap + (size_t)k;
+  const int8_t *a2 = Ap + (size_t)2 * k;
+  const int8_t *a3 = Ap + (size_t)3 * k;
+  __m256i       va;
+
+  int l = 0;
+  for (; l + 16 <= k; l += 16)
+  {
+    __m256i vb0 =
+      _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(b0 + l)));
+    __m256i vb1 =
+      _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(b1 + l)));
+
+    va  = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(a0 + l)));
+    a00 = _mm256_add_epi32(a00, _mm256_madd_epi16(va, vb0));
+    a01 = _mm256_add_epi32(a01, _mm256_madd_epi16(va, vb1));
+    va  = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(a1 + l)));
+    a10 = _mm256_add_epi32(a10, _mm256_madd_epi16(va, vb0));
+    a11 = _mm256_add_epi32(a11, _mm256_madd_epi16(va, vb1));
+    va  = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(a2 + l)));
+    a20 = _mm256_add_epi32(a20, _mm256_madd_epi16(va, vb0));
+    a21 = _mm256_add_epi32(a21, _mm256_madd_epi16(va, vb1));
+    va  = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(a3 + l)));
+    a30 = _mm256_add_epi32(a30, _mm256_madd_epi16(va, vb0));
+    a31 = _mm256_add_epi32(a31, _mm256_madd_epi16(va, vb1));
+  }
+
+  int32_t t00 = 0, t01 = 0, t10 = 0, t11 = 0;
+  int32_t t20 = 0, t21 = 0, t30 = 0, t31 = 0;
+  for (; l < k; l++)
+  {
+    int32_t yb0 = b0[l], yb1 = b1[l];
+    int32_t ya0 = a0[l], ya1 = a1[l], ya2 = a2[l], ya3 = a3[l];
+    t00 += ya0 * yb0; t01 += ya0 * yb1;
+    t10 += ya1 * yb0; t11 += ya1 * yb1;
+    t20 += ya2 * yb0; t21 += ya2 * yb1;
+    t30 += ya3 * yb0; t31 += ya3 * yb1;
+  }
+
+  acc[0 * acc_stride + 0] = hsum_epi32(a00) + t00;
+  acc[0 * acc_stride + 1] = hsum_epi32(a01) + t01;
+  acc[1 * acc_stride + 0] = hsum_epi32(a10) + t10;
+  acc[1 * acc_stride + 1] = hsum_epi32(a11) + t11;
+  acc[2 * acc_stride + 0] = hsum_epi32(a20) + t20;
+  acc[2 * acc_stride + 1] = hsum_epi32(a21) + t21;
+  acc[3 * acc_stride + 0] = hsum_epi32(a30) + t30;
+  acc[3 * acc_stride + 1] = hsum_epi32(a31) + t31;
+}
+
+/* 4 rows x 2 columns dot-product micro-kernel over the whole k, for the
+ * k-contiguous packing: four vpdpbssd per row pair, no shuffling at all. */
+static inline void
+gemm_int8_kernel_dot(
+  int32_t *RESTRICT      acc,     // acc + ib * acc_stride + jb
+  int                    acc_stride,
+  const int8_t *RESTRICT Bp,      // 2 rows x k
+  const int8_t *RESTRICT Ap,      // 4 rows x k
+  int                    k)
+{
+  __m256i a00 = _mm256_setzero_si256(), a01 = _mm256_setzero_si256();
+  __m256i a10 = _mm256_setzero_si256(), a11 = _mm256_setzero_si256();
+  __m256i a20 = _mm256_setzero_si256(), a21 = _mm256_setzero_si256();
+  __m256i a30 = _mm256_setzero_si256(), a31 = _mm256_setzero_si256();
+
+  const int8_t *b0 = Bp;
+  const int8_t *b1 = Bp + k;
+  const int8_t *a0 = Ap;
+  const int8_t *a1 = Ap + (size_t)k;
+  const int8_t *a2 = Ap + (size_t)2 * k;
+  const int8_t *a3 = Ap + (size_t)3 * k;
+  __m256i       va;
+
+  int l = 0;
+  for (; l + 32 <= k; l += 32)
+  {
+    __m256i vb0 = _mm256_loadu_si256((const __m256i *)(b0 + l));
+    __m256i vb1 = _mm256_loadu_si256((const __m256i *)(b1 + l));
+
+    va  = _mm256_loadu_si256((const __m256i *)(a0 + l));
+    a00 = _mm256_dpbssd_epi32(a00, va, vb0);
+    a01 = _mm256_dpbssd_epi32(a01, va, vb1);
+    va  = _mm256_loadu_si256((const __m256i *)(a1 + l));
+    a10 = _mm256_dpbssd_epi32(a10, va, vb0);
+    a11 = _mm256_dpbssd_epi32(a11, va, vb1);
+    va  = _mm256_loadu_si256((const __m256i *)(a2 + l));
+    a20 = _mm256_dpbssd_epi32(a20, va, vb0);
+    a21 = _mm256_dpbssd_epi32(a21, va, vb1);
+    va  = _mm256_loadu_si256((const __m256i *)(a3 + l));
+    a30 = _mm256_dpbssd_epi32(a30, va, vb0);
+    a31 = _mm256_dpbssd_epi32(a31, va, vb1);
+  }
+
+  int32_t t00 = 0, t01 = 0, t10 = 0, t11 = 0;
+  int32_t t20 = 0, t21 = 0, t30 = 0, t31 = 0;
+  for (; l < k; l++)
+  {
+    int32_t yb0 = b0[l], yb1 = b1[l];
+    int32_t ya0 = a0[l], ya1 = a1[l], ya2 = a2[l], ya3 = a3[l];
+    t00 += ya0 * yb0; t01 += ya0 * yb1;
+    t10 += ya1 * yb0; t11 += ya1 * yb1;
+    t20 += ya2 * yb0; t21 += ya2 * yb1;
+    t30 += ya3 * yb0; t31 += ya3 * yb1;
+  }
+
+  acc[0 * acc_stride + 0] = hsum_epi32(a00) + t00;
+  acc[0 * acc_stride + 1] = hsum_epi32(a01) + t01;
+  acc[1 * acc_stride + 0] = hsum_epi32(a10) + t10;
+  acc[1 * acc_stride + 1] = hsum_epi32(a11) + t11;
+  acc[2 * acc_stride + 0] = hsum_epi32(a20) + t20;
+  acc[2 * acc_stride + 1] = hsum_epi32(a21) + t21;
+  acc[3 * acc_stride + 0] = hsum_epi32(a30) + t30;
+  acc[3 * acc_stride + 1] = hsum_epi32(a31) + t31;
+}
+
+#endif  // GEMMA_GEMM_VNNI8 || GEMMA_GEMM_AVX2
+
 /* Same int8 x int8 -> int32 outer-product micro-kernel. */
 static inline void
 gemm_int8_kernel_accum(
@@ -4064,21 +4322,16 @@ gemm_int8_flush_block(
   }
 }
 
-static _Thread_local int32_t *gemm_i8_acc_buf     = NULL;
-static _Thread_local size_t   gemm_i8_acc_buf_cap = 0;
-
 /* */
 static int32_t *
-gemm_i8_acc_buf_get(size_t needed)
+gemm_i8_acc_get(size_t needed)
 {
-  if (needed > gemm_i8_acc_buf_cap)
-  {
-    int32_t *tmp = realloc(gemm_i8_acc_buf, needed * sizeof(int32_t));
-    if (tmp == NULL) return NULL;
-    gemm_i8_acc_buf     = tmp;
-    gemm_i8_acc_buf_cap = needed;
-  }
-  return gemm_i8_acc_buf;
+  GemmScratch *ws = &g_gemm_scratch;
+  if (!gemm_scratch_reserve(
+    (void **)&ws->i8_acc, &ws->i8_acc_cap, needed, sizeof(int32_t)
+  ))
+    return NULL;
+  return ws->i8_acc;
 }
 
 /* Cache-blocked compute core for a single (ic,jc) int8 tile-block. */
@@ -4097,18 +4350,37 @@ gemm_int8_compute_tile(
 {
   size_t needed = (size_t)GEMM_MC * GEMM_NC;
 
-  int32_t *acc_buf = gemm_i8_acc_buf_get(needed);
+  int32_t *acc_buf = gemm_i8_acc_get(needed);
   if (acc_buf == NULL)
   {
     log_error("gemm_int8 accumulator scratch allocation failed");
     return;
   }
 
+#if !defined(GEMMA_GEMM_VNNI8) && !defined(GEMMA_GEMM_AVX2)
   for (int r = 0; r < mc; r++)
   {
     memset(acc_buf + (size_t)r * GEMM_NC, 0, (size_t)nc * sizeof(int32_t));
   }
+#endif
 
+#if defined(GEMMA_GEMM_VNNI8) || defined(GEMMA_GEMM_AVX2)
+  // k-contiguous: one dot product per output cell, no accumulator zeroing
+  for (int jb = 0; jb < nc; jb += 2)
+  {
+    for (int ib = 0; ib < mc; ib += 4)
+    {
+      int32_t       *cell = acc_buf + (size_t)ib * GEMM_NC + jb;
+      const int8_t  *bp   = Bp_block + (size_t)jb * k;
+      const int8_t  *ap   = Ap_block + (size_t)ib * k;
+#  if defined(GEMMA_GEMM_VNNI8)
+      gemm_int8_kernel_dot(cell, GEMM_NC, bp, ap, k);
+#  else
+      gemm_int8_kernel_dot_widen(cell, GEMM_NC, bp, ap, k);
+#  endif
+    }
+  }
+#else
   for (int pc = 0; pc < k; pc += GEMM_KC)
   {
     int kc = min(k - pc, GEMM_KC);
@@ -4126,6 +4398,7 @@ gemm_int8_compute_tile(
       }
     }
   }
+#endif
 
   gemm_int8_flush_block(
     dst, dst_stride, acc_buf, GEMM_NC, src_scales, mat_scales, mc, nc
@@ -4168,7 +4441,7 @@ gemm_int8(
   if (m_full > 0 && n_full > 0)
   {
     size_t  needed  = (size_t)(m_full + n_full) * k;
-    int8_t *scratch = gemm_i8_pack_scratch_get(needed);
+    int8_t *scratch = gemm_i8_pack_get(needed);
     if (scratch == NULL)
     {
       log_error("gemm_int8 packing scratch allocation failed");
@@ -4255,19 +4528,14 @@ done:
 static void
 gemm_free_thread_scratch(void)
 {
-  free(gemm_fpx_pack_scratch);
-  free(gemm_fpx_acc_buf);
-  free(gemm_i8_pack_scratch);
-  free(gemm_i8_acc_buf);
+  GemmScratch *ws = &g_gemm_scratch;
 
-  gemm_fpx_pack_scratch     = NULL;
-  gemm_fpx_acc_buf          = NULL;
-  gemm_i8_pack_scratch      = NULL;
-  gemm_i8_acc_buf           = NULL;
-  gemm_fpx_acc_buf_cap      = 0;
-  gemm_fpx_pack_scratch_cap = 0;
-  gemm_i8_pack_scratch_cap  = 0;
-  gemm_i8_acc_buf_cap       = 0;
+  free(ws->fpx_pack);
+  free(ws->fpx_pack_a);
+  free(ws->fpx_acc);
+  free(ws->i8_pack);
+  free(ws->i8_acc);
+  memset(ws, 0, sizeof(*ws));
 }
 
 static inline float
@@ -4306,15 +4574,15 @@ softmax(floatx *dst, const floatx *src, int dim, PerfBench *perf)
   }
 
   float expsum = 0.0f;
+  int   i;  // MSVC needs the loop variable declared outside an omp simd loop
   #pragma omp simd reduction(+:expsum)
-  for (int i = 0; i < dim; i++)
+  for (i = 0; i < dim; i++)
   {
     float val = fast_expf((float)(src[i] - max));
     dst[i]    = (floatx)val;
     expsum += val;
   }
 
-  int i;
   #pragma omp simd
   for (i = 0; i < dim; i++)
   {
@@ -4617,8 +4885,8 @@ rope_freqs(
  * Apply RoPE in place to `n` vectors of `head_dim` values laid out back to
  * back, rotating with the frequency block `freq_stride` floats apart (0 when
  * all the vectors share one block, as in a decode step). `scale` is folded
- * into the result; prefill uses it to apply the attention scale to the
- * queries here instead of touching the whole attention matrix later.
+ * into the result; prefill uses it to apply the attention scale to the queries
+ * here instead of touching the whole attention matrix later.
  */
 static void
 rope_apply(

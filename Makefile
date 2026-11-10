@@ -51,7 +51,29 @@ ifeq ($(IS_MSVC),1)
     CRTFLAG := /MD
   endif
 
-  CFLAGS  := /nologo /O2 /std:c11 /fp:fast /openmp:experimental $(CRTFLAG)
+  # MSYS2 rewrites arguments that start with "/" into paths, which breaks
+  # every cl switch; turn that off for the recipes below.
+  export MSYS2_ARG_CONV_EXCL := *
+
+  # MSVC has no -march=native, so find out whether this CPU can run AVX2 by
+  # compiling a probe and running it: pre-2014 Intel parts and pre-2017 AMD
+  # parts fault on AVX2, which make sees as a failed probe.
+  AVX2_PROBE := gemma_avx2_probe
+  $(file >$(AVX2_PROBE).c,#include <immintrin.h>)
+  $(file >>$(AVX2_PROBE).c,int main(void) { __m256i z = _mm256_setzero_si256();)
+  $(file >>$(AVX2_PROBE).c,  return _mm256_extract_epi32(_mm256_add_epi32(z, z), 0); })
+  AVX2_FLAG  := $(shell $(CC) /nologo /O1 /arch:AVX2 /Fe:$(AVX2_PROBE).exe \
+                  $(AVX2_PROBE).c > $(AVX2_PROBE).log 2>&1 && \
+                cmd /c $(AVX2_PROBE).exe && echo /arch:AVX2)
+  $(shell rm -f $(AVX2_PROBE).c $(AVX2_PROBE).exe $(AVX2_PROBE).obj \
+          $(AVX2_PROBE).log 2>/dev/null || \
+          del /Q $(AVX2_PROBE).c $(AVX2_PROBE).exe $(AVX2_PROBE).obj \
+          $(AVX2_PROBE).log 2>NUL)
+
+  # /arch:AVX2 is what enables the vectorized GEMM kernels (MSVC doesn't
+  # define __AVX2__ / __FMA__ without it)
+  CFLAGS  := /nologo /O2 /std:c11 /fp:fast $(AVX2_FLAG) \
+             /openmp:experimental $(CRTFLAG)
   CFLAGS  += /DDTYPE=$(DTYPE)
   LDFLAGS :=
   LDLIBS  := shell32.lib

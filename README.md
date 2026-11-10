@@ -19,9 +19,35 @@ The project started as a learning attempt to understand how LLMs work
 end-to-end, inspired by [llama2.c](https://github.com/karpathy/llama2.c).
 
 ## Quick start
- 
-### 1. Export a model
- 
+
+### 1. Get a model
+
+**Option A: download a pre-exported INT8 model** (no Python, no torch, no
+Hugging Face login :D). These are the fp32-exported, INT8 (`-q`) quantized
+files, so the default `make` below matches them:
+
+| Model                   | Size    | Download                                                                                            |
+| ----------------------- | ------: | --------------------------------------------------------------------------------------------------- |
+| gemma-3-270m-it         | 0.28 GB | [TerryGuo1126/gemma-3-270m-it-gemma-c](https://huggingface.co/TerryGuo1126/gemma-3-270m-it-gemma-c) |
+| gemma-3-1b-it           | 1.0 GB  | [TerryGuo1126/gemma-3-1b-it-gemma-c](https://huggingface.co/TerryGuo1126/gemma-3-1b-it-gemma-c)     |
+| gemma-3-4b-it (vision)  | 4.3 GB  | [TerryGuo1126/gemma-3-4b-it-gemma-c](https://huggingface.co/TerryGuo1126/gemma-3-4b-it-gemma-c)     |
+| gemma-3-12b-it (vision) | 12 GB   | [TerryGuo1126/gemma-3-12b-it-gemma-c](https://huggingface.co/TerryGuo1126/gemma-3-12b-it-gemma-c)   |
+
+```bash
+pip install -U huggingface_hub
+hf download TerryGuo1126/gemma-3-1b-it-gemma-c --local-dir models/gemma-3-1b-it
+# then use models/gemma-3-1b-it/gemma-3-1b-it_q.bin wherever the examples below say gemma-3-1b-it_q.bin
+```
+
+These files are unofficial, converted by [`export.py`](export.py) from Google's
+checkpoints, and are subject to the
+[Gemma Terms of Use](https://ai.google.dev/gemma/terms) and the
+[Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy), not
+to this repository's MIT license. See [License](#license).
+
+**Option B: export it yourself** Needed for other models, fp16/bf16, or if you'd
+rather not trust a converted file.
+
 Gemma weights are gated: accept the license on the model's Hugging Face page
 and log in first (`huggingface-cli login`, or `hf auth login` on newer versions).
 
@@ -55,7 +81,7 @@ python export.py google/gemma-3-1b-it -o gemma-3-1b-it_q.bin -q
 make
 ```
 
-`make` auto-detects whether you're on gcc/clang/msvc and picks safe flags for
+`make` auto-detects whether you're on GCC/Clang/MSVC and picks safe flags for
 each. If you get to choose the compiler, choose GCC since the GEMM loops vectorize
 a lot better there, and prefill / SigLIP end up several times slower with
 clang or MSVC at the same `-O` level. You can override the compiler or the
@@ -87,8 +113,11 @@ clang -O3 -ffast-math -march=native -mtune=native -fopenmp gemma.c -lm -o gemma 
 Or if you are using MSVC (see [Windows](#windows)):
 
 ```powershell
-cl /O2 /openmp:experimental /fp:fast gemma.c /link shell32.lib /Fe:gemma.exe
+cl /O2 /openmp:experimental /fp:fast /arch:AVX2 gemma.c /link shell32.lib /Fe:gemma.exe
 ```
+
+Most CPUs since 2013 supports AVX2, if your computer is old then remove
+`/arch:AVX2`, the performance will be much slower.
 
 override with -DDTYPE at compile time (FP32 / FP16 / BF16):
 
@@ -338,7 +367,7 @@ higher-resolution crops:
 
 ## Windows
 
-If you want a better performance in Windows, I would recommand to use WSL.
+If you want a better performance in Windows, I would recommend to use WSL.
 The native Windows builds work, but they leave a lot of throughput on the
 table currently, for mainly two reasons:
 
@@ -502,7 +531,6 @@ actually saw. The 270m and 1b rows pool their `-pt` and `-it` checkpoints (same
 configuration, different weights), which is why those two have twice the
 samples of everything else.
 
-
 | model | params | dtype | quant | prefill tok/s | decode tok/s (short ctx) | decode tok/s (1k ctx) | ms/token (1k ctx) | n | ±% |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|
 | gemma-3-270m | 268M | fp32 | no | 619.2 | 65.5 | 56.4 | 17.7 | 8 | 1.7 |
@@ -575,7 +603,7 @@ python3 bench/bench.py run --export-python /mnt/d/repo/venv/Scripts/python.exe
 python3 bench/bench.py render --update-readme   # rewrite the block above
 ```
 
-Worth knowing that this scipt is AI-generated :D See [`bench.py`](bench/bench.py)
+Worth knowing that this script is AI-generated :D See [`bench.py`](bench/bench.py)
 for more details on how to use it.
 
 ## Project layout
@@ -628,7 +656,7 @@ real HuggingFace checkpoint, and serve as a side-by-side reference.
 - CPU only. No GPU, no distributed anything.
 
 ## Roadmap
- 
+
 - [ ] Clean up the messy code of `export.py`
 - [ ] KV cache quantization
 - [ ] W4A8 quantization
@@ -647,13 +675,20 @@ real HuggingFace checkpoint, and serve as a side-by-side reference.
 
 ## Acknowledgements
  
-- [Google Gemma](https://ai.google.dev/gemma) official models and technical reports
+- [Google Gemma](https://ai.google.dev/gemma) official models and technical
+  reports
 - [llama2.c](https://github.com/karpathy/llama2.c) for inspiring this project
-- [stb](https://github.com/nothings/stb) by Sean Barrett, for the image decoder and resizer
+- [stb](https://github.com/nothings/stb) by Sean Barrett, for the image decoder
+  and resizer
 
 ## License
 
 MIT, for the code in this repository, see [LICENSE](LICENSE). The embedded stb
 code is public domain / MIT under its own terms. Model weights are not covered
 by this license; they are subject to Google's
-[Gemma Terms of Use](https://ai.google.dev/gemma/terms).
+[Gemma Terms of Use](https://ai.google.dev/gemma/terms) and
+[Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy). This
+includes the pre-exported files on Hugging Face linked in the Quick start: they are
+Model Derivatives of Google's Gemma 3 checkpoints (converted to this project's
+binary format and INT8-quantized), carry their own copy of the terms and a `NOTICE`
+file, and are not affiliated with or endorsed by Google.
