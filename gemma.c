@@ -509,14 +509,6 @@ load_image_utf8(const char *utf8_path, int *w, int *h, int *ch, int req_comp)
 
 // The actual inference code starts here :D
 
-// Block size of blockwise causal masking
-#define QK_BLOCK_SIZE 64
-
-// Block sizes for the m/n/k cache-blocked GEMM
-#define GEMM_MC 128  // rows of A resident per (jc, ic) tile block, mult of 8
-#define GEMM_NC 256  // cols of B packed per outer jc block, mult of 8
-#define GEMM_KC 256  // k-length streamed per inner pc chunk
-
 // OpenMP parameters
 #if defined(__MSVC__)
 // MSVC uses OpenMP 2.0, which does not support `proc_bind`
@@ -531,15 +523,84 @@ load_image_utf8(const char *utf8_path, int *w, int *h, int *ch, int req_comp)
 #  define OMP_COLLAPSE2 collapse(2)
 #endif
 
-// Prompt used in pan & scan
-// google/gemma_pytorch/blob/main/gemma/gemma3_preprocessor.py
-#define CROPPED_IMAGE_PREFIX "here is the original image"
-#define CROPPED_IMAGE_FILTER "and here are some crops to help you see better"
+/* */
+typedef struct
+{
+  int         qk_block_size;
+  int         gemm_mc;
+  int         gemm_nc;
+  int         gemm_kc;
+  const char *cropped_image_prefix;
+  const char *cropped_image_filter;
+  int         min_crop_size;
+  int         max_num_crops;
+} RuntimeConfig;
 
-// Default parameters used in pan & scan
-// google/gemma_pytorch/blob/main/gemma/siglip_vision/pan_and_scan.py
-#define MIN_CROP_SIZE 256
-#define MAX_NUM_CROPS 4
+static RuntimeConfig g_rt = {
+  .qk_block_size        = 64,   // Block size of blockwise causal masking
+  .gemm_mc              = 128,  // rows of A resident per (jc, ic) tile block,
+                                // mult of 8
+  .gemm_nc              = 256,  // cols of B packed per outer jc block,
+                                // mult of 8
+  .gemm_kc              = 256,  // k-length streamed per inner pc chunk
+  // Prompt used in pan & scan
+  // google/gemma_pytorch/blob/main/gemma/gemma3_preprocessor.py
+  .cropped_image_prefix = "here is the original image",
+  .cropped_image_filter = "and here are some crops to help you see better",
+  // Default parameters used in pan & scan
+  // google/gemma_pytorch/blob/main/gemma/siglip_vision/pan_and_scan.py
+  .min_crop_size        = 256,
+  .max_num_crops        = 4,
+};
+
+/* */
+static int
+env_int(const char *name, int def)
+{
+  const char *s = getenv(name);
+  char       *end;
+  long        v;
+
+  if (s == NULL || *s == '\0') return def;
+  v = strtol(s, &end, 10);
+  if (end == s) return def;
+  return (int)v;
+}
+
+/* */
+static const char *
+env_str(const char *name, const char *def)
+{
+  const char *s = getenv(name);
+  return (s != NULL && *s != '\0') ? s : def;
+}
+
+/* Block sizes have to stay multiples of 8 for the 8x8 GEMM tiles. */
+static int
+env_block(const char *name, int def)
+{
+  int v = env_int(name, def);
+  if (v < 8) v = 8;
+  return v / 8 * 8;
+}
+
+/* */
+static void
+setup_runtime_config(void)
+{
+  g_rt.qk_block_size = env_block("QK_BLOCK_SIZE", g_rt.qk_block_size);
+  g_rt.gemm_mc       = env_block("GEMM_MC", g_rt.gemm_mc);
+  g_rt.gemm_nc       = env_block("GEMM_NC", g_rt.gemm_nc);
+  g_rt.gemm_kc       = env_block("GEMM_KC", g_rt.gemm_kc);
+  g_rt.cropped_image_prefix = env_str(
+    "CROPPED_IMAGE_PREFIX", g_rt.cropped_image_prefix
+  );
+  g_rt.cropped_image_filter = env_str(
+    "CROPPED_IMAGE_FILTER", g_rt.cropped_image_filter
+  );
+  g_rt.min_crop_size = env_int("MIN_CROP_SIZE", g_rt.min_crop_size);
+  g_rt.max_num_crops = env_int("MAX_NUM_CROPS", g_rt.max_num_crops);
+}
 
 // Macros for different dtypes
 // TODO: dispatch dtype at runtime using the `#include __FILE__` trick
@@ -568,12 +629,12 @@ load_image_utf8(const char *utf8_path, int *w, int *h, int *ch, int req_comp)
 #  error "unsupported DTYPE"
 #endif
 
-/* MSVC has the AVX2/FMA intrinsics but does not define __FMA__. */
+// MSVC has the AVX2/FMA intrinsics but does not define __FMA__
 #if defined(__AVX2__) && (defined(__FMA__) || defined(_MSC_VER))
 #  define GEMMA_GEMM_AVX2 1
 #endif
 
-/* AVX-VNNI-INT8 (vpdpbssd): signed bytes x signed bytes -> int32. */
+// AVX-VNNI-INT8 (vpdpbssd): signed bytes x signed bytes -> int32
 #if defined(__AVXVNNIINT8__)
 #  define GEMMA_GEMM_VNNI8 1
 #endif
@@ -587,60 +648,6 @@ load_image_utf8(const char *utf8_path, int *w, int *h, int *ch, int req_comp)
 #if defined(GEMMA_F16C) || defined(GEMMA_GEMM_AVX2)
 #  include <immintrin.h>
 #endif
-
-#if defined(GEMMA_F16C)
-/* dot product of two fp16 vectors with a float accumulator, using the F16C
- * hardware conversion (vcvtph2ps) and FMA. */
-static inline float
-dot_f16c(const _Float16 *a, const _Float16 *b, int n)
-{
-  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
-  __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
-  int    j    = 0;
-  for (; j + 32 <= n; j += 32)
-  {
-    acc0 = _mm256_fmadd_ps(
-      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j     ))),
-      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j     ))), acc0
-    );
-    acc1 = _mm256_fmadd_ps(
-      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j +  8))),
-      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j +  8))), acc1
-    );
-    acc2 = _mm256_fmadd_ps(
-      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j + 16))),
-      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j + 16))), acc2
-    );
-    acc3 = _mm256_fmadd_ps(
-      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j + 24))),
-      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j + 24))), acc3
-    );
-  }
-  for (; j + 8 <= n; j += 8)
-  {
-    acc0 = _mm256_fmadd_ps(
-      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j))),
-      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j))), acc0
-    );
-  }
-  acc0 = _mm256_add_ps(
-    _mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)
-  );
-  __m128 r = _mm_add_ps(
-    _mm256_castps256_ps128(acc0), _mm256_extractf128_ps(acc0, 1)
-  );
-  r = _mm_hadd_ps(r, r);
-  r = _mm_hadd_ps(r, r);
-
-  float sum = _mm_cvtss_f32(r);
-  for (; j < n; j++)
-  {
-    sum += (float)a[j] * (float)b[j];
-  }
-  return sum;
-}
-#endif
-
 
 // no-fast-math
 #if defined(__GCC__)
@@ -1156,7 +1163,8 @@ read_tokenizer(FILE *fp, TextConfig *tcfg, bool support_mm)
   // Build merges
   if (!read_uint32_ckd(fp, &tok->n_merges)) goto fail;
 
-  if (!(tok->ranks = malloc_ckd(tok->n_merges, sizeof(*tok->ranks)))) goto fail;
+  if (!(tok->ranks = malloc_ckd(tok->n_merges, sizeof(*tok->ranks))))
+    goto fail;
 
   size_t merge_bytes = get_strarr_bytes(fp, tok->n_merges * 2);
   if (merge_bytes == (size_t)-1) goto fail;
@@ -1452,12 +1460,12 @@ typedef struct
   QTensor *w3;  // (mlp_dim, embed_dim).T
 
   // RMSNorm weights (Gemma adds 1.0 to the weight)
-  floatx *nq;  // (head_dim,)
-  floatx *nk;  // (head_dim,)
-  floatx *n1;  // (embed_dim,)
-  floatx *n2;  // (embed_dim,)
-  floatx *n3;  // (embed_dim,)
-  floatx *n4;  // (embed_dim,)
+  floatx *nq;   // (head_dim,)
+  floatx *nk;   // (head_dim,)
+  floatx *n1;   // (embed_dim,)
+  floatx *n2;   // (embed_dim,)
+  floatx *n3;   // (embed_dim,)
+  floatx *n4;   // (embed_dim,)
 } TextDecoderLayer;
 
 /* */
@@ -1501,26 +1509,26 @@ free_text_layer_wrapper(TextDecoderLayer *layer)
 typedef struct
 {
   // ViT attention weights
-  QTensor *wq;  // (hidden_dim, hidden_dim).T
-  QTensor *wk;  // (hidden_dim, hidden_dim).T
-  QTensor *wv;  // (hidden_dim, hidden_dim).T
-  QTensor *wo;  // (hidden_dim, hidden_dim).T
-  floatx  *bq;  // (hidden_dim,)
-  floatx  *bk;  // (hidden_dim,)
-  floatx  *bv;  // (hidden_dim,)
-  floatx  *bo;  // (hidden_dim,)
+  QTensor *wq;    // (hidden_dim, hidden_dim).T
+  QTensor *wk;    // (hidden_dim, hidden_dim).T
+  QTensor *wv;    // (hidden_dim, hidden_dim).T
+  QTensor *wo;    // (hidden_dim, hidden_dim).T
+  floatx  *bq;    // (hidden_dim,)
+  floatx  *bk;    // (hidden_dim,)
+  floatx  *bv;    // (hidden_dim,)
+  floatx  *bo;    // (hidden_dim,)
 
   // ViT feedforward weights
-  QTensor *w1;  // (hidden_dim, mlp_dim).T
-  QTensor *w2;  // (hidden_dim, mlp_dim).T
-  floatx  *b1;  // (mlp_dim,)
-  floatx  *b2;  // (mlp_dim,)
+  QTensor *w1;    // (hidden_dim, mlp_dim).T
+  QTensor *w2;    // (hidden_dim, mlp_dim).T
+  floatx  *b1;    // (mlp_dim,)
+  floatx  *b2;    // (mlp_dim,)
 
   // ViT layernorm weights
-  floatx *n1;    // (hidden_dim,)
-  floatx *n2;    // (hidden_dim,)
-  floatx *n1_b;  // (hidden_dim,)
-  floatx *n2_b;  // (hidden_dim,)
+  floatx  *n1;    // (hidden_dim,)
+  floatx  *n2;    // (hidden_dim,)
+  floatx  *n1_b;  // (hidden_dim,)
+  floatx  *n2_b;  // (hidden_dim,)
 } VisionEncoderLayer;
 
 /* */
@@ -2641,33 +2649,33 @@ typedef struct
   int cache_len;
 
   // Temporary quantized activations (when quant=true)
-  int8_t *x_i8;       // ([n_tokens], embed_dim,)
-  floatx *x_scales;   // ([n_tokens],)
-  int8_t *xo_i8;      // (n_heads, [n_tokens], head_dim)
-  floatx *xo_scales;  // ([n_tokens],)
-  int8_t *xg_i8;      // ([n_tokens], mlp_dim,)
-  floatx *xg_scales;  // ([n_tokens],)
+  int8_t *x_i8;          // ([n_tokens], embed_dim,)
+  floatx *x_scales;      // ([n_tokens],)
+  int8_t *xo_i8;         // (n_heads, [n_tokens], head_dim)
+  floatx *xo_scales;     // ([n_tokens],)
+  int8_t *xg_i8;         // ([n_tokens], mlp_dim,)
+  floatx *xg_scales;     // ([n_tokens],)
 
   // Pre-computed cos/sin for RoPE
   floatx *csfreqs_slid;  // ([n_tokens], head_dim / 2, 2)
   floatx *csfreqs_full;  // ([n_tokens], head_dim / 2, 2)
 
   // Residual stream
-  floatx *x;      // ([n_tokens], embed_dim,)
-  floatx *resid;  // ([n_tokens], embed_dim,)
+  floatx *x;             // ([n_tokens], embed_dim,)
+  floatx *resid;         // ([n_tokens], embed_dim,)
 
   // Attention buffers
-  floatx *xq;        // (n_heads, [n_tokens], head_dim)
-  floatx *xk;        // (n_kv_heads, [n_tokens], head_dim)
-  floatx *xv;        // (n_kv_heads, head_dim, [n_tokens])
-  floatx *xo;        // ([n_tokens], n_heads, head_dim)
-  floatx *att;       // (n_heads, [n_tokens], cache_len)
-  floatx *kv_cache;  // (n_layers, 2, n_kv_heads, cache_len, head_dim)
+  floatx *xq;            // (n_heads, [n_tokens], head_dim)
+  floatx *xk;            // (n_kv_heads, [n_tokens], head_dim)
+  floatx *xv;            // (n_kv_heads, head_dim, [n_tokens])
+  floatx *xo;            // ([n_tokens], n_heads, head_dim)
+  floatx *att;           // (n_heads, [n_tokens], cache_len)
+  floatx *kv_cache;      // (n_layers, 2, n_kv_heads, cache_len, head_dim)
 
   // MLP buffers
-  floatx *xg;      // ([n_tokens], mlp_dim,)
-  floatx *xu;      // ([n_tokens], mlp_dim,)
-  floatx *logits;  // (vocab_size,)
+  floatx *xg;            // ([n_tokens], mlp_dim,)
+  floatx *xu;            // ([n_tokens], mlp_dim,)
+  floatx *logits;        // (vocab_size,)
 } TextBuffer;
 
 /* */
@@ -3030,6 +3038,44 @@ layernorm(
   PERF_TOC(perf, PERF_OP_LAYERNORM, t0);
 }
 
+#if defined(GEMMA_GEMM_AVX2)
+/* Loads 8 consecutive floatx values into fp32 lanes. */
+static inline __m256
+gemm_load_fpx8(const floatx *p)
+{
+#  if DTYPE == FP32
+  return _mm256_loadu_ps((const float *)p);
+#  elif DTYPE == FP16
+  return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
+#  else
+  __m256i u = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)p));
+  return _mm256_castsi256_ps(_mm256_slli_epi32(u, 16));
+#  endif
+}
+
+/* Stores 8 fp32 lanes as floatx, rounding to nearest even. */
+static inline void
+gemm_store_fpx8(floatx *p, __m256 v)
+{
+#  if DTYPE == FP32
+  _mm256_storeu_ps((float *)p, v);
+#  elif DTYPE == FP16
+  _mm_storeu_si128((__m128i *)p, _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
+#  else
+  __m256i u   = _mm256_castps_si256(v);
+  __m256i lsb =
+    _mm256_and_si256(_mm256_srli_epi32(u, 16), _mm256_set1_epi32(1));
+  u = _mm256_srli_epi32(
+    _mm256_add_epi32(u, _mm256_add_epi32(_mm256_set1_epi32(0x7FFF), lsb)), 16
+  );
+  _mm_storeu_si128(
+    (__m128i *)p,
+    _mm_packus_epi32(_mm256_castsi256_si128(u), _mm256_extracti128_si256(u, 1))
+  );
+#  endif
+}
+#endif
+
 /**
  * Symmetric per-vector quantization into int8 [-127, 127]
  * Q(fpx src (dim,)) ~= int8 dst (dim,) * fpx vec_scale (1,)
@@ -3037,22 +3083,75 @@ layernorm(
 static floatx
 quantize_act(int8_t *dst, const floatx *vec, int dim, PerfBench *perf)
 {
-  double t0 = PERF_TIC(perf);
+  double t0   = PERF_TIC(perf);
+  int    d    = 0;
+  float  amax = 0.0f;
 
-  float amax = 0.0f;
-  for (int d = 0; d < dim; d++)
+#if defined(GEMMA_GEMM_AVX2)
+  {
+    const __m256 smask = _mm256_set1_ps(-0.0f);
+    __m256       vmax  = _mm256_setzero_ps();
+
+    for (; d + 8 <= dim; d += 8)
+    {
+      __m256 v = gemm_load_fpx8(vec + d);
+      vmax     = _mm256_max_ps(vmax, _mm256_andnot_ps(smask, v));
+    }
+
+    __m128 lo = _mm256_castps256_ps128(vmax);
+    __m128 hi = _mm256_extractf128_ps(vmax, 1);
+    __m128 m  = _mm_max_ps(lo, hi);
+    m         = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m         = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
+    amax      = _mm_cvtss_f32(m);
+  }
+#endif
+
+  for (; d < dim; d++)
   {
     amax = fmaxf(amax, fabsf((float)vec[d]));
   }
+
   float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
   float inv   = 1.0f / scale;
 
-  for (int d = 0; d < dim; d++)
+  d = 0;
+
+#if defined(GEMMA_GEMM_AVX2)
+  {
+    const __m256 vinv  = _mm256_set1_ps(inv);
+    const __m256 vhalf = _mm256_set1_ps(0.5f);
+    const __m256 vsign = _mm256_set1_ps(-0.0f);
+    const __m256i vmax = _mm256_set1_epi32(127);
+    const __m256i vmin = _mm256_set1_epi32(-127);
+
+    for (; d + 8 <= dim; d += 8)
+    {
+      __m256 v = _mm256_mul_ps(gemm_load_fpx8(vec + d), vinv);
+
+      // (int)(v + copysignf(0.5f, v)): truncation, same as the scalar path
+      __m256 t = _mm256_add_ps(
+        v, _mm256_or_ps(vhalf, _mm256_and_ps(v, vsign)));
+
+      __m256i q = _mm256_cvttps_epi32(t);
+      q         = _mm256_min_epi32(_mm256_max_epi32(q, vmin), vmax);
+
+      __m128i lo16 = _mm256_castsi256_si128(q);
+      __m128i hi16 = _mm256_extracti128_si256(q, 1);
+      __m128i p16  = _mm_packs_epi32(lo16, hi16);
+      __m128i p8   = _mm_packs_epi16(p16, p16);
+      _mm_storel_epi64((__m128i *)(dst + d), p8);
+    }
+  }
+#endif
+
+  for (; d < dim; d++)
   {
     float v = (float)vec[d] * inv;
     int   q = (int)(v + (v >= 0.0f ? 0.5f : -0.5f));
     dst[d]  = (int8_t)(q > 127 ? 127 : (q < -127 ? -127 : q));
   }
+
   PERF_TOC(perf, PERF_OP_QUANTIZE_ACT, t0);
   return (floatx)scale;
 }
@@ -3096,24 +3195,75 @@ quantize_acts(
   }
 }
 
+#if defined(GEMMA_F16C)
+/* dot product of two fp16 vectors with a float accumulator, using the F16C
+ * hardware conversion (vcvtph2ps) and FMA. */
+static inline floatx
+gemv_fpx_row(
+  const floatx *RESTRICT vec, const floatx *RESTRICT mat, int n, int i)
+{
+  const floatx *RESTRICT a = mat + (size_t)i * n;
+  const floatx *RESTRICT b = vec;
+
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+  int    j    = 0;
+  for (; j + 32 <= n; j += 32)
+  {
+    acc0 = _mm256_fmadd_ps(
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j     ))),
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j     ))), acc0
+    );
+    acc1 = _mm256_fmadd_ps(
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j +  8))),
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j +  8))), acc1
+    );
+    acc2 = _mm256_fmadd_ps(
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j + 16))),
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j + 16))), acc2
+    );
+    acc3 = _mm256_fmadd_ps(
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j + 24))),
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j + 24))), acc3
+    );
+  }
+  for (; j + 8 <= n; j += 8)
+  {
+    acc0 = _mm256_fmadd_ps(
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(a + j))),
+      _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(b + j))), acc0
+    );
+  }
+  acc0 = _mm256_add_ps(
+    _mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)
+  );
+  __m128 r = _mm_add_ps(
+    _mm256_castps256_ps128(acc0), _mm256_extractf128_ps(acc0, 1)
+  );
+  r = _mm_hadd_ps(r, r);
+  r = _mm_hadd_ps(r, r);
+
+  float sum = _mm_cvtss_f32(r);
+  for (; j < n; j++)
+  {
+    sum += (float)a[j] * (float)b[j];
+  }
+  return (floatx)sum;
+}
+#else
 /* */
 static inline floatx
 gemv_fpx_row(
   const floatx *RESTRICT vec, const floatx *RESTRICT mat, int n, int i)
 {
-#ifdef GEMMA_F16C
-  return (floatx)dot_f16c(
-    (const _Float16 *)(mat + (size_t)i * n), (const _Float16 *)vec, n
-  );
-#else
   float sum = 0;
   for (int j = 0; j < n; j++)
   {
     sum += (float)mat[i * n + j] * (float)vec[j];
   }
   return (floatx)sum;
-#endif
 }
+#endif
 
 /**
  * fpx matrix-vector multiply (NT)
@@ -3442,15 +3592,15 @@ gemm_fpx_scalar(
 * calls gemm_fpx once per head). */
 typedef struct
 {
-  floatx *fpx_pack;      // packed B panels
-  size_t  fpx_pack_cap;
-  float  *fpx_pack_a;    // packed A panels, upcast to fp32
-  size_t  fpx_pack_a_cap;
-  float  *fpx_acc;       // fp32 accumulators
-  size_t  fpx_acc_cap;
-  int8_t *i8_pack;       // packed int8 panels
-  size_t  i8_pack_cap;
-  int32_t *i8_acc;       // int32 accumulators
+  floatx  *fpx_pack;      // packed B panels
+  size_t   fpx_pack_cap;
+  float   *fpx_pack_a;    // packed A panels, upcast to fp32
+  size_t   fpx_pack_a_cap;
+  float   *fpx_acc;       // fp32 accumulators
+  size_t   fpx_acc_cap;
+  int8_t  *i8_pack;       // packed int8 panels
+  size_t   i8_pack_cap;
+  int32_t *i8_acc;        // int32 accumulators
   size_t   i8_acc_cap;
 } GemmScratch;
 
@@ -3483,43 +3633,6 @@ gemm_fpx_pack_get(size_t needed)
   return ws->fpx_pack;
 }
 
-#if defined(GEMMA_GEMM_AVX2)
-/* Loads 8 consecutive floatx values into fp32 lanes. */
-static inline __m256
-gemm_load_fpx8(const floatx *p)
-{
-#  if DTYPE == FP32
-  return _mm256_loadu_ps((const float *)p);
-#  elif DTYPE == FP16
-  return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
-#  else
-  __m256i u = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *)p));
-  return _mm256_castsi256_ps(_mm256_slli_epi32(u, 16));
-#  endif
-}
-
-/* Stores 8 fp32 lanes as floatx, rounding to nearest even. */
-static inline void
-gemm_store_fpx8(floatx *p, __m256 v)
-{
-#  if DTYPE == FP32
-  _mm256_storeu_ps((float *)p, v);
-#  elif DTYPE == FP16
-  _mm_storeu_si128((__m128i *)p, _mm256_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT));
-#  else
-  __m256i u   = _mm256_castps_si256(v);
-  __m256i lsb =
-    _mm256_and_si256(_mm256_srli_epi32(u, 16), _mm256_set1_epi32(1));
-  u = _mm256_srli_epi32(
-    _mm256_add_epi32(u, _mm256_add_epi32(_mm256_set1_epi32(0x7FFF), lsb)), 16
-  );
-  _mm_storeu_si128(
-    (__m128i *)p,
-    _mm_packus_epi32(_mm256_castsi256_si128(u), _mm256_extracti128_si256(u, 1))
-  );
-#  endif
-}
-#endif
 
 /* 8x8 outer-product micro-kernel, fp32 accumulation */
 static inline void
@@ -3662,7 +3775,10 @@ gemm_fpx_compute_tile(
   int                    nc,
   int                    k)
 {
-  size_t needed = (size_t)GEMM_MC * GEMM_NC;
+  int    MC     = g_rt.gemm_mc;
+  int    NC     = g_rt.gemm_nc;
+  int    KC     = g_rt.gemm_kc;
+  size_t needed = (size_t)MC * NC;
 
   float *acc_buf = gemm_fpx_acc_get(needed);
   if (acc_buf == NULL)
@@ -3671,16 +3787,16 @@ gemm_fpx_compute_tile(
     return;  // best-effort: skip this tile rather than crash
   }
 
-  // acc_buf's row stride is the fixed GEMM_NC (allocation size), NOT nc,
+  // acc_buf's row stride is the fixed NC (allocation size), NOT nc,
   // so it must be zeroed row-by-row rather than as one flat mc*nc memset.
   for (int r = 0; r < mc; r++)
   {
-    memset(acc_buf + (size_t)r * GEMM_NC, 0, (size_t)nc * sizeof(float));
+    memset(acc_buf + (size_t)r * NC, 0, (size_t)nc * sizeof(float));
   }
 
-  for (int pc = 0; pc < k; pc += GEMM_KC)
+  for (int pc = 0; pc < k; pc += KC)
   {
-    int kc = min(k - pc, GEMM_KC);
+    int kc = min(k - pc, KC);
 
     for (int jb = 0; jb < nc; jb += 8)
     {
@@ -3690,13 +3806,13 @@ gemm_fpx_compute_tile(
         const floatx *Bp_panel = Bp_block + (size_t)jb * k + pc * 8;
 
         gemm_fpx_kernel_accum(
-          acc_buf + ib * GEMM_NC + jb, GEMM_NC, Bp_panel, Ap_panel, kc
+          acc_buf + ib * NC + jb, NC, Bp_panel, Ap_panel, kc
         );
       }
     }
   }
 
-  gemm_fpx_flush_block(dst, dst_stride, acc_buf, GEMM_NC, mc, nc);
+  gemm_fpx_flush_block(dst, dst_stride, acc_buf, NC, mc, nc);
 }
 
 /**
@@ -3745,8 +3861,10 @@ gemm_fpx(
     pack_all_f32(Ap_full, src, src_stride, m_full, 8, k, omp, threads);
     pack_all_fpx(Bp_full, mat, mat_stride, n_full, 8, k, omp, threads);
 
-    int n_ic_blocks = (m_full + GEMM_MC - 1) / GEMM_MC;
-    int n_jc_blocks = (n_full + GEMM_NC - 1) / GEMM_NC;
+    int MC          = g_rt.gemm_mc;
+    int NC          = g_rt.gemm_nc;
+    int n_ic_blocks = (m_full + MC - 1) / MC;
+    int n_jc_blocks = (n_full + NC - 1) / NC;
 
     if (omp)
     {
@@ -3757,10 +3875,10 @@ gemm_fpx(
       {
         for (bj = 0; bj < n_jc_blocks; bj++)
         {
-          int ic = bi * GEMM_MC;
-          int jc = bj * GEMM_NC;
-          int mc = m_full - ic; if (mc > GEMM_MC) mc = GEMM_MC;
-          int nc = n_full - jc; if (nc > GEMM_NC) nc = GEMM_NC;
+          int ic = bi * MC;
+          int jc = bj * NC;
+          int mc = m_full - ic; if (mc > MC) mc = MC;
+          int nc = n_full - jc; if (nc > NC) nc = NC;
 
           gemm_fpx_compute_tile(
             dst + (size_t)ic * dst_stride + jc, dst_stride,
@@ -3775,10 +3893,10 @@ gemm_fpx(
       {
         for (int bj = 0; bj < n_jc_blocks; bj++)
         {
-          int ic = bi * GEMM_MC;
-          int jc = bj * GEMM_NC;
-          int mc = m_full - ic; if (mc > GEMM_MC) mc = GEMM_MC;
-          int nc = n_full - jc; if (nc > GEMM_NC) nc = GEMM_NC;
+          int ic = bi * MC;
+          int jc = bj * NC;
+          int mc = m_full - ic; if (mc > MC) mc = MC;
+          int nc = n_full - jc; if (nc > NC) nc = NC;
 
           gemm_fpx_compute_tile(
             dst + (size_t)ic * dst_stride + jc, dst_stride,
@@ -3810,6 +3928,82 @@ done:
   PERF_TOC(perf, PERF_OP_GEMM_FPX, t0);
   return ret;
 }
+
+#if defined(GEMMA_GEMM_AVX2)
+/* 8x8 register-blocked kernel for the NN case: `mat` is k x n, so a row of
+ * it is contiguous in n and can be used as the broadcast-free operand. */
+static inline void
+gemm_fpx_nn_kernel8(
+  floatx *RESTRICT       dst,        // + 8 rows of dst_stride
+  int                    dst_stride,
+  const floatx *RESTRICT mat,
+  int                    mat_stride,
+  const floatx *RESTRICT src,
+  int                    src_stride,
+  int                    n,
+  int                    k)
+{
+  int j = 0;
+
+  for (; j + 8 <= n; j += 8)
+  {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    __m256 acc2 = _mm256_setzero_ps();
+    __m256 acc3 = _mm256_setzero_ps();
+    __m256 acc4 = _mm256_setzero_ps();
+    __m256 acc5 = _mm256_setzero_ps();
+    __m256 acc6 = _mm256_setzero_ps();
+    __m256 acc7 = _mm256_setzero_ps();
+
+    for (int l = 0; l < k; l++)
+    {
+      __m256 b = gemm_load_fpx8(mat + (size_t)l * mat_stride + j);
+
+      acc0 = _mm256_fmadd_ps(
+        _mm256_set1_ps((float)src[0 * (size_t)src_stride + l]), b, acc0);
+      acc1 = _mm256_fmadd_ps(
+        _mm256_set1_ps((float)src[1 * (size_t)src_stride + l]), b, acc1);
+      acc2 = _mm256_fmadd_ps(
+        _mm256_set1_ps((float)src[2 * (size_t)src_stride + l]), b, acc2);
+      acc3 = _mm256_fmadd_ps(
+        _mm256_set1_ps((float)src[3 * (size_t)src_stride + l]), b, acc3);
+      acc4 = _mm256_fmadd_ps(
+        _mm256_set1_ps((float)src[4 * (size_t)src_stride + l]), b, acc4);
+      acc5 = _mm256_fmadd_ps(
+        _mm256_set1_ps((float)src[5 * (size_t)src_stride + l]), b, acc5);
+      acc6 = _mm256_fmadd_ps(
+        _mm256_set1_ps((float)src[6 * (size_t)src_stride + l]), b, acc6);
+      acc7 = _mm256_fmadd_ps(
+        _mm256_set1_ps((float)src[7 * (size_t)src_stride + l]), b, acc7);
+    }
+
+    gemm_store_fpx8(dst + 0 * (size_t)dst_stride + j, acc0);
+    gemm_store_fpx8(dst + 1 * (size_t)dst_stride + j, acc1);
+    gemm_store_fpx8(dst + 2 * (size_t)dst_stride + j, acc2);
+    gemm_store_fpx8(dst + 3 * (size_t)dst_stride + j, acc3);
+    gemm_store_fpx8(dst + 4 * (size_t)dst_stride + j, acc4);
+    gemm_store_fpx8(dst + 5 * (size_t)dst_stride + j, acc5);
+    gemm_store_fpx8(dst + 6 * (size_t)dst_stride + j, acc6);
+    gemm_store_fpx8(dst + 7 * (size_t)dst_stride + j, acc7);
+  }
+
+  // Columns that don't fill a vector
+  for (int i = 0; i < 8; i++)
+  {
+    for (int jj = j; jj < n; jj++)
+    {
+      float sum = 0.0f;
+      for (int l = 0; l < k; l++)
+      {
+        sum += (float)src[i * (size_t)src_stride + l]
+             * (float)mat[(size_t)l * mat_stride + jj];
+      }
+      dst[i * (size_t)dst_stride + jj] = (floatx)sum;
+    }
+  }
+}
+#endif
 
 /**
  * Compute an `mr`x`n` (mr <= 8) block of dst = src @ mat.
@@ -3909,20 +4103,34 @@ gemm_fpx_nn(
     #pragma omp parallel for private(ib) num_threads(threads) OMP_PARA_ARGS
     for (ib = 0; ib < m_full; ib += 8)
     {
+#if defined(GEMMA_GEMM_AVX2)
+      gemm_fpx_nn_kernel8(
+        dst + ib * dst_stride, dst_stride, mat, mat_stride,
+        src + ib * src_stride, src_stride, n, k
+      );
+#else
       gemm_fpx_nn_kernel(
         dst + ib * dst_stride, dst_stride, mat, mat_stride,
         src + ib * src_stride, src_stride, 8, n, k
       );
+#endif
     }
   }
   else
   {
     for (int ib = 0; ib < m_full; ib += 8)
     {
+#if defined(GEMMA_GEMM_AVX2)
+      gemm_fpx_nn_kernel8(
+        dst + ib * dst_stride, dst_stride, mat, mat_stride,
+        src + ib * src_stride, src_stride, n, k
+      );
+#else
       gemm_fpx_nn_kernel(
         dst + ib * dst_stride, dst_stride, mat, mat_stride,
         src + ib * src_stride, src_stride, 8, n, k
       );
+#endif
     }
   }
 
@@ -4348,7 +4556,9 @@ gemm_int8_compute_tile(
   int                    nc,
   int                    k)
 {
-  size_t needed = (size_t)GEMM_MC * GEMM_NC;
+  int    MC     = g_rt.gemm_mc;
+  int    NC     = g_rt.gemm_nc;
+  size_t needed = (size_t)MC * NC;
 
   int32_t *acc_buf = gemm_i8_acc_get(needed);
   if (acc_buf == NULL)
@@ -4360,7 +4570,7 @@ gemm_int8_compute_tile(
 #if !defined(GEMMA_GEMM_VNNI8) && !defined(GEMMA_GEMM_AVX2)
   for (int r = 0; r < mc; r++)
   {
-    memset(acc_buf + (size_t)r * GEMM_NC, 0, (size_t)nc * sizeof(int32_t));
+    memset(acc_buf + (size_t)r * NC, 0, (size_t)nc * sizeof(int32_t));
   }
 #endif
 
@@ -4370,20 +4580,22 @@ gemm_int8_compute_tile(
   {
     for (int ib = 0; ib < mc; ib += 4)
     {
-      int32_t       *cell = acc_buf + (size_t)ib * GEMM_NC + jb;
+      int32_t       *cell = acc_buf + (size_t)ib * NC + jb;
       const int8_t  *bp   = Bp_block + (size_t)jb * k;
       const int8_t  *ap   = Ap_block + (size_t)ib * k;
 #  if defined(GEMMA_GEMM_VNNI8)
-      gemm_int8_kernel_dot(cell, GEMM_NC, bp, ap, k);
+      gemm_int8_kernel_dot(cell, NC, bp, ap, k);
 #  else
-      gemm_int8_kernel_dot_widen(cell, GEMM_NC, bp, ap, k);
+      gemm_int8_kernel_dot_widen(cell, NC, bp, ap, k);
 #  endif
     }
   }
 #else
-  for (int pc = 0; pc < k; pc += GEMM_KC)
+  int KC = g_rt.gemm_kc;
+
+  for (int pc = 0; pc < k; pc += KC)
   {
-    int kc = min(k - pc, GEMM_KC);
+    int kc = min(k - pc, KC);
 
     for (int jb = 0; jb < nc; jb += 8)
     {
@@ -4393,7 +4605,7 @@ gemm_int8_compute_tile(
         const int8_t *Bp_panel = Bp_block + (size_t)jb * k + pc * 8;
 
         gemm_int8_kernel_accum(
-          acc_buf + ib * GEMM_NC + jb, GEMM_NC, Bp_panel, Ap_panel, kc
+          acc_buf + ib * NC + jb, NC, Bp_panel, Ap_panel, kc
         );
       }
     }
@@ -4401,7 +4613,7 @@ gemm_int8_compute_tile(
 #endif
 
   gemm_int8_flush_block(
-    dst, dst_stride, acc_buf, GEMM_NC, src_scales, mat_scales, mc, nc
+    dst, dst_stride, acc_buf, NC, src_scales, mat_scales, mc, nc
   );
 }
 
@@ -4440,22 +4652,36 @@ gemm_int8(
 
   if (m_full > 0 && n_full > 0)
   {
+    // The k-contiguous packing is a plain copy, so a row-major source can be
+    // used in place; only a padded stride needs the copy.
+    bool    need_a  = (src_stride != k);
+    bool    need_b  = (mat_stride != k);
     size_t  needed  = (size_t)(m_full + n_full) * k;
-    int8_t *scratch = gemm_i8_pack_get(needed);
-    if (scratch == NULL)
+    int8_t *scratch = NULL;
+
+    if (need_a || need_b)
     {
-      log_error("gemm_int8 packing scratch allocation failed");
-      ret = 1;
-      goto done;
+      scratch = gemm_i8_pack_get(needed);
+      if (scratch == NULL)
+      {
+        log_error("gemm_int8 packing scratch allocation failed");
+        ret = 1;
+        goto done;
+      }
     }
-    int8_t *Ap_full = scratch;
-    int8_t *Bp_full = scratch + (size_t)m_full * k;
 
-    pack_all_i8(Ap_full, src, src_stride, m_full, 8, k, omp, threads);
-    pack_all_i8(Bp_full, mat, mat_stride, n_full, 8, k, omp, threads);
+    int8_t *Ap_full = need_a ? scratch : (int8_t *)src;
+    int8_t *Bp_full = need_b ? scratch + (size_t)m_full * k : (int8_t *)mat;
 
-    int n_ic_blocks = (m_full + GEMM_MC - 1) / GEMM_MC;
-    int n_jc_blocks = (n_full + GEMM_NC - 1) / GEMM_NC;
+    if (need_a)
+      pack_all_i8(Ap_full, src, src_stride, m_full, 8, k, omp, threads);
+    if (need_b)
+      pack_all_i8(Bp_full, mat, mat_stride, n_full, 8, k, omp, threads);
+
+    int MC          = g_rt.gemm_mc;
+    int NC          = g_rt.gemm_nc;
+    int n_ic_blocks = (m_full + MC - 1) / MC;
+    int n_jc_blocks = (n_full + NC - 1) / NC;
 
     if (omp)
     {
@@ -4466,10 +4692,10 @@ gemm_int8(
       {
         for (bj = 0; bj < n_jc_blocks; bj++)
         {
-          int ic = bi * GEMM_MC;
-          int jc = bj * GEMM_NC;
-          int mc = m_full - ic; if (mc > GEMM_MC) mc = GEMM_MC;
-          int nc = n_full - jc; if (nc > GEMM_NC) nc = GEMM_NC;
+          int ic = bi * MC;
+          int jc = bj * NC;
+          int mc = m_full - ic; if (mc > MC) mc = MC;
+          int nc = n_full - jc; if (nc > NC) nc = NC;
 
           gemm_int8_compute_tile(
             dst + (size_t)ic * dst_stride + jc, dst_stride,
@@ -4485,10 +4711,10 @@ gemm_int8(
       {
         for (int bj = 0; bj < n_jc_blocks; bj++)
         {
-          int ic = bi * GEMM_MC;
-          int jc = bj * GEMM_NC;
-          int mc = m_full - ic; if (mc > GEMM_MC) mc = GEMM_MC;
-          int nc = n_full - jc; if (nc > GEMM_NC) nc = GEMM_NC;
+          int ic = bi * MC;
+          int jc = bj * NC;
+          int mc = m_full - ic; if (mc > MC) mc = MC;
+          int nc = n_full - jc; if (nc > NC) nc = NC;
 
           gemm_int8_compute_tile(
             dst + (size_t)ic * dst_stride + jc, dst_stride,
@@ -5765,67 +5991,68 @@ forward_text_chunk(
       );
     }
 
-    // Compute xq & xk & xv
+    // Compute xq & xk & xv. An output row only depends on the matching row of
+    // x, so the work also splits over token blocks: one task per (tensor
+    // head, token block) pair. Splitting by head alone leaves most threads
+    // idle on the small models (4 heads against 10 threads).
     int  h;
     bool quit = false;
 
-    #pragma omp parallel for private(h) reduction(|| : quit) \
-            num_threads(threads) OMP_PARA_ARGS
-    for (h = 0; h < n_heads; h++)
+    const int proj_rows = 128;
+    int       n_rb      = (n_tokens + proj_rows - 1) / proj_rows;
+    int       n_task    = (n_heads + 2 * n_kv_heads) * n_rb;
+    int       idx;
+
+    #pragma omp parallel for private(h, idx) reduction(|| : quit) \
+            schedule(dynamic, 1) num_threads(threads) OMP_PARA_ARGS
+    for (idx = 0; idx < n_task; idx++)
     {
-      floatx *xq_head =
-        tbuf->xq + h * n_tokens * head_dim;  // (n_tokens, head_dim)
+      h = idx / n_rb;  // 0..n_heads-1: q, then k, then v
+
+      const QTensor *w;
+      floatx        *dst;
+      int            hd;
+      if (h < n_heads)
+      {
+        w   = layer->wq;
+        hd  = h;
+        dst = tbuf->xq;
+      }
+      else if (h < n_heads + n_kv_heads)
+      {
+        w   = layer->wk;
+        hd  = h - n_heads;
+        dst = tbuf->xk;
+      }
+      else
+      {
+        w   = layer->wv;
+        hd  = h - n_heads - n_kv_heads;
+        dst = tbuf->xv;
+      }
+
+      int t0 = (idx % n_rb) * proj_rows;
+      int tn = min(proj_rows, n_tokens - t0);
+
+      // (tn, head_dim) = x[t0:t0+tn] (tn, embed_dim) @ w[hd].T
+      floatx *dst_b = dst + ((size_t)hd * n_tokens + t0) * head_dim;
+      size_t  woff  = (size_t)hd * head_dim * embed_dim;
+
       if (!quant)
       {
         if (gemm_fpx(
-          xq_head, 0, layer->wq->fpx + h * head_dim * embed_dim, 0, tbuf->x,
-          0, n_tokens, head_dim, embed_dim, false, threads, perf
+          dst_b, head_dim, w->fpx + woff, 0, tbuf->x + (size_t)t0 * embed_dim,
+          0, tn, head_dim, embed_dim, false, threads, perf
         ) == 1)
           quit = true;
       }
       else
       {
         if (gemm_int8(
-          xq_head, 0, layer->wq->i8.q + h * head_dim * embed_dim, 0,
-          layer->wq->i8.scales + h * head_dim, tbuf->x_i8, 0,
-          tbuf->x_scales, n_tokens, head_dim, embed_dim, false, threads, perf
+          dst_b, head_dim, w->i8.q + woff, 0, w->i8.scales + hd * head_dim,
+          tbuf->x_i8 + (size_t)t0 * embed_dim, 0, tbuf->x_scales + t0, tn,
+          head_dim, embed_dim, false, threads, perf
         ) == 1)
-          quit = true;
-      }
-      if (h >= n_kv_heads) continue;
-
-      floatx *xk_head = tbuf->xk + h * n_tokens * head_dim;
-      floatx *xv_head = tbuf->xv + h * n_tokens * head_dim;
-
-      if (!quant)
-      {
-        // (n_tokens, n_kv_heads, head_dim)
-        if (
-          gemm_fpx(
-            xk_head, 0, layer->wk->fpx + h * head_dim * embed_dim, 0, tbuf->x,
-            0, n_tokens, head_dim, embed_dim, false, threads, perf
-          ) == 1 ||
-          gemm_fpx(
-            xv_head, 0, layer->wv->fpx + h * head_dim * embed_dim, 0, tbuf->x,
-            0, n_tokens, head_dim, embed_dim, false, threads, perf
-          ) == 1
-        )
-          quit = true;
-      }
-      else
-      {
-        if (
-          gemm_int8(
-            xk_head, 0, layer->wk->i8.q + h * head_dim * embed_dim, 0,
-            layer->wk->i8.scales + h * head_dim, tbuf->x_i8, 0,
-            tbuf->x_scales, n_tokens, head_dim, embed_dim, false, threads, perf
-          ) == 1 ||
-          gemm_int8(
-            xv_head, 0, layer->wv->i8.q + h * head_dim * embed_dim, 0,
-            layer->wv->i8.scales + h * head_dim, tbuf->x_i8, 0,
-            tbuf->x_scales, n_tokens, head_dim, embed_dim, false, threads, perf
-          ) == 1
-        )
           quit = true;
       }
     }
@@ -5902,11 +6129,23 @@ forward_text_chunk(
 
     int max_k = epos + 1;
     quit      = false;
+    int qbi;
 
-    #pragma omp parallel for private(h) reduction(|| : quit) \
-            num_threads(threads) OMP_PARA_ARGS
-    for (h = 0; h < n_heads; h++)
+    /* One task per (head, query block) pair. Splitting by head alone leaves
+     * most threads idle on the small models (4 heads against 10 threads), and
+     * a (head, query block) pair only ever writes its own rows of att[] and
+     * xo[]. The dense path simply has a single block per head. */
+    int QK   = g_rt.qk_block_size;
+    int n_qb = mask ? (n_tokens + QK - 1) / QK : 1;
+    int qidx;
+
+    #pragma omp parallel for private(h, qbi, qidx) schedule(dynamic, 1) \
+            reduction(|| : quit) num_threads(threads) OMP_PARA_ARGS
+    for (qidx = 0; qidx < n_heads * n_qb; qidx++)
     {
+      h   = qidx / n_qb;
+      qbi = qidx % n_qb;
+
       int h_kv = h * n_kv_heads / n_heads;  // GQA mapping
 
       // (n_tokens, max_k)
@@ -5941,11 +6180,12 @@ forward_text_chunk(
 
       if (mask)  // Only apply tiling if mask=true
       {
-        for (int q_start = 0; q_start < n_tokens; q_start += QK_BLOCK_SIZE)
+        int q_start = qbi * QK;
+
         {
           // xq[h, q_start:q_end, :] (q_end - q_start, head_dim)
           floatx *qb = tbuf->xq + h * n_tokens * head_dim + q_start * head_dim;
-          int     q_end       = min(q_start + QK_BLOCK_SIZE, n_tokens);
+          int     q_end       = min(q_start + QK, n_tokens);
           int     abs_q_end   = spos + q_end;
           int     abs_q_start = spos + q_start;
           if (is_local && abs_q_start >= tcfg->slide_len)
@@ -5956,15 +6196,15 @@ forward_text_chunk(
           {
             abs_q_start = 0;
           }
-          int spos_b = abs_q_start / QK_BLOCK_SIZE * QK_BLOCK_SIZE;
+          int spos_b = abs_q_start / QK * QK;
 
           for (int k_start = spos_b; k_start < abs_q_end;
-            k_start += QK_BLOCK_SIZE)
+            k_start += QK)
           {
             // k_cache[h_kv, k_start:k_end, :] (k_end - k_start, head_dim)
             floatx *kb =
               k_cache + h_kv * tbuf->cache_len * head_dim + k_start * head_dim;
-            int     k_end = min(k_start + QK_BLOCK_SIZE, max_k);
+            int     k_end = min(k_start + QK, max_k);
             floatx *att_b = att_head + q_start * max_k + k_start;
 
             // Typically people don't quantize this
@@ -7266,7 +7506,7 @@ longimage_inject_next(GemmaModel *model, InjectContext *ctx, bool enable_mm)
     // Inject prefix prompt
     spos = ctx->tokens_len;
     encode(
-      tok, CROPPED_IMAGE_PREFIX, strlen(CROPPED_IMAGE_PREFIX),
+      tok, g_rt.cropped_image_prefix, strlen(g_rt.cropped_image_prefix),
       ctx->tokens_buf, spos, &ctx->tokens_len
     );
     // Inject image header ("\n\n<start_of_image>")
@@ -7295,7 +7535,7 @@ longimage_inject_next(GemmaModel *model, InjectContext *ctx, bool enable_mm)
 
     // Save the image to cmd_ctx->crops
     cmd_ctx->crops = prepare_longimage(
-      cmd_ctx->path, image_size, MIN_CROP_SIZE, MAX_NUM_CROPS,
+      cmd_ctx->path, image_size, g_rt.min_crop_size, g_rt.max_num_crops,
       &cmd_ctx->n_crops
     );
     if (cmd_ctx->crops == NULL)
@@ -7332,7 +7572,7 @@ longimage_inject_next(GemmaModel *model, InjectContext *ctx, bool enable_mm)
     }
     // Inject crop prompt ("and here are some crops to help you see better")
     encode(
-      tok, CROPPED_IMAGE_FILTER, strlen(CROPPED_IMAGE_FILTER),
+      tok, g_rt.cropped_image_filter, strlen(g_rt.cropped_image_filter),
       ctx->tokens_buf, ctx->tokens_len, &ctx->tokens_len
     );
     // Image header of the first crop
@@ -8375,6 +8615,7 @@ main(int argc, char **argv)
 {
   set_utf8_console();
   setup_signal_handler();
+  setup_runtime_config();
 
   CliArgs args = {
     .modelfile   = NULL,

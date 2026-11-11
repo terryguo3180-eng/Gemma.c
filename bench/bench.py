@@ -353,6 +353,7 @@ def run_once(args, binary, model_bin, prompt):
     return {"error": "unparsable output"}
   m = RE_PARAMS.search(out)
   return {
+    "prefill_tokens": int(p.group(1)),
     "prefill_s": float(p.group(2)),
     "prefill_tps": float(p.group(3)),
     "gen_s": float(g.group(2)),
@@ -524,7 +525,8 @@ def cmd_run(args):
       for d in dtypes:
         for q in quants:
           tag = "%s|%s|%s" % (m["name"], d, "q" if q else "nq")
-          state = "done" if tag in results["runs"] else "todo"
+          rec = results["runs"].get(tag)
+          state = rec.get("status", "todo") if rec else "todo"
           est = planned_size(m["dir"], d, q)
           note = " (over --max-model-gb)" if est > args.max_model_gb * 1024 ** 3 else ""
           print("  %-40s %-6s ~%s%s" % (tag, state, human_bytes(est), note))
@@ -538,8 +540,15 @@ def cmd_run(args):
     for dtype in dtypes:
       for quant in quants:
         tag = "%s|%s|%s" % (m["name"], dtype, "q" if quant else "nq")
-        if tag in results["runs"]:
+        prev = results["runs"].get(tag)
+        # configs that produced numbers are kept; failed or skipped ones
+        # are only re-tried with --force
+        if prev is not None and prev.get("status") == "ok":
           print("[skip] %s (already measured)" % tag)
+          continue
+        if prev is not None and not args.force:
+          print("[skip] %s (%s, use --force to retry)"
+                % (tag, prev.get("status", "?")))
           continue
         est = planned_size(m["dir"], dtype, quant)
         if est > args.max_model_gb * 1024 ** 3:
@@ -770,7 +779,10 @@ def render(args, write_readme=True):
   if not (write_readme and args.update_readme):
     return
   planned = set(results["meta"].get("planned", []))
-  done = set(results["runs"])
+  # only a run that actually produced numbers counts as done; skipped or
+  # failed configs stay "missing" so the README is not silently truncated
+  done = set(tag for tag, rec in results["runs"].items()
+             if rec.get("status") == "ok")
   if planned and not planned <= done and not args.force:
     print("README not touched: %d of %d planned configs are still missing "
           "(use --force)" % (len(planned - done), len(planned)))
@@ -836,7 +848,8 @@ def cmd_chunk(args):
       print("| %d | — | %s |" % (size, err))
       continue
     tps = statistics.median([s["prefill_tps"] for s in steady(samples)])
-    print("| %d | %.1f | %.2f |" % (size, tps, 1002.0 / tps))
+    ntok = statistics.median([s.get("prefill_tokens", 1002) for s in steady(samples)])
+    print("| %d | %.1f | %.2f |" % (size, tps, ntok / tps))
 
 
 # --------------------------------------------------------------------------- #
@@ -869,7 +882,7 @@ def add_common(p):
   p.add_argument("--keep-bins", action="store_true")
   p.add_argument("--dry-run", action="store_true")
   p.add_argument("--prompt-file",
-                 default=os.path.join(REPO, "prompt1000toks.txt"))
+                 default=os.path.join(REPO, "bench", "prompt1000toks.txt"))
   p.add_argument("--short-prompt", default=SHORT_PROMPT)
   p.add_argument("--runs", type=int, default=5)
   p.add_argument("--extra-runs", type=int, default=5)
