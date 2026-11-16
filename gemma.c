@@ -6,18 +6,18 @@
  *   02   428  config: runtime knobs, dtypes, ISA switches, tiny utils
  *   03   573  errors & memory: logging, checked alloc, file reads
  *   04   710  model config: siglip vision + gemma text, from file
- *   05   830  tokenizer: byte-pair encoding
- *   06  1101  weights: tensors, layers, decoders, load (read / mmap)
- *   07  2145  runtime buffers: kv cache & scratch, allocated once
- *   08  2403  performance counters
- *   09  2505  math: normalization & fp32 lane helpers
- *   10  4251  image preprocess: resize, pan & scan crops
- *   11  4393  forward passes: vision tower, text decode, prefill
- *   12  5614  sampling: argmax, top-k / top-p, repet. penalty
- *   13  5968  front-end: settings, sample loop, generate, chat
- *   14  6813  setup: --verbose report, model load, cleanup
- *   15  6943  cli: argument parsing, printing, main
- *   16  7516  embedded stb_image / resize2 blob (do not edit)
+ *   05   826  tokenizer: byte-pair encoding
+ *   06  1097  weights: tensors, layers, decoders, load (read / mmap)
+ *   07  2140  runtime buffers: kv cache & scratch, allocated once
+ *   08  2398  performance counters
+ *   09  2500  math: normalization & fp32 lane helpers
+ *   10  4244  image preprocess: resize, pan & scan crops
+ *   11  4386  forward passes: vision tower, text decode, prefill
+ *   12  5596  sampling: argmax, top-k / top-p, repet. penalty
+ *   13  5950  front-end: settings, sample loop, generate, chat
+ *   14  6793  setup: --verbose report, model load, cleanup
+ *   15  6923  cli: argument parsing, printing, main
+ *   16  7494  embedded stb_image / resize2 blob (do not edit)
  * </toc>
  */
 
@@ -64,7 +64,7 @@
 #endif
 
 /*----------------------------------------------------------------------------*/
-/* 01 platform: windows mmap, console, argv, signals, clock */
+/* 01 platform: windows mmap, console, argv, signals, clock                   */
 /*----------------------------------------------------------------------------*/
 
 /* adapted from https://github.com/karpathy/llama2.c/blob/master/win.h and
@@ -426,7 +426,7 @@ unsigned char *load_image_utf8(const char *upath, int *w, int *h, int *ch,
 }
 
 /*----------------------------------------------------------------------------*/
-/* 02 config: runtime knobs, dtypes, ISA switches, tiny utils */
+/* 02 config: runtime knobs, dtypes, ISA switches, tiny utils                 */
 /*----------------------------------------------------------------------------*/
 
 typedef struct {
@@ -571,7 +571,7 @@ static inline int min(int a, int b) { return a < b ? a : b; }
 #define ARRAYLEN(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 /*----------------------------------------------------------------------------*/
-/* 03 errors & memory: logging, checked alloc, file reads */
+/* 03 errors & memory: logging, checked alloc, file reads                     */
 /*----------------------------------------------------------------------------*/
 
 static _Thread_local char g_err[128] = {0};
@@ -708,7 +708,7 @@ static size_t get_strarr_bytes(FILE *fp, int count) {
 }
 
 /*----------------------------------------------------------------------------*/
-/* 04 model config: siglip vision + gemma text, from file */
+/* 04 model config: siglip vision + gemma text, from file                     */
 /*----------------------------------------------------------------------------*/
 typedef struct {
   uint8_t nl;       /* ViT layers */
@@ -824,7 +824,7 @@ fail:
 }
 
 /*----------------------------------------------------------------------------*/
-/* 05 tokenizer: byte-pair encoding */
+/* 05 tokenizer: byte-pair encoding                                           */
 /*----------------------------------------------------------------------------*/
 
 typedef struct {
@@ -1095,7 +1095,7 @@ const char *decode(GemmaTokenizer *tok, int id, char *bbuf) {
 }
 
 /*----------------------------------------------------------------------------*/
-/* 06 weights: tensors, layers, decoders, load (read / mmap) */
+/* 06 weights: tensors, layers, decoders, load (read / mmap)                  */
 /*----------------------------------------------------------------------------*/
 
 /* a linear layer, either dense fpx or int8 + scales */
@@ -2138,7 +2138,7 @@ fail:
 }
 
 /*----------------------------------------------------------------------------*/
-/* 07 runtime buffers: kv cache & scratch, allocated once */
+/* 07 runtime buffers: kv cache & scratch, allocated once                     */
 /*----------------------------------------------------------------------------*/
 
 typedef struct {
@@ -2396,7 +2396,7 @@ fail:
 }
 
 /*----------------------------------------------------------------------------*/
-/* 08 performance counters */
+/* 08 performance counters                                                    */
 /*----------------------------------------------------------------------------*/
 
 typedef enum {
@@ -2498,7 +2498,7 @@ typedef struct {
   } while (0)
 
 /*----------------------------------------------------------------------------*/
-/* 09 math: normalization & fp32 lane helpers */
+/* 09 math: normalization & fp32 lane helpers                                 */
 /*----------------------------------------------------------------------------*/
 
 static inline floatx clamp_fpx(floatx v) {
@@ -4242,7 +4242,7 @@ static void rope_apply(floatx *x, int n, int hdim, const floatx *freqs,
 }
 
 /*----------------------------------------------------------------------------*/
-/* 10 image preprocess: resize, pan & scan crops */
+/* 10 image preprocess: resize, pan & scan crops                              */
 /*----------------------------------------------------------------------------*/
 
 floatx *prepare_image(const char *path, int img_px) {
@@ -4384,7 +4384,7 @@ fail:
 }
 
 /*----------------------------------------------------------------------------*/
-/* 11 forward passes: vision tower, text decode, prefill */
+/* 11 forward passes: vision tower, text decode, prefill                      */
 /*----------------------------------------------------------------------------*/
 
 /**
@@ -5594,7 +5594,7 @@ done:
 }
 
 /*----------------------------------------------------------------------------*/
-/* 12 sampling: argmax, top-k / top-p, repet. penalty */
+/* 12 sampling: argmax, top-k / top-p, repet. penalty                         */
 /*----------------------------------------------------------------------------*/
 
 static int argmax(floatx *logits, int nvocab, int threads) {
@@ -5948,7 +5948,7 @@ done:
 }
 
 /*----------------------------------------------------------------------------*/
-/* 13 front-end: settings, sample loop, generate, chat */
+/* 13 front-end: settings, sample loop, generate, chat                        */
 /*----------------------------------------------------------------------------*/
 
 /* inference settings */
@@ -6791,7 +6791,7 @@ fail:
 }
 
 /*----------------------------------------------------------------------------*/
-/* 14 setup: --verbose report, model load, cleanup */
+/* 14 setup: --verbose report, model load, cleanup                            */
 /*----------------------------------------------------------------------------*/
 
 /* pretty-print of the --verbose performance report */
@@ -6921,7 +6921,7 @@ void cleanup_gemma_model(GemmaModel *model, TextBuffer *tb, VisionBuffer *vb,
 }
 
 /*----------------------------------------------------------------------------*/
-/* 15 cli: argument parsing, printing, main */
+/* 15 cli: argument parsing, printing, main                                   */
 /*----------------------------------------------------------------------------*/
 
 #define DEFAULT_SEQLEN 4096
@@ -7492,7 +7492,7 @@ cleanup:
 }
 
 /*----------------------------------------------------------------------------*/
-/* 16 embedded stb_image / resize2 blob (do not edit) */
+/* 16 embedded stb_image / resize2 blob (do not edit)                         */
 /*----------------------------------------------------------------------------*/
 
 /**

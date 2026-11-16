@@ -6,7 +6,10 @@ def rule(width):
   return "/*" + "-" * (width - 4) + "*/"
 
 def banner(number, title, width):
-  return [rule(width), f"/* {number:02d} {title} */", rule(width)]
+  return [
+    rule(width),
+    f"/* {number:02d} {title}{' ' * (width - 8 - len(title))}*/", rule(width)
+  ]
 
 def find_banners(lines):
   spans = []
