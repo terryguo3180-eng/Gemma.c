@@ -169,3 +169,24 @@ else
   endif
 
 endif
+
+# ---------------------------------------------------------------------------
+#
+# 'make toc' regenerates the table of contents at the top of gemma.c from the
+# section banners. A banner is a title line wrapped in two rules:
+#
+#     /*----------------------------------------------------------------------------*/
+#     /* 01 platform: windows mmap, console, argv, signals, clock                   */
+#     /*----------------------------------------------------------------------------*/
+#
+# so adding a section is just adding one [rule, title, rule] block, run it
+# after moving code around. 'tools/toc.py --check gemma.c' does the same test
+# without writing, for a pre-commit hook.
+#
+# ---------------------------------------------------------------------------
+
+PYTHON ?= python3
+
+.PHONY: toc
+toc:
+	$(PYTHON) tools/toc.py $(SRC)

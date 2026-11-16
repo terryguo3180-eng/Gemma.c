@@ -122,7 +122,7 @@ Most CPUs since 2013 supports AVX2, if your computer is old then remove
 override with -DDTYPE at compile time (FP32 / FP16 / BF16):
 
 ```bash
-gcc -Ofast -march=native -fopenmp -DDTYPE=BF16 gemma.c -lm -o gemma
+gcc -Ofast -march=native -mtune=native -fopenmp -DDTYPE=BF16 gemma.c -lm -o gemma
 ```
 
 ### 3. Run inference
@@ -227,36 +227,6 @@ Interactive chat:
 >
 > Do you want to learn more about the science behind it, or would you like to
   know anything else about the stars?
->
-> ---
-> 
-> `> Write a peom about stars`
-> 
-> ---
-> 
-> Okay, here’s a poem about stars:
-> 
-> **Celestial Echoes**
-> 
-> Across the velvet, dark and deep,
-> A million diamonds softly sleep.
-> Stars ignite, a silver dust,
-> In cosmic realms, a sacred trust.
-> 
-> Each glimmer holds a distant fire,
-> A sun’s embrace, a burning desire.
-> Across the void, their light does leap,
-> Secrets whispered, silent, deep.
-> 
-> Of ancient worlds and nebulae’s grace,
-> Lost in time, a timeless space.
-> Constellations dance, a mythic show,
-> Where wonders bloom and starlight flow.
-> 
-> So gaze above, and let your soul,
-> Be drawn to stories, making whole.
-> For stars remain, a constant plea,
-> A beacon bright for you and me.
 
 Multimodal models take images inline in the prompt with `@image{...}`:
  
@@ -514,77 +484,74 @@ here.
 ## Benchmark
 
 <!-- BENCH:BEGIN -->
-WSL2 / Ubuntu, Intel Core Ultra 5 225H (14 threads), 30 GB RAM, gcc 15.2,
-`-O3 -ffast-math -march=native -mtune=native -fopenmp`.
 
-Every cell: `--seqlen 2048 --threads 10 --temperature 0 --tokens 100
---no-mmap --text-only --chunk 2048` (chunk 2048 was the fastest of
-64/128/256/512/1024/2048 on a 1002-token prompt).
+WSL2 / Ubuntu 26.04.1 LTS, Intel(R) Core(TM) Ultra 5 225H (14 threads), gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0, `-O3 -ffast-math -march=native -mtune=native -fopenmp`.
 
-* **prefill tok/s** - 1002-token prompt, prompt ingestion only
+Every cell: `--seqlen 16384 --threads 10 --temperature 0 --tokens 100 --no-mmap --text-only --chunk 2048`
+
+* **prefill tok/s** - 10000-token prompt, prompt ingestion only
 * **decode tok/s** - 100 tokens after a 5-token prompt ("short ctx") or after
-  the 1002-token prompt ("1k ctx")
+  the 10000-token prompt ("10k ctx")
 
-Two warm-up runs are thrown away, then 5 runs are measured, and the rest is a
-median. `n` is the number of samples behind a row and `±%` is the spread I
-actually saw. The 270m and 1b rows pool their `-pt` and `-it` checkpoints (same
-configuration, different weights), which is why those two have twice the
-samples of everything else.
-
-| model | params | dtype | quant | prefill tok/s | decode tok/s (short ctx) | decode tok/s (1k ctx) | ms/token (1k ctx) | n | ±% |
+| model | params | dtype | quant | prefill tok/s | decode tok/s (short ctx) | decode tok/s (10k ctx) | ms/token (10k ctx) | n | ±% |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|
-| gemma-3-270m | 268M | fp32 | no | 619.2 | 65.5 | 56.4 | 17.7 | 8 | 1.7 |
-| gemma-3-270m | 268M | fp32 | yes | 1332.9 | 213.7 | 141.0 | 7.1 | 13 | 8.3 |
-| gemma-3-270m | 268M | fp16 | no | 450.7 | 108.3 | 77.1 | 13.0 | 8 | 2.3 |
-| gemma-3-270m | 268M | fp16 | yes | 1081.0 | 192.0 | 112.4 | 8.9 | 13 | 2.1 |
-| gemma-3-270m | 268M | bf16 | no | 365.0 | 17.3 | 12.1 | 82.4 | 13 | 4.3 |
-| gemma-3-270m | 268M | bf16 | yes | 737.9 | 99.9 | 29.0 | 34.5 | 8 | 2.8 |
-| gemma-3-1b | 1.0B | fp32 | no | 129.2 | 18.1 | 17.0 | 58.7 | 8 | 2.2 |
-| gemma-3-1b | 1.0B | fp32 | yes | 356.0 | 65.3 | 53.4 | 18.7 | 13 | 3.0 |
-| gemma-3-1b | 1.0B | fp16 | no | 103.4 | 31.6 | 26.6 | 37.7 | 8 | 2.1 |
-| gemma-3-1b | 1.0B | fp16 | yes | 326.0 | 60.5 | 45.1 | 22.2 | 8 | 2.5 |
-| gemma-3-1b | 1.0B | bf16 | no | 91.3 | 4.7 | 4.0 | 248.4 | 8 | 0.6 |
-| gemma-3-1b | 1.0B | bf16 | yes | 246.8 | 36.5 | 15.3 | 65.5 | 8 | 2.8 |
-| gemma-2-2b | 2.6B | fp32 | no | 47.4 | 7.2 | 6.3 | 159.5 | 9 | 6.3 |
-| gemma-2-2b | 2.6B | fp32 | yes | 141.7 | 25.5 | 17.3 | 57.7 | 4 | 2.0 |
-| gemma-2-2b | 2.6B | fp16 | no | 39.2 | 11.7 | 9.6 | 103.6 | 4 | 1.8 |
-| gemma-2-2b | 2.6B | fp16 | yes | 139.8 | 24.4 | 15.4 | 65.1 | 4 | 1.6 |
-| gemma-2-2b | 2.6B | bf16 | no | 34.8 | 1.9 | 1.5 | 666.7 | 4 | 0.2 |
-| gemma-2-2b | 2.6B | bf16 | yes | 114.2 | 15.5 | 4.7 | 211.4 | 4 | 1.3 |
-| gemma-3-4b | 4.3B | fp32 | no | 30.1 | 4.6 | 3.9 | 254.5 | 4 | 3.1 |
-| gemma-3-4b | 4.3B | fp32 | yes | 84.2 | 16.7 | 11.4 | 87.6 | 9 | 3.4 |
-| gemma-3-4b | 4.3B | fp16 | no | 22.0 | 7.5 | 6.2 | 161.8 | 9 | 3.9 |
-| gemma-3-4b | 4.3B | fp16 | yes | 89.0 | 15.0 | 11.4 | 87.6 | 9 | 3.6 |
-| gemma-3-4b | 4.3B | bf16 | no | 21.1 | 1.2 | 1.0 | 1010.1 | 9 | 3.9 |
-| gemma-3-4b | 4.3B | bf16 | yes | 70.1 | 10.9 | 3.6 | 278.6 | 9 | 8.6 |
-| gemma-1-7b | 8.5B | fp16 | no | 10.7 | 3.7 | 3.1 | 318.0 | 4 | 4.0 |
-| gemma-3-12b | 12.2B | fp32 | yes | 28.2 | 5.5 | 4.3 | 230.7 | 4 | 2.2 |
-| gemma-3-12b | 12.2B | fp16 | yes | 27.4 | 5.4 | 4.0 | 250.6 | 9 | 4.9 |
+| gemma-3-270m | 268M | fp32 | no | 1309.7 | 68.9 | 59.8 | 16.7 | 4 | 15.2 |
+| gemma-3-270m | 268M | fp32 | yes | 1857.7 | 245.9 | 152.3 | 6.6 | 4 | 21.2 |
+| gemma-3-270m | 268M | fp16 | no | 1139.6 | 109.3 | 86.0 | 11.6 | 1 | 0.0 |
+| gemma-3-270m | 268M | fp16 | yes | 1719.8 | 231.4 | 148.9 | 6.7 | 4 | 21.4 |
+| gemma-3-270m | 268M | bf16 | no | 789.0 | 17.6 | 14.5 | 69.0 | 4 | 4.5 |
+| gemma-3-270m | 268M | bf16 | yes | 1040.8 | 178.0 | 56.0 | 17.8 | 4 | 14.5 |
+| gemma-3-1b-it | 1000M | fp32 | no | 298.7 | 18.9 | 18.3 | 54.7 | 9 | 7.0 |
+| gemma-3-1b-it | 1000M | fp32 | yes | 572.5 | 71.9 | 62.2 | 16.1 | 4 | 9.6 |
+| gemma-3-1b-it | 1000M | fp16 | no | 296.7 | 32.1 | 30.4 | 32.8 | 4 | 6.6 |
+| gemma-3-1b-it | 1000M | fp16 | yes | 541.9 | 66.9 | 57.5 | 17.4 | 4 | 10.9 |
+| gemma-3-1b-it | 1000M | bf16 | no | 224.9 | 4.7 | 4.3 | 232.0 | 4 | 0.6 |
+| gemma-3-1b-it | 1000M | bf16 | yes | 406.3 | 55.8 | 28.8 | 34.8 | 4 | 14.0 |
+| gemma-3-1b-pt | 1000M | fp32 | no | 299.9 | 18.6 | 18.3 | 54.6 | 4 | 6.2 |
+| gemma-3-1b-pt | 1000M | fp32 | yes | 571.9 | 72.6 | 59.2 | 16.9 | 4 | 11.9 |
+| gemma-3-1b-pt | 1000M | fp16 | no | 294.5 | 32.1 | 29.4 | 34.0 | 4 | 5.4 |
+| gemma-3-1b-pt | 1000M | fp16 | yes | 540.8 | 67.0 | 55.8 | 17.9 | 4 | 8.6 |
+| gemma-3-1b-pt | 1000M | bf16 | no | 225.9 | 4.7 | 4.3 | 230.9 | 4 | 1.1 |
+| gemma-3-1b-pt | 1000M | bf16 | yes | 409.2 | 55.3 | 27.6 | 36.2 | 4 | 7.6 |
+| gemma-2-2b | 2.6B | fp32 | no | 84.6 | 7.4 | 6.1 | 163.7 | 4 | 3.3 |
+| gemma-2-2b | 2.6B | fp32 | yes | 140.6 | 27.4 | 15.3 | 65.3 | 4 | 5.6 |
+| gemma-2-2b | 2.6B | fp16 | no | 84.3 | 13.0 | 9.8 | 101.6 | 4 | 6.6 |
+| gemma-2-2b | 2.6B | fp16 | yes | 134.1 | 26.1 | 15.8 | 63.5 | 4 | 9.4 |
+| gemma-2-2b | 2.6B | bf16 | no | 58.7 | 1.8 | 1.5 | 666.7 | 4 | 0.9 |
+| gemma-2-2b | 2.6B | bf16 | yes | 87.7 | 21.8 | 6.2 | 162.6 | 9 | 10.6 |
+| gemma-3-4b-it | 3.9B | fp32 | yes | 141.1 | 19.7 | 15.8 | 63.3 | 9 | 3.8 |
+| gemma-3-4b-it | 3.9B | fp16 | no | 69.3 | 9.0 | 8.4 | 118.9 | 4 | 5.5 |
+| gemma-3-4b-it | 3.9B | fp16 | yes | 134.3 | 18.5 | 15.9 | 62.9 | 4 | 11.8 |
+| gemma-3-4b-it | 3.9B | bf16 | no | 54.5 | 1.2 | 1.2 | 854.7 | 4 | 0.3 |
+| gemma-3-4b-it | 3.9B | bf16 | yes | 107.5 | 17.0 | 9.2 | 108.2 | 4 | 5.8 |
+| gemma-1-7b-it | 8.5B | fp32 | yes | 42.4 | 8.0 | 3.4 | 296.7 | 1 | 0.0 |
+| gemma-1-7b-it | 8.5B | fp16 | yes | 46.4 | 8.8 | 4.7 | 211.0 | 4 | 6.4 |
+| gemma-1-7b-it | 8.5B | bf16 | yes | 33.8 | 8.3 | 2.2 | 458.7 | 4 | 9.5 |
+| gemma-3-12b-it | 11.8B | fp16 | yes | 42.5 | 6.5 | 5.5 | 180.5 | 4 | 8.8 |
+| gemma-3-12b-it | 11.8B | bf16 | yes | 35.2 | 6.0 | 3.4 | 295.9 | 4 | 5.5 |
 
 | model | q/nq (fp32) | q/nq (fp16) | q/nq (bf16) | fp16/fp32 (nq) | fp16/fp32 (q) |
 |---|---:|---:|---:|---:|---:|
-| gemma-3-270m | 3.26× | 1.77× | 5.78× | 1.65× | 0.90× |
-| gemma-3-1b | 3.61× | 1.92× | 7.71× | 1.75× | 0.93× |
-| gemma-2-2b | 3.55× | 2.09× | 8.14× | 1.63× | 0.96× |
-| gemma-3-4b | 3.60× | 2.00× | 9.41× | 1.62× | 0.90× |
-| gemma-3-12b | - | - | - | - | 0.98× |
+| gemma-3-270m | 3.57× | 2.12× | 10.13× | 1.59× | 0.94× |
+| gemma-3-1b-it | 3.81× | 2.08× | 11.99× | 1.70× | 0.93× |
+| gemma-3-1b-pt | 3.91× | 2.08× | 11.89× | 1.73× | 0.92× |
+| gemma-2-2b | 3.69× | 2.01× | 11.97× | 1.75× | 0.95× |
+| gemma-3-4b-it | — | 2.05× | 13.71× | — | 0.94× |
+| gemma-1-7b-it | — | — | — | — | 1.10× |
+| gemma-3-12b-it | — | — | — | — | — |
+
+<!-- BENCH:END -->
 
 Ratios are decode throughput from the first table (higher = the first dtype
 wins). Two things worth noting: int8 buys 3.3-3.6x over fp32 and 1.8-2.1x over
-fp16, and for an already-quantized model FP16 is actually *slower* than FP32
+fp16, and for an already-quantized model FP16 is actually slower than FP32
 (0.90-0.98x). The dequant math is fp32 anyway, so building with `DTYPE=FP16`
 just adds conversions.
 
-What I didn't measure: 7b int8 (the activation scalers are incompatible with
-the gemma-1 pre-norm layout, the output is garbage), 7b fp32 (~32 GB), 7b bf16
-(same size as fp16 but 6x slower), 12b fp32 (45 GB doesn't fit), 12b fp16/bf16
-(23 GB, ~20 min per run), 12b bf16 int8.
-
-One more caveat: bf16 runs in software on this CPU (no AVX512-BF16), so every
+Also bf16 runs in software on this CPU (no AVX512-BF16), so every
 `bf16 <-> float` conversion becomes a big libgcc call, which is where the 6-40x
 gap comes from. On a machine with AVX512-BF16 the bf16 column would look very
 different.
-<!-- BENCH:END -->
 
 ### Reproducing
 
@@ -627,30 +594,21 @@ real HuggingFace checkpoint, and serve as a side-by-side reference.
 
 ## Known limitations
 
-- **One request at a time.** No batching, no continuous batching, no
+- One request at a time. No batching, no continuous batching, no
   prompt/prefix cache, every run re-prefills from scratch.
-- **`--seqlen` is fixed at load.** The KV cache is allocated up front and the
+- `--seqlen` is fixed at load. The KV cache is allocated up front and the
   prefill attention buffer is roughly `chunk × n_heads × seqlen` floats, so
   memory follows the flags, not what the conversation actually uses.
-- **Only fp16 decoding has a hand-written SIMD path** (F16C + FMA on x86-64).
+- Only fp16 decoding has a hand-written SIMD path (F16C + FMA on x86-64).
   fp32 and bf16 GEMV/GEMM are plain loops that lean on auto-vectorization, and
   there is no VNNI or NEON code yet.
-- **bf16 is only worth using on AVX512-BF16 hardware.** Everywhere else GCC
+- bf16 is only worth using on AVX512-BF16 hardware. Everywhere else GCC
   turns each `bf16 <-> float` conversion into a big libgcc call, and bf16 ends
   up 6-40x slower than fp16 (see the benchmark).
-- **W8A8 quantization doesn't work for Gemma 1.** Its pre-norm layout doesn't
+- W8A8 quantization doesn't work for Gemma 1. Its pre-norm layout doesn't
   match the activation scalers `export.py` emits, so a quantized Gemma 1
   checkpoint produces garbage. Use fp16 for those.
-- Quantizing trades a little output quality for size and speed; the benchmark
-  above only measures throughput.
-- **No stop strings.** Generation ends at EOS/EOT, `--tokens`, or `--seqlen`.
-- **Long prefills are silent.** A 12B model spends ~35 s on 1000 tokens with
-  nothing printed; there's no progress indicator yet.
-- **GCC is the fast path.** Prefill and SigLIP are several times slower with
-  clang or MSVC at the same `-O` level, because the GEMM kernels are plain C
-  and lean on the compiler to vectorize them. Hand-written intrinsics would
-  level that out; see [Windows](#windows).
-- **Native Windows builds lose to WSL.** MinGW's libgomp makes decode ~1.7x
+- Native Windows builds lose to WSL. MinGW's libgomp makes decode ~1.7x
   slower than Linux, and no single Windows compiler wins both prefill and
   decode, details in [Windows](#windows).
 - CPU only. No GPU, no distributed anything.

@@ -3,8 +3,8 @@
 
 For every model under `models/`, every weight dtype (fp32 / fp16 / bf16) and
 both the plain and the int8 export, this exports a `.bin`, runs one warm-up
-round plus N measured rounds over a short and a ~1000 token prompt, and renders
-the two tables plus the footnotes.
+round plus N measured rounds over a short and a ~10000 token prompt, and renders
+the two tables that go between the BENCH markers in README.md.
 
 Everything is resumable: results are written to `bench/results.json` after each
 config, and a config that is already in there is skipped, so an interrupted run
@@ -36,6 +36,7 @@ import platform
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import threading
@@ -47,13 +48,15 @@ DTYPES = ["float32", "float16", "bfloat16"]
 DTYPE_MACRO = {"float32": "FP32", "float16": "FP16", "bfloat16": "BF16"}
 DTYPE_LABEL = {"float32": "fp32", "float16": "fp16", "bfloat16": "bf16"}
 SHORT_PROMPT = "Once upon a time"
+# Length of bench/prompt.txt in prefill tokens (including <bos>).
+DEFAULT_LONG_TOKENS = 10000
 
 # Benchmark arguments, mirroring what the README table was measured with.
 BENCH_ARGS = [
-  "--seqlen", "2048",
-  "--tokens", "100",
+  "--seqlen", "16384",
   "--threads", "10",
   "--temperature", "0",
+  "--tokens", "100",
   "--no-mmap",
   "--text-only",
   "--chunk", "2048",
@@ -99,6 +102,93 @@ def human_bytes(n):
     if n < 1024 or unit == "TB":
       return ("%.0f %s" if unit == "B" else "%.1f %s") % (n, unit)
     n /= 1024.0
+
+
+SIGNALS = {4: "SIGILL", 6: "SIGABRT", 7: "SIGBUS", 8: "SIGFPE", 9: "SIGKILL",
+           11: "SIGSEGV", 15: "SIGTERM"}
+
+
+def describe_failure(returncode, out):
+  """Name the exit status and keep the last thing gemma said about it.
+
+  Without this a crash is reported as a bare "rc=-11", which says nothing
+  about *why* a config died. gemma's own stderr ("error: memory allocation
+  failed ...") is usually the whole answer.
+  """
+  if returncode < 0:
+    sig = -returncode
+    what = ("killed by %s" % SIGNALS[sig]) if sig in SIGNALS else (
+      "killed by signal %d" % sig)
+  else:
+    what = "exit code %d" % returncode
+  lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+  if not lines:
+    return what
+  errors = [ln for ln in lines if ln.lower().startswith("error:")]
+  return "%s: %s" % (what, (errors or lines)[-1][:200])
+
+
+def bench_arg(name, default=0):
+  """One integer out of BENCH_ARGS, e.g. bench_arg("--seqlen")."""
+  try:
+    return int(BENCH_ARGS[BENCH_ARGS.index(name) + 1])
+  except (ValueError, IndexError):
+    return default
+
+
+def bin_arch(path):
+  """Read the architecture out of the header export.py writes.
+
+  Mirrors read_text_config() in gemma.c: "GEMA" + a 4-char dtype/quant tag,
+  then big-endian fields. Returns None if the file is not a model, which is
+  what a half-written export looks like.
+  """
+  try:
+    with open(path, "rb") as f:
+      head = f.read(31)
+  except OSError:
+    return None
+  if len(head) < 31 or head[:4] != b"GEMA":
+    return None
+  nl, n_heads, nkv = head[8], head[9], head[10]
+  (hdim, dim, mlp, q_scale, slide, img_tok) = struct.unpack(">6H", head[11:23])
+  max_seq, nvocab = struct.unpack(">II", head[23:31])
+  return {
+    "tag": head[4:8].decode("ascii", "replace"),
+    "nl": nl, "n_heads": n_heads, "nkv": nkv, "hdim": hdim, "dim": dim,
+    "mlp": mlp, "q_scale": q_scale, "slide": slide, "img_tok": img_tok,
+    "max_seq": max_seq, "nvocab": nvocab,
+  }
+
+
+def peak_memory(arch, weights, dtype, seqlen, chunk):
+  """Bytes gemma will have to touch at peak for one config.
+
+  Mirrors get_text_buffer_size() in gemma.c: the weights, the kv cache, the
+  attention scores and the activation scratch. Everything but the weights is
+  scaled by the dtype, because the scratch buffers use the weight type too
+  (an fp32 config needs twice the memory of an fp16 one).
+  """
+  f = 4 if dtype == "float32" else 2
+  q_sz = arch["n_heads"] * arch["hdim"]
+  kv_sz = arch["nkv"] * arch["hdim"]
+  kv = arch["nl"] * 2 * seqlen * kv_sz * f
+  att = chunk * arch["n_heads"] * seqlen * f
+  act = chunk * (2 * arch["dim"] + 2 * q_sz + 2 * kv_sz + 2 * arch["hdim"] +
+                 2 * arch["mlp"]) * f + arch["nvocab"] * f
+  return weights + kv + att + act
+
+
+def ram_available():
+  """Bytes the kernel says we can still get, or None where unknown (Windows)."""
+  try:
+    with open("/proc/meminfo", "r", encoding="utf-8") as f:
+      for line in f:
+        if line.startswith("MemAvailable:"):
+          return int(line.split()[1]) * 1024
+  except (OSError, ValueError, IndexError):
+    pass
+  return None
 
 
 def describe_os():
@@ -287,6 +377,37 @@ def export_model(args, model_dir, dtype, quant, out_path):
   return False, msg
 
 
+def drop_page_cache(path):
+  """Flush and evict the pages a fresh copy of the model left behind.
+
+  `shutil.copyfile` leaves the whole model in the page cache, and those pages
+  are dirty until writeback catches up, so they cannot be reclaimed. On a
+  16 GB model that is 16 GB of unswappable memory next to the 16 GB gemma is
+  about to allocate, which is how a run ends up taking the whole VM down
+  instead of just failing. fsync() turns the pages clean, fadvise() drops
+  them.
+  """
+  if not hasattr(os, "posix_fadvise"):
+    return
+  try:
+    fd = os.open(path, os.O_RDONLY)
+  except OSError:
+    return
+  try:
+    os.fsync(fd)
+  except OSError:
+    pass
+  try:
+    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)  # type: ignore
+  except OSError:
+    pass
+  finally:
+    try:
+      os.close(fd)
+    except OSError:
+      pass
+
+
 def fetch_model(args, model_dir, dtype, quant):
   """Export a model and make sure it sits on the filesystem we bench from."""
   work = os.path.join(args.work_dir, "model.bin")
@@ -311,6 +432,7 @@ def fetch_model(args, model_dir, dtype, quant):
         os.unlink(staged)
     else:
       os.replace(staged, work)
+    drop_page_cache(work)
   except OSError as exc:
     return None, "copy failed: %s" % exc
   return work, ""
@@ -346,7 +468,7 @@ def run_once(args, binary, model_bin, prompt):
 
   out = box.get("out", "")
   if proc.returncode != 0:
-    return {"error": "rc=%s" % proc.returncode}
+    return {"error": describe_failure(proc.returncode, out)}
   p = RE_PREFILL.search(out)
   g = RE_GENERATE.search(out)
   if not p or not g:
@@ -372,9 +494,11 @@ def cv(values):
 
 def bench_prompt(args, binary, model_bin, prompt, kind):
   """Warm-up + N rounds, plus M extra rounds when the spread is too big."""
-  warm = run_once(args, binary, model_bin, prompt)
-  if "error" in warm:
-    return None, warm["error"]
+  for i in range(2):
+    warm = run_once(args, binary, model_bin, prompt)
+    if "error" in warm:
+      return None, warm["error"]
+  
   samples = []
   for i in range(args.runs):
     rec = run_once(args, binary, model_bin, prompt)
@@ -499,6 +623,11 @@ def cmd_run(args):
 
   results = load_results(args.results)
   rc, cc_out = run([args.cc, "--version"], timeout=60)
+  # Stamped on every run so that changing BENCH_ARGS or bench/prompt.txt
+  # invalidates the numbers measured with the old settings instead of letting
+  # them survive as "already measured".
+  bench_args = " ".join(BENCH_ARGS)
+  prompt_sha1 = hashlib.sha1(args.long_prompt.encode("utf-8")).hexdigest()[:12]
   results["meta"].update({
     "date": time.strftime("%Y-%m-%d"),
     "os_name": describe_os(),
@@ -508,7 +637,8 @@ def cmd_run(args):
     "cc": args.cc,
     "cc_version": cc_out.splitlines()[0] if rc == 0 and cc_out else args.cc,
     "avx512bf16": has_avx512bf16(),
-    "args": " ".join(BENCH_ARGS),
+    "args": bench_args,
+    "prompt_sha1": prompt_sha1,
     "runs": args.runs,
   })
 
@@ -527,6 +657,9 @@ def cmd_run(args):
           tag = "%s|%s|%s" % (m["name"], d, "q" if q else "nq")
           rec = results["runs"].get(tag)
           state = rec.get("status", "todo") if rec else "todo"
+          if state == "ok" and (rec.get("args") != bench_args  # type: ignore
+                                or rec.get("prompt_sha1") != prompt_sha1):  # type: ignore
+            state = "stale"
           est = planned_size(m["dir"], d, q)
           note = " (over --max-model-gb)" if est > args.max_model_gb * 1024 ** 3 else ""
           print("  %-40s %-6s ~%s%s" % (tag, state, human_bytes(est), note))
@@ -541,12 +674,16 @@ def cmd_run(args):
       for quant in quants:
         tag = "%s|%s|%s" % (m["name"], dtype, "q" if quant else "nq")
         prev = results["runs"].get(tag)
-        # configs that produced numbers are kept; failed or skipped ones
-        # are only re-tried with --force
+        # configs that produced numbers with the current settings are kept;
+        # failed, skipped or stale ones are only re-tried with --force, except
+        # that changing the benchmark args or the prompt always re-measures.
         if prev is not None and prev.get("status") == "ok":
-          print("[skip] %s (already measured)" % tag)
-          continue
-        if prev is not None and not args.force:
+          if (prev.get("args") == bench_args
+              and prev.get("prompt_sha1") == prompt_sha1):
+            print("[skip] %s (already measured)" % tag)
+            continue
+          print("[redo] %s (benchmark args or prompt changed)" % tag)
+        elif prev is not None and not args.force:
           print("[skip] %s (%s, use --force to retry)"
                 % (tag, prev.get("status", "?")))
           continue
@@ -566,6 +703,36 @@ def cmd_run(args):
           save_results(args.results, results)
           continue
 
+        # running a config that cannot fit does not fail cleanly: the kernel
+        # starts swapping and the whole VM can go down with it, losing the
+        # work of every config before it. the header of the exported .bin has
+        # the exact architecture, so the peak can be predicted here.
+        arch = bin_arch(model_bin)
+        if arch is not None:
+          seqlen = bench_arg("--seqlen", 4096)
+          peak = peak_memory(arch, os.path.getsize(model_bin), dtype, seqlen,
+                             bench_arg("--chunk", 1024))
+          if args.max_ram_gb:
+            budget = args.max_ram_gb * 1024 ** 3
+          else:
+            avail = ram_available()
+            # MemAvailable already excludes reclaimable page cache, and the
+            # estimate above runs ~20% over what a config really touches, so
+            # no extra fudge factor here; the swap file covers the rest
+            budget = avail
+          if budget and peak > budget:
+            reason = "needs ~%s at --seqlen %d, over the %s memory budget" % (
+              human_bytes(peak), seqlen, human_bytes(budget))
+            print("[skip] %s: %s" % (tag, reason))
+            results["runs"][tag] = {"status": "skipped", "reason": reason}
+            save_results(args.results, results)
+            if not args.keep_bins:
+              try:
+                os.unlink(model_bin)
+              except OSError:
+                pass
+            continue
+
         try:
           rec = bench_config(args, bins[dtype], model_bin)
         finally:
@@ -574,6 +741,8 @@ def cmd_run(args):
               os.unlink(model_bin)
             except OSError:
               pass
+        rec["args"] = bench_args
+        rec["prompt_sha1"] = prompt_sha1
         results["runs"][tag] = rec
         results["models"][m["name"]] = {
           "config_hash": m["config_hash"],
@@ -667,17 +836,58 @@ def fmt_params(params):
   return "%.0fM" % (params / 1e6)
 
 
+def prompt_tokens(results):
+  """Median number of prefilled tokens for the long prompt (incl. <bos>)."""
+  meta = results["meta"]
+  recs = [r for r in results["runs"].values() if r.get("status") == "ok"]
+  sha = meta.get("prompt_sha1")
+  if sha:
+    current = [r for r in recs
+               if r.get("args") == meta.get("args")
+               and r.get("prompt_sha1") == sha]
+    if current:
+      recs = current
+  vals = [s.get("prefill_tokens", 0)
+          for r in recs for s in r["samples"].get("long", [])]
+  vals = [v for v in vals if v]
+  return int(statistics.median(vals)) if vals else DEFAULT_LONG_TOKENS
+
+
+def ctx_label(n):
+  """10000 -> "10k", 1002 -> "1k", 512 -> "512"."""
+  if n >= 1000:
+    return "%dk" % int(round(n / 1000.0))
+  return str(n)
+
+
+def md_table_head(cells, right):
+  """Markdown table header plus its delimiter row.
+
+  The delimiter row has to carry exactly one cell per header cell: GFM only
+  recognises a table when the two match, and a short delimiter row makes the
+  whole thing render as plain text. Deriving it from `cells` means it cannot
+  drift out of sync again (the generated table had 10 header cells against 9
+  delimiter cells, which is why it never rendered).
+  """
+  head = "| " + " | ".join(cells) + " |"
+  delim = "|" + "|".join(
+    "---:" if i >= len(cells) - right else "---"
+    for i in range(len(cells))) + "|"
+  return [head, delim]
+
+
 def render_tables(results):
   fams = gather(results)
   order = sorted(fams, key=lambda h: (fams[h]["params"] or 0, fams[h]["label"]))
+  ctx = ctx_label(prompt_tokens(results))
 
-  main = ["| model | params | dtype | quant | prefill tok/s | "
-          "decode tok/s (short ctx) | decode tok/s (1k ctx) | "
-          "ms/token (1k ctx) | n | ±% |",
-          "|---|---|---|---:|---:|---:|---:|---:|---:|"]
-  ratio = ["| model | q/nq (fp32) | q/nq (fp16) | q/nq (bf16) | "
-           "fp16/fp32 (nq) | fp16/fp32 (q) |",
-           "|---|---:|---:|---:|---:|---:|"]
+  main = md_table_head([
+    "model", "params", "dtype", "quant", "prefill tok/s",
+    "decode tok/s (short ctx)", "decode tok/s (%s ctx)" % ctx,
+    "ms/token (%s ctx)" % ctx, "n", "±%"], right=6)
+  ratio = md_table_head([
+    "model", "q/nq (fp32)", "q/nq (fp16)", "q/nq (bf16)",
+    "fp16/fp32 (nq)", "fp16/fp32 (q)"], right=5)
 
   def short_tps(fam, dtype, quant):
     return pooled(fam, dtype, quant, "short", "gen_tps")
@@ -707,15 +917,16 @@ def render_tables(results):
       r(short_tps(fam, "float16", False), short_tps(fam, "float32", False)),
       r(short_tps(fam, "float16", True), short_tps(fam, "float32", True))))
 
-  pooled_names = [fams[h]["label"] for h in order if len(fams[h]["names"]) > 1]
-  return main, ratio, pooled_names
+  return main, ratio
 
 
 def render_block(results):
   if not results["runs"]:
     raise SystemExit("no results yet — run the sweep first")
-  main, ratio, pooled_names = render_tables(results)
+  main, ratio = render_tables(results)
   meta = results["meta"]
+  n = prompt_tokens(results)
+  ctx = ctx_label(n)
 
   out = [
     "%s, %s (%s threads), %s, `%s`."
@@ -723,48 +934,38 @@ def render_block(results):
        meta.get("cores", "?"), meta.get("cc_version", meta.get("cc", "?")),
        "-O3 -ffast-math -march=native -mtune=native -fopenmp"),
     "",
-    "Every cell: `%s` (chunk 2048 was the fastest of "
-    "64/128/256/512/1024/2048 on a 1002-token prompt)."
-    % meta.get("args", " ".join(BENCH_ARGS)),
+    "Every cell: `%s`" % meta.get("args", " ".join(BENCH_ARGS)),
     "",
-    "* **prefill tok/s** - 1002-token prompt, prompt ingestion only",
+    "* **prefill tok/s** - %d-token prompt, prompt ingestion only" % n,
     "* **decode tok/s** - 100 tokens after a 5-token prompt (\"short ctx\") "
-    "or after the 1002-token prompt (\"1k ctx\")",
+    "or after",
+    "  the %d-token prompt (\"%s ctx\")" % (n, ctx),
     "",
-    "One warm-up run is thrown away, then %d rounds are measured; the first "
-    "measured round is dropped as well (it is consistently a bit slow), and "
-    "the rest is a median. `n` is the number of samples behind a row and `±%%` "
-    "is the spread we actually saw." % meta.get("runs", 5),
-  ]
-  if pooled_names:
-    out += ["",
-            "Some rows pool several checkpoints that share an identical "
-            "configuration (that is why their `n` is larger): %s."
-            % ", ".join("`%s`" % p for p in pooled_names)]
-  out += [""] + main + [""] + ratio + [
-    "",
-    "Ratios are decode throughput from the first table (higher = the first "
-    "dtype wins).",
-  ]
+  ] + main + [""] + ratio + [""]
+  block = "\n".join(out)
+  check_tables(block)
+  return block
 
-  missing = []
-  for tag in sorted(results["runs"]):
-    rec = results["runs"][tag]
-    if rec.get("status") == "ok":
+
+def check_tables(block):
+  """Fail loudly on a table whose rows disagree on the cell count.
+
+  A single short row is enough to turn the whole table back into plain text,
+  and that is invisible to whoever runs the script - it only shows up in the
+  rendered markdown. Cheap to check, so check.
+  """
+  group = []
+  for line in block.splitlines() + [""]:
+    if line.lstrip().startswith("|"):
+      group.append(line)
       continue
-    name, dtype, nq = tag.split("|")
-    missing.append("* `%s` %s %s — %s"
-                   % (name, DTYPE_LABEL[dtype], nq, rec.get("reason", "?")))
-  if missing:
-    out += ["", "Not measured:"] + missing
-
-  if meta.get("avx512bf16") is False:
-    out += ["", "One more caveat: bf16 runs in software on this CPU (no "
-                "AVX512-BF16), so every `bf16 <-> float` conversion becomes a "
-                "libgcc call — that is where the 6-40x gap comes from. A CPU "
-                "with AVX512-BF16 would make the bf16 column look very "
-                "different."]
-  return "\n".join(out)
+    if len(group) > 1:
+      counts = sorted({ln.count("|") for ln in group})
+      if len(counts) > 1:
+        raise SystemExit(
+          "malformed markdown table: rows have %s pipes each\n  %s"
+          % (counts, group[0][:100]))
+    group = []
 
 
 def render(args, write_readme=True):
@@ -779,10 +980,16 @@ def render(args, write_readme=True):
   if not (write_readme and args.update_readme):
     return
   planned = set(results["meta"].get("planned", []))
-  # only a run that actually produced numbers counts as done; skipped or
-  # failed configs stay "missing" so the README is not silently truncated
+  # only a run that actually produced numbers with the current settings counts
+  # as done; skipped, failed or stale configs stay "missing" so the README is
+  # not silently truncated
+  meta = results["meta"]
+  sha = meta.get("prompt_sha1")
   done = set(tag for tag, rec in results["runs"].items()
-             if rec.get("status") == "ok")
+             if rec.get("status") == "ok"
+             and (not sha
+                  or (rec.get("args") == meta.get("args")
+                      and rec.get("prompt_sha1") == sha)))
   if planned and not planned <= done and not args.force:
     print("README not touched: %d of %d planned configs are still missing "
           "(use --force)" % (len(planned - done), len(planned)))
@@ -848,7 +1055,8 @@ def cmd_chunk(args):
       print("| %d | — | %s |" % (size, err))
       continue
     tps = statistics.median([s["prefill_tps"] for s in steady(samples)])
-    ntok = statistics.median([s.get("prefill_tokens", 1002) for s in steady(samples)])
+    ntok = statistics.median([s.get("prefill_tokens", DEFAULT_LONG_TOKENS)
+                              for s in steady(samples)])
     print("| %d | %.1f | %.2f |" % (size, tps, ntok / tps))
 
 
@@ -875,6 +1083,10 @@ def add_common(p):
   p.add_argument("--only", default=None, help="regex on the model dir name")
   p.add_argument("--max-model-gb", type=float, default=26.0,
                  help="skip configs whose .bin would be bigger than this")
+  p.add_argument("--max-ram-gb", type=float, default=None,
+                 help="skip configs whose predicted peak memory (weights plus "
+                      "kv cache, attention and scratch buffers) is bigger than "
+                      "this (default: MemAvailable)")
   p.add_argument("--cc", default=os.environ.get("CC", "gcc"))
   p.add_argument("--skip-build", action="store_true")
   p.add_argument("--skip-export", action="store_true",
@@ -882,7 +1094,7 @@ def add_common(p):
   p.add_argument("--keep-bins", action="store_true")
   p.add_argument("--dry-run", action="store_true")
   p.add_argument("--prompt-file",
-                 default=os.path.join(REPO, "bench", "prompt1000toks.txt"))
+                 default=os.path.join(REPO, "bench", "prompt.txt"))
   p.add_argument("--short-prompt", default=SHORT_PROMPT)
   p.add_argument("--runs", type=int, default=5)
   p.add_argument("--extra-runs", type=int, default=5)
@@ -929,9 +1141,10 @@ def main(argv=None):
   if args.cmd != "render":
     with open(args.prompt_file, "r", encoding="utf-8", errors="replace") as f:
       args.long_prompt = f.read()
-    if len(args.long_prompt) < 500:
-      raise SystemExit("prompt file %s looks too short for a 1000-token prompt"
-                       % args.prompt_file)
+    if len(args.long_prompt) < 30000:
+      raise SystemExit("prompt file %s looks too short for a 10000-token "
+                       "prompt (%d characters)"
+                       % (args.prompt_file, len(args.long_prompt)))
     if not args.dry_run:
       check_export_python(args.export_python)
     if args.cmd == "run":
